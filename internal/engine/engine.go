@@ -68,10 +68,12 @@ func Run(cfg Config) (*Result, error) {
 	if svcName == "" && len(l.Services) > 0 {
 		svcName = l.Services[0].Name
 	}
+	// 未显式指定 --service 时，默认全仓分析（所有服务），而不是回落到第一个服务。
+	filterName := cfg.Service
 
 	// 1-2. 服务拓扑 + 框架识别
 	framework := detectFrameworkOf(l)
-	pkgs := l.ServiceFilter(svcName)
+	pkgs := l.ServiceFilter(filterName)
 
 	// 3. 约定画像
 	prof, err := loadProfile(cfg, l)
@@ -329,30 +331,92 @@ func fullTypeID(t types.Type) string {
 	return t2.String()
 }
 
-// expandWildcards 用画像规则展开通配符路径。
+// expandWildcards 展开通配符路径。
+//
+// 优先级（设计文档 §3.3 的画像优先，外加自动推断兜底）：
+//  1. profile 显式规则（wildcard_expansion）——人类对「版本歧义」的最终裁决；
+//  2. 自动推断——当且仅当能从已解析路由中唯一确定一个具体版本段时；
+//  3. 以上皆无 → 保留未解析（宁可少不可错，不注入幻觉路由）。
 func expandWildcards(routes []adapter.Route, prof *profile.Profile) []adapter.Route {
+	// 收集已解析路由的原始路径，供版本推断（v* → 具体版本段）。
+	resolvedRaw := map[string]bool{}
+	for _, r := range routes {
+		if r.Unresolved == "" {
+			resolvedRaw[r.RawPath] = true
+		}
+	}
 	var out []adapter.Route
 	for _, r := range routes {
 		if r.Unresolved != adapter.ReasonWildcard {
 			out = append(out, r)
 			continue
 		}
-		expansions, ok := lookupExpansion(prof, r.RawPath)
-		if !ok {
-			// 无规则: 保守标记未解析（宁可少不可错）
-			out = append(out, r)
+		// 1. profile 显式规则
+		if expansions, ok := lookupExpansion(prof, r.RawPath); ok {
+			for _, base := range expansions {
+				out = append(out, expandTo(r, base))
+			}
 			continue
 		}
-		for _, base := range expansions {
-			suffix := strings.TrimPrefix(r.RawPath, wildcardPrefixOf(r.RawPath))
-			normSuffix, _ := adapter.NormalizePathSuffix(suffix)
-			nr := r
-			nr.Path = base + normSuffix
-			nr.Unresolved = ""
-			out = append(out, nr)
+		// 2. 自动推断（仅单版本确定时）
+		if bases, ok := inferWildcardBases(r.RawPath, resolvedRaw); ok {
+			for _, base := range bases {
+				out = append(out, expandTo(r, base))
+			}
+			continue
 		}
+		// 3. 保留未解析
+		out = append(out, r)
 	}
 	return out
+}
+
+// expandTo 把通配符路由按具体 base 前缀展开（base 如 "/ipo/v1"）。
+func expandTo(r adapter.Route, base string) adapter.Route {
+	suffix := strings.TrimPrefix(r.RawPath, wildcardPrefixOf(r.RawPath))
+	normSuffix, _ := adapter.NormalizePathSuffix(suffix)
+	nr := r
+	nr.Path = base + normSuffix
+	nr.Unresolved = ""
+	return nr
+}
+
+// inferWildcardBases 自动推断通配符前缀的具体版本段。
+//
+// rawPath 形如 "/ipo/v*/OrderCreate"：取 `*` 前的段前缀 base="/ipo/v"，
+// 在已解析路由里找以 base 开头、下一段为具体版本的路由（如 "/ipo/v1/Ping"），
+// 收集去重后的版本段（"1"）。仅当恰好唯一一个版本段时返回该展开 base，
+// 多版本歧义（如同时有 v1/v3）返回 false，交给 profile 裁决——把
+// 「v* 到底指哪个版本」留给人类约定，绝不静态臆测注入 spurious 路由。
+func inferWildcardBases(rawPath string, resolvedRaw map[string]bool) ([]string, bool) {
+	star := strings.Index(rawPath, "*")
+	if star < 0 {
+		return nil, false
+	}
+	base := rawPath[:star] // 不含 '*'
+	tokens := map[string]bool{}
+	for p := range resolvedRaw {
+		if !strings.HasPrefix(p, base) {
+			continue
+		}
+		rest := p[len(base):]
+		token := rest
+		if i := strings.IndexByte(rest, '/'); i >= 0 {
+			token = rest[:i]
+		}
+		if token == "" {
+			continue
+		}
+		tokens[token] = true
+	}
+	if len(tokens) != 1 {
+		return nil, false
+	}
+	var base2 string
+	for t := range tokens {
+		base2 = base + t
+	}
+	return []string{base2}, true
 }
 
 // lookupExpansion 通配符展开规则查找: 全路径 → 含 '*' 的前缀段。

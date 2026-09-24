@@ -112,9 +112,17 @@ func (a FiberAdapter) extractRouteCall(p *PkgCtx, st *fiberState, call *ast.Call
 	if !isRouterMethod(method) {
 		return nil
 	}
-	// 请求访问器误判防护: c.Get("X-Header") 接收者是 *fiber.Ctx，
-	// 且路由注册至少需要 (path, handler) 两个实参。
-	if recvType := p.Info.RecvTypeOf(sel.X); recvType != "" && strings.Contains(recvType, "fiber.Ctx") {
+	// 误判防护：路由注册的接收者必须是 fiber 的 App/Router/Group，
+	// 其余同名方法（resty.Request.Get/Post、*fiber.Ctx.Get、net/http.Header.Get
+	// 等）不是路由注册。能拿到静态类型时以类型为准，拿不到时保守丢弃
+	// （宁可漏动态场景，也不把 HTTP 客户端调用误报成路由——F3 召回由
+	// 表驱动/循环注册专门路径补齐，纯运行时拼接本就列进 Unresolved）。
+	if recvType := p.Info.RecvTypeOf(sel.X); recvType != "" {
+		if !isFiberRouterType(recvType) {
+			return nil
+		}
+	} else {
+		// 无类型信息兜底：接收者是 *fiber.Ctx 的已明确排除，其余按非路由丢弃。
 		return nil
 	}
 	if len(call.Args) < 2 {
@@ -286,6 +294,24 @@ func findLoopTable(body *ast.BlockStmt, loopVar string) *ast.CompositeLit {
 func isRouterMethod(upper string) bool {
 	switch upper {
 	case "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS", "ALL":
+		return true
+	}
+	return false
+}
+
+// isFiberRouterType 判定接收者类型是否为 fiber 路由对象（App/Router/Group）。
+// 这三个类型都能链式调用 .Get/.Post/.Group 注册路由；其余同名方法不是路由注册。
+// 类型串形如 "*github.com/gofiber/fiber/v2.App"，按 '.' 取末段类型名比对。
+func isFiberRouterType(recvType string) bool {
+	t := recvType
+	if i := strings.LastIndexByte(t, '.'); i >= 0 {
+		t = t[i+1:]
+	}
+	if i := strings.IndexByte(t, '['); i >= 0 {
+		t = t[:i]
+	}
+	switch t {
+	case "App", "Group", "Router", "*App", "*Group", "*Router":
 		return true
 	}
 	return false

@@ -102,15 +102,56 @@ func detectServices(pkgs []*packages.Package) []Service {
 }
 
 // ServiceFilter 按名称过滤服务涉及的包集合。
-// 单模块多服务时，服务边界 = main 包可达闭包；简化实现：
-// 全部包都属于该模块，交给路由提取阶段自然限定。
+//
+// 单模块多服务时，服务边界 = main 包的 import 可达闭包：从服务的入口包
+// （cmd/service-xxx 的 main 包）出发，沿 Imports 边 BFS，收集该服务真正
+// 可达的包。name 为空返回全量（全仓模式）。找不到对应入口时回退全量，
+// 保证不因服务名拼写错误而崩溃或产出空 spec。
 func (l *Loaded) ServiceFilter(name string) []*packages.Package {
 	if name == "" {
 		return l.Pkgs
 	}
+	var entry *packages.Package
 	for _, s := range l.Services {
 		if s.Name == name {
-			return l.Pkgs
+			entry = pkgByPath(l.Pkgs, s.Entrypoint)
+			break
+		}
+	}
+	if entry == nil {
+		return l.Pkgs
+	}
+	// BFS 沿 import 边收集可达包（含外部依赖，末尾只保留 l.Pkgs 内实际加载的）。
+	reach := map[string]*packages.Package{}
+	queue := []*packages.Package{entry}
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		if p == nil || reach[p.PkgPath] != nil {
+			continue
+		}
+		reach[p.PkgPath] = p
+		for _, imp := range p.Imports {
+			if imp != nil && reach[imp.PkgPath] == nil {
+				queue = append(queue, imp)
+			}
+		}
+	}
+	// 只保留 ./... 范围内实际加载的包，保持加载序稳定。
+	var out []*packages.Package
+	for _, p := range l.Pkgs {
+		if reach[p.PkgPath] != nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// pkgByPath 在包集合中按 import path 查找包。
+func pkgByPath(pkgs []*packages.Package, path string) *packages.Package {
+	for _, p := range pkgs {
+		if p.PkgPath == path {
+			return p
 		}
 	}
 	return nil
