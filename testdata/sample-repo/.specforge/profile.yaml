@@ -1,0 +1,38 @@
+# 约定画像（设计文档 §3.3）—— 对样本仓库的约定声明。
+# P0/P1 由人工提供；P3 起由约定画像 Agent 自动学习产出同构文件。
+framework: gofiber/v2
+response_sinks:
+  - symbol: code.WriteResponse
+    signature: "(c *fiber.Ctx, err error, data any) error"
+    data_slot: 2
+    err_slot: 1
+    status: 200
+response_envelope:
+  type: object
+  properties:
+    code: integer
+    msg: string
+    data: "<T>"
+  data_slot: data
+  success_code: 0
+request_binding:
+  - pattern: "c.BodyParser(&T{})"
+    contentType: application/json
+auth_middleware:
+  GetUserRelation:
+    header: X-User-Token
+    scheme: apiKey
+    required: true
+  PermissionCheck:
+    header: X-User-Token
+    scheme: apiKey
+    required: true
+    scope_arg: 0
+  NewSubAccountIntercepter:
+    header: X-Sub-Account-Id
+    scheme: apiKey
+    required: false
+path_conventions:
+  wildcard_expansion:
+    "/ipo/v*": ["/ipo/v1"]
+error_codes_source: code

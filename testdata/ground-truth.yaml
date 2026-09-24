@@ -1,0 +1,570 @@
+# Ground Truth: 样本仓库的完美注解形态（人工标注，作为 specforge eval 的对照真值）
+# 约定与 specforge 渲染一致: 信封 code/msg/data、date-time/int64/double 格式、
+# nullable 用 3.1 type 数组、json.RawMessage 无 type（透传）。
+openapi: 3.1.0
+info:
+  title: service-ipo API
+  version: 1.0.0
+paths:
+  /health:
+    get:
+      tags:
+        - HealthController
+      operationId: health
+      responses:
+        '200':
+          description: Success (code=0)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    enum:
+                      - 0
+                  msg:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/HealthStatus'
+  /ipo/v1/OrderCancel:
+    post:
+      tags:
+        - IpoController
+      operationId: orderCancel
+      parameters:
+        - name: X-User-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCheckReqParams'
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=40001); Business error (code=41001)'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    enum:
+                      - 0
+                      - 40001
+                      - 41001
+                  msg:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/OrderCancelResp'
+      security:
+        - X-User-Token: []
+  /ipo/v1/OrderCheck:
+    post:
+      tags:
+        - IpoController
+      operationId: orderCheck
+      parameters:
+        - name: X-Sub-Account-Id
+          in: header
+          schema:
+            type: string
+        - name: X-User-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCheckReqParams'
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=40001); Business error (code=40002); Business error (code=41002)'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    enum:
+                      - 0
+                      - 40001
+                      - 40002
+                      - 41002
+                  msg:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/OrderCheckResp'
+      security:
+        - X-User-Token: []
+        - X-Sub-Account-Id: []
+  /ipo/v1/OrderCreate:
+    post:
+      tags:
+        - IpoController
+      operationId: orderCreate
+      parameters:
+        - name: X-User-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateReq'
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=40001); Business error (code=41003)'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    enum:
+                      - 0
+                      - 40001
+                      - 41003
+                  msg:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/OrderCreateResp'
+      security:
+        - X-User-Token: []
+  /ipo/v1/OrderQuery:
+    post:
+      tags:
+        - IpoController
+      operationId: orderQuery
+      parameters:
+        - name: X-User-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderListReq'
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=40001)'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    enum:
+                      - 0
+                      - 40001
+                  msg:
+                    type: string
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrderListResp'
+      security:
+        - X-User-Token: []
+  /ipo/v1/orders/{orderId}:
+    get:
+      tags:
+        - IpoController
+      operationId: getOrderDetail
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-User-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=40002)'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    enum:
+                      - 0
+                      - 40002
+                  msg:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/OrderDetailResp'
+      security:
+        - X-User-Token: []
+  /ipo/v1/orders/{orderId}/items:
+    get:
+      tags:
+        - IpoController
+      operationId: listOrderItems
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-User-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=40002)'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    enum:
+                      - 0
+                      - 40002
+                  msg:
+                    type: string
+                  data:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/OrderItem'
+      security:
+        - X-User-Token: []
+  /ipo/v1/controls/assess:
+    get:
+      tags:
+        - IpoController
+      operationId: riskAssess
+      parameters:
+        - name: X-Sub-Account-Id
+          in: header
+          schema:
+            type: string
+        - name: X-User-Token
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: orderId
+          in: query
+          schema:
+            type: string
+        - name: level
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=40002)'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    enum:
+                      - 0
+                      - 40002
+                  msg:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/RiskAssessResp'
+      security:
+        - X-User-Token: []
+        - X-Sub-Account-Id: []
+  /legacy/v1/depth:
+    get:
+      tags:
+        - IpoController
+      operationId: legacyDepth
+      parameters:
+        - name: symbol
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success (code=0)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    enum:
+                      - 0
+                  msg:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/depthResp'
+  /legacy/v1/quote:
+    get:
+      tags:
+        - IpoController
+      operationId: legacyQuote
+      parameters:
+        - name: symbol
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=40002)'
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    enum:
+                      - 0
+                      - 40002
+                  msg:
+                    type: string
+                  data:
+                    $ref: '#/components/schemas/quoteResp'
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+        version:
+          type: string
+      required:
+        - status
+        - version
+    OrderCancelResp:
+      type: object
+      properties:
+        orderId:
+          type: string
+        canceled:
+          type: boolean
+        timestamp:
+          type: string
+          format: date-time
+      required:
+        - orderId
+        - canceled
+        - timestamp
+    OrderCheckReqParams:
+      type: object
+      properties:
+        params:
+          type: object
+          properties:
+            orderId:
+              type: string
+            accountId:
+              type: integer
+              format: int64
+            amount:
+              type: number
+              format: double
+          required:
+            - orderId
+            - accountId
+            - amount
+      required:
+        - params
+    OrderCheckResp:
+      type: object
+      properties:
+        orderId:
+          type: string
+        status:
+          type: string
+          enum:
+            - canceled
+            - closed
+            - paid
+            - pending
+        amount:
+          type: number
+          format: double
+        fee:
+          type: [number, 'null']
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - orderId
+        - status
+        - amount
+        - createdAt
+    OrderCreateReq:
+      type: object
+      properties:
+        symbol:
+          type: string
+          enum:
+            - SH
+            - SZ
+            - BJ
+        price:
+          type: [number, 'null']
+        quantity:
+          type: integer
+          format: int64
+        orderType:
+          type: string
+          enum:
+            - limit
+            - market
+      required:
+        - symbol
+        - quantity
+        - orderType
+    OrderCreateResp:
+      type: object
+      properties:
+        orderId:
+          type: string
+        status:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - orderId
+        - status
+        - createdAt
+    OrderDetailResp:
+      type: object
+      properties:
+        orderId:
+          type: string
+        status:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+        extra:
+          type: [object, 'null']
+          properties:
+            remark:
+              type: string
+            attrs:
+              type: object
+              additionalProperties:
+                type: string
+            rawMeta:
+              description: raw passthrough
+      required:
+        - orderId
+        - status
+        - items
+    OrderItem:
+      type: object
+      properties:
+        itemId:
+          type: string
+        qty:
+          type: integer
+          format: int64
+        price:
+          type: number
+          format: double
+      required:
+        - itemId
+        - qty
+        - price
+    OrderListReq:
+      type: object
+      properties:
+        page:
+          type: integer
+          format: int64
+        pageSize:
+          type: integer
+          format: int64
+        status:
+          type: [string, 'null']
+      required:
+        - page
+        - pageSize
+    OrderListResp:
+      type: object
+      properties:
+        orderId:
+          type: string
+        status:
+          type: string
+        amount:
+          type: number
+          format: double
+        createdAt:
+          type: string
+          format: date-time
+      required:
+        - orderId
+        - status
+        - amount
+        - createdAt
+    RiskAssessResp:
+      type: object
+      properties:
+        orderId:
+          type: string
+        score:
+          type: integer
+          format: int64
+        riskInfo:
+          type: object
+          additionalProperties: true
+      required:
+        - orderId
+        - score
+        - riskInfo
+    depthResp:
+      type: object
+      properties:
+        symbol:
+          type: string
+        bidPrice:
+          type: number
+          format: double
+      required:
+        - symbol
+        - bidPrice
+    quoteResp:
+      type: object
+      properties:
+        symbol:
+          type: string
+        price:
+          type: number
+          format: double
+      required:
+        - symbol
+        - price

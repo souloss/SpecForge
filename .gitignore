@@ -1,0 +1,10 @@
+# 构建产物
+/specforge
+/dist/
+*.exe
+
+# specforge 生成的输出（openapi.yaml / report.md 可重新生成；profile.yaml 是输入需保留）
+**/.specforge/out/
+
+# Go 工具链
+vendor/

@@ -1,0 +1,348 @@
+package compiler
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/specforge/specforge/internal/typeschema"
+)
+
+// 确定性 YAML 渲染器（设计文档 §8.5 序列化规范）:
+//
+//      1. 固定 key 顺序（OpenAPI 规范推荐序，非字典序）
+//      2. 缩进 2 空格，不用流式风格
+//      3. 引号仅在需要时添加，单引号风格
+//      4. 数值定点输出; 整数绝不出现 .0
+//      5. 不折行; 文件尾单个换行
+//      6. 空值禁止: 显式 x-specforge-unknown 或省略
+
+// render 输出 OpenAPI 3.1 YAML。
+func render(d *Document) ([]byte, error) {
+	var b strings.Builder
+	w := func(format string, args ...interface{}) {
+		fmt.Fprintf(&b, format, args...)
+	}
+
+	w("openapi: 3.1.0\n")
+	w("info:\n")
+	w("  title: %s\n", quoteIfNeeded(d.Title))
+	w("  version: %s\n", quoteIfNeeded(d.Version))
+	if d.Description != "" {
+		w("  description: %s\n", quoteIfNeeded(d.Description))
+	}
+
+	// securitySchemes 在 components 下输出; 先写 tags（operation 标签汇总）
+	tagSet := map[string]bool{}
+	var tags []string
+	for _, op := range d.Operations {
+		for _, t := range op.Tags {
+			if !tagSet[t] {
+				tagSet[t] = true
+				tags = append(tags, t)
+			}
+		}
+	}
+	if len(tags) > 0 {
+		w("tags:\n")
+		for _, t := range tags {
+			w("  - name: %s\n", quoteIfNeeded(t))
+		}
+	}
+
+	w("paths:\n")
+	currentPath := ""
+	for _, op := range d.Operations {
+		if op.Path != currentPath {
+			currentPath = op.Path
+			w("  %s:\n", quoteIfNeeded(op.Path))
+		}
+		writeOperation(w, &b, op, 4)
+	}
+
+	// components
+	if len(d.Schemas) > 0 || len(d.SecSchemes) > 0 {
+		w("components:\n")
+		if len(d.SecSchemes) > 0 {
+			w("  securitySchemes:\n")
+			for _, s := range d.SecSchemes {
+				w("    %s:\n", quoteIfNeeded(s.Name))
+				w("      type: %s\n", s.Type)
+				if s.Type == "apiKey" {
+					w("      name: %s\n", quoteIfNeeded(s.HeaderName))
+					w("      in: header\n")
+				}
+				if s.Type == "http" {
+					w("      scheme: bearer\n")
+				}
+			}
+		}
+		if len(d.Schemas) > 0 {
+			w("  schemas:\n")
+			for _, ns := range d.Schemas {
+				w("    %s:\n", quoteIfNeeded(ns.Name))
+				writeSchema(w, &b, ns.Schema, 6, "      ")
+			}
+		}
+	}
+	return []byte(b.String()), nil
+}
+
+var methodOrderList = map[string]int{}
+
+func writeOperation(w func(string, ...interface{}), b *strings.Builder, op Operation, indent int) {
+	pad := strings.Repeat(" ", indent)
+	w("%s%s:\n", pad, strings.ToLower(op.Method))
+	p2 := pad + "  "
+	if len(op.Tags) > 0 {
+		w("%stags:\n", p2)
+		for _, t := range op.Tags {
+			w("%s  - %s\n", p2, quoteIfNeeded(t))
+		}
+	}
+	if op.Summary != "" {
+		w("%ssummary: %s\n", p2, quoteIfNeeded(op.Summary))
+	}
+	if op.Description != "" {
+		w("%sdescription: %s\n", p2, quoteIfNeeded(op.Description))
+	}
+	w("%soperationId: %s\n", p2, quoteIfNeeded(op.OperationID))
+	if len(op.Params) > 0 {
+		w("%sparameters:\n", p2)
+		for _, p := range op.Params {
+			w("%s  - name: %s\n", p2, quoteIfNeeded(p.Name))
+			w("%s    in: %s\n", p2, p.In)
+			if p.Required {
+				w("%s    required: true\n", p2)
+			}
+			if p.Origin != "" {
+				w("%s    description: %s\n", p2, quoteIfNeeded("origin: "+p.Origin))
+			}
+			w("%s    schema:\n", p2)
+			p3 := p2 + "      "
+			w("%stype: %s\n", p3, p.Type)
+			if p.Format != "" {
+				w("%sformat: %s\n", p3, p.Format)
+			}
+		}
+	}
+	if op.Body != nil {
+		w("%srequestBody:\n", p2)
+		w("%s  required: true\n", p2)
+		w("%s  content:\n", p2)
+		w("%s    application/json:\n", p2)
+		w("%s      schema:\n", p2)
+		w("%s        $ref: '#/components/schemas/%s'\n", p2, escapeRef(op.Body.SchemaName))
+	}
+	if len(op.Responses) > 0 {
+		w("%sresponses:\n", p2)
+		p3 := p2 + "  "
+		for _, r := range op.Responses {
+			w("%s'%s':\n", p3, r.Status)
+			p4 := p3 + "    "
+			w("%sdescription: %s\n", p4, quoteIfNeeded(r.Description))
+			if r.HasBody && r.SchemaName != "" || len(r.Codes) > 0 {
+				w("%scontent:\n", p4)
+				w("%s  application/json:\n", p4)
+				w("%s    schema:\n", p4)
+				// 信封包装: code / msg / data（设计文档 §3.3 response_envelope）
+				w("%s      type: object\n", p4)
+				w("%s      properties:\n", p4)
+				w("%s        code:\n", p4)
+				w("%s          type: integer\n", p4)
+				if len(r.Codes) > 0 {
+					w("%s          enum:\n", p4)
+					for _, c := range r.Codes {
+						w("%s            - %d\n", p4, c)
+					}
+				}
+				w("%s        msg:\n", p4)
+				w("%s          type: string\n", p4)
+				if r.HasBody && r.ArrayElem != "" {
+					w("%s        data:\n", p4)
+					w("%s          type: array\n", p4)
+					w("%s          items:\n", p4)
+					w("%s            $ref: '#/components/schemas/%s'\n", p4, escapeRef(r.ArrayElem))
+				} else if r.HasBody && r.SchemaName != "" {
+					w("%s        data:\n", p4)
+					w("%s          $ref: '#/components/schemas/%s'\n", p4, escapeRef(r.SchemaName))
+				}
+			}
+			if len(r.Sinks) > 0 {
+				w("%sx-specforge-sinks:\n", p4)
+				for _, sk := range r.Sinks {
+					w("%s  - %s\n", p4, quoteIfNeeded(sk))
+				}
+			}
+			if r.HasUnresolved {
+				w("%sx-specforge-unknown: 'error envelope code unresolved'\n", p4)
+			}
+		}
+	}
+	if len(op.Security) > 0 {
+		w("%ssecurity:\n", p2)
+		for _, s := range op.Security {
+			w("%s  - %s: []\n", p2, quoteIfNeeded(s))
+		}
+	}
+	// x-specforge 扩展（固定键序: confidence, evidence, unknown）
+	if op.Confidence > 0 && op.Confidence < 0.95 {
+		w("%sx-specforge-confidence: %s\n", p2, fixed2(op.Confidence))
+	}
+	if len(op.Evidence) > 0 {
+		w("%sx-specforge-evidence:\n", p2)
+		for _, e := range op.Evidence {
+			w("%s  - %s\n", p2, quoteIfNeeded(e))
+		}
+	}
+	if len(op.Unknowns) > 0 {
+		w("%sx-specforge-unknown:\n", p2)
+		for _, u := range op.Unknowns {
+			w("%s  - %s\n", p2, quoteIfNeeded(u))
+		}
+	}
+}
+
+func writeSchema(w func(string, ...interface{}), b *strings.Builder, sc *typeschema.Schema, indent int, pad string) {
+	if sc == nil {
+		w("%sdescription: 'unresolved schema'\n", pad)
+		return
+	}
+	if sc.NoBody {
+		w("%sdescription: 'raw passthrough (json.RawMessage)'\n", pad)
+		return
+	}
+	if sc.Ref != "" {
+		w("%s$ref: '#/components/schemas/%s'\n", pad, escapeRef(sc.Ref))
+		return
+	}
+	if sc.Type != "" {
+		if sc.Nullable {
+			// 3.1 可空: type 数组（§7.2.6），唯一 type 键
+			w("%stype: [%s, 'null']\n", pad, sc.Type)
+		} else {
+			w("%stype: %s\n", pad, sc.Type)
+		}
+	}
+	if sc.Format != "" && !sc.Nullable {
+		w("%sformat: %s\n", pad, sc.Format)
+	}
+	if sc.Description != "" {
+		w("%sdescription: %s\n", pad, quoteIfNeeded(sc.Description))
+	}
+	if len(sc.Enum) > 0 {
+		w("%senum:\n", pad)
+		for _, e := range sc.Enum {
+			w("%s  - %s\n", pad, quoteIfNeeded(e))
+		}
+	}
+	if sc.Min != nil {
+		w("%sminimum: %s\n", pad, numStr(*sc.Min))
+	}
+	if sc.Max != nil {
+		w("%smaximum: %s\n", pad, numStr(*sc.Max))
+	}
+	if sc.MinLen != nil {
+		w("%sminLength: %d\n", pad, *sc.MinLen)
+	}
+	if sc.MaxLen != nil {
+		w("%smaxLength: %d\n", pad, *sc.MaxLen)
+	}
+	if sc.Items != nil {
+		w("%sitems:\n", pad)
+		writeSchema(w, b, sc.Items, indent+2, pad+"  ")
+	}
+	if sc.Additional {
+		w("%sadditionalProperties: true\n", pad)
+	}
+	if len(sc.Props) > 0 {
+		w("%sproperties:\n", pad)
+		for _, p := range sc.Props {
+			w("%s  %s:\n", pad, quoteIfNeeded(p.Name))
+			writeSchema(w, b, p.Schema, indent+2, pad+"    ")
+		}
+	}
+	if len(sc.Required) > 0 {
+		w("%srequired:\n", pad)
+		for _, r := range sc.Required {
+			w("%s  - %s\n", pad, quoteIfNeeded(r))
+		}
+	}
+	if sc.Unknown {
+		w("%sx-specforge-unknown: %s\n", pad, quoteIfNeeded(sc.UnknownWhy))
+	}
+}
+
+// schemaView 别名已移除，直接使用 typeschema.Schema。
+
+var _ = fmt.Sprintf
+
+func numStr(f float64) string {
+	if f == float64(int64(f)) {
+		return fmt.Sprintf("%d", int64(f))
+	}
+	return fmt.Sprintf("%g", f)
+}
+
+func fixed2(f float64) string { return fmt.Sprintf("%.2f", f) }
+
+func escapeRef(s string) string { return s }
+
+// quoteIfNeeded YAML 单引号转义（保守规则）。
+func quoteIfNeeded(s string) string {
+	if s == "" {
+		return "''"
+	}
+	if needsQuote(s) {
+		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+	}
+	return s
+}
+
+func needsQuote(s string) bool {
+	// 开头特殊字符
+	c := s[0]
+	if c == '&' || c == '*' || c == '?' || c == '|' || c == '-' || c == '<' ||
+		c == '>' || c == '=' || c == '!' || c == '%' || c == '@' || c == '`' ||
+		c == '{' || c == '[' || c == ']' || c == '}' || c == ',' || c == '#' ||
+		c == '\'' || c == '"' || c == ' ' {
+		return true
+	}
+	if s[len(s)-1] == ' ' || s[len(s)-1] == ':' {
+		return true
+	}
+	if strings.Contains(s, ": ") || strings.Contains(s, " #") {
+		return true
+	}
+	if strings.Contains(s, "\n") || strings.Contains(s, "\t") {
+		return true
+	}
+	// 布尔/空/null 字面量形态
+	switch strings.ToLower(s) {
+	case "true", "false", "null", "yes", "no", "on", "off", "~":
+		return true
+	}
+	// 数字形态
+	if isNumericLike(s) {
+		return true
+	}
+	return false
+}
+
+func isNumericLike(s string) bool {
+	dot := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			continue
+		}
+		if c == '.' && !dot && i > 0 {
+			dot = true
+			continue
+		}
+		if (c == '-' || c == '+') && i == 0 {
+			continue
+		}
+		return false
+	}
+	return len(s) > 0
+}
