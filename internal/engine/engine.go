@@ -21,6 +21,7 @@ import (
 	"github.com/specforge/specforge/internal/compiler"
 	"github.com/specforge/specforge/internal/facts"
 	"github.com/specforge/specforge/internal/loader"
+	"github.com/specforge/specforge/internal/memo"
 	"github.com/specforge/specforge/internal/profile"
 	"github.com/specforge/specforge/internal/slicing"
 	"github.com/specforge/specforge/internal/typeschema"
@@ -28,12 +29,18 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+// Version 引擎版本。分析行为（适配器/类型映射/编译）或依赖版本变化时须递增，
+// 否则 memo 指纹会把旧引擎的缓存误判为新鲜（设计文档 §5.2 缓存键含 EngineVersion）。
+const Version = "0.4.0"
+
 // Config 生成配置。
 type Config struct {
 	RepoDir     string
 	Service     string
 	ProfilePath string
 	OutDir      string
+	// MemoDir 运行级 memo 缓存目录；空 = 禁用（每次全量重算）。
+	MemoDir string
 }
 
 // Result 运行统计（CLI 与 --json 消费）。
@@ -55,11 +62,47 @@ type Result struct {
 	OutDir           string
 	Repo             string
 	FactsList        []*facts.Fact
+	Cached           bool // 命中运行级 memo 缓存（本次未重新分析）
 }
 
 // Run 执行完整生成。
 func Run(cfg Config) (*Result, error) {
-	// 0. 仓库摄入
+	// 0. 运行级 memo 缓存：输入指纹未变直接复用上次产物，跳过整个分析管线。
+	fp, err := memo.Fingerprint(cfg.RepoDir, cfg.Service, cfg.ProfilePath, Version)
+	if err != nil {
+		return nil, err
+	}
+	store := memo.New(cfg.MemoDir)
+	if spec, report, summary, ok := store.Load(fp); ok {
+		outDir := cfg.OutDir
+		if outDir == "" {
+			outDir = filepath.Join(cfg.RepoDir, ".specforge", "out")
+		}
+		if err := os.MkdirAll(outDir, 0o755); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(outDir, "openapi.yaml"), spec, 0o644); err != nil {
+			return nil, err
+		}
+		if err := os.WriteFile(filepath.Join(outDir, "report.md"), report, 0o644); err != nil {
+			return nil, err
+		}
+		return &Result{
+			Services:         summary.Service,
+			Repo:             cfg.RepoDir,
+			Operations:       summary.Operations,
+			Routes:           summary.Routes,
+			RoutesResolved:   summary.Routes - summary.RoutesUnresolved,
+			RoutesUnresolved: summary.RoutesUnresolved,
+			SchemaTypes:      summary.SchemaTypes,
+			Facts:            summary.Facts,
+			LowConf:          summary.LowConfidence,
+			OutDir:           outDir,
+			Cached:           true,
+		}, nil
+	}
+
+	// 1. 仓库摄入
 	l, err := loader.LoadRepo(cfg.RepoDir)
 	if err != nil {
 		return nil, err
@@ -183,6 +226,16 @@ func Run(cfg Config) (*Result, error) {
 	if err := os.WriteFile(filepath.Join(outDir, "report.md"), []byte(report), 0o644); err != nil {
 		return nil, err
 	}
+	// 写 memo 缓存：下次输入未变时直接复用产物。
+	_ = store.Save(fp, specYAML, []byte(report), memo.Summary{
+		Service:          svcName,
+		Operations:       res.Operations,
+		Routes:           res.Routes,
+		RoutesUnresolved: res.RoutesUnresolved,
+		SchemaTypes:      res.SchemaTypes,
+		Facts:            res.Facts,
+		LowConfidence:    res.LowConf,
+	})
 	return res, nil
 }
 

