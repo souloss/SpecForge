@@ -233,6 +233,7 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 
 	seenSuccess := map[string]bool{}
 	seenErrCode := map[string]bool{}
+	var errSources []string
 	hasUnresolvedErr := false
 
 	for _, h := range hits {
@@ -299,12 +300,20 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 			})
 		case h.ErrUnresolved:
 			hasUnresolvedErr = true
+			// 溯源成功但码不可静态定（如 errgroup.Wait）：把来源记进 unknown，供报告展示。
+			if h.ErrSource != "" && !containsStr(errSources, h.ErrSource) {
+				errSources = append(errSources, h.ErrSource)
+			}
 		}
 	}
 	if hasUnresolvedErr {
+		msg := "error variable not statically traceable"
+		if len(errSources) > 0 {
+			msg += " (sources: " + strings.Join(errSources, ", ") + ")"
+		}
 		rows = append(rows, facts.ResponseFact{
 			Status: hits[0].Status, HasBody: false,
-			Envelope: &facts.Envelope{Code: -1, CodeRef: "unresolved", Msg: "error variable not statically traceable"},
+			Envelope: &facts.Envelope{Code: -1, CodeRef: "unresolved", Msg: msg},
 			Sink:     "(multiple)",
 		})
 		unknowns = append(unknowns, "error envelope: err variable not statically resolved")

@@ -31,6 +31,7 @@ type SinkHit struct {
 	ErrConstID    string   // 错误码常量符号（可解析时）
 	ErrCallCallee string   // 错误构造器调用（如 code.NewDefaultError）
 	ErrUnresolved bool     // err 为变量: 信封码不可静态解析
+	ErrSource     string   // err 变量的来源证据（定义点的调用符号 + file:line）
 	HandlerPath   []string // 从 handler 到 sink 的调用路径（证据链）
 }
 
@@ -146,11 +147,104 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 				}
 			}
 		default:
-			// err 变量: 局部逆向数据流不在 P0 范围 → 显式未解析
+			// err 变量: 错误码无法静态确定，始终标未解析；溯源信息仅供报告展示，
+			// 不改变「未解析」的定性（否则会把 errgroup.Wait 等 sink 静默丢弃）。
+			hit.ErrSource = s.traceErrSource(site, pat.ErrSlot)
 			hit.ErrUnresolved = true
 		}
 	}
 	return hit
+}
+
+// traceErrSource 对 err 变量做保守的局部数据流：定位其在 sink 之前最近一次赋值的来源。
+//
+// 只处理两种确定性来源，其余显式返回空（交由上层按未解析降级，绝不臆测）：
+//  1. `if err = g.Wait(); err != nil { return code.Response(c, err, nil) }` ——
+//     来源为 errgroup.Wait，错误码不可静态确定（返回 "errgroup.Wait" 标记）。
+//  2. 直接 `err := call(...)` 且该 call 返回 error —— 错误码来自被调函数内部。
+//
+// 返回人类可读的来源证据串（如 "errgroup.Wait@ipoServer.go:233"），
+// 供 report 展示；本函数只负责溯源，不负责解析出具体错误码。
+func (s *Slicer) traceErrSource(site codegraph.CallSite, errSlot int) string {
+	fd := s.funcDeclOf(site.Caller)
+	if fd == nil || fd.Body == nil {
+		return ""
+	}
+	sinkLine := site.Line
+	var errName string
+	if errSlot < len(site.ArgExprs) {
+		if id, ok := ast.Unparen(site.ArgExprs[errSlot]).(*ast.Ident); ok {
+			errName = id.Name
+		}
+	}
+	if errName == "" {
+		return ""
+	}
+	var source string
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if source != "" {
+			return false
+		}
+		as, ok := n.(*ast.AssignStmt)
+		if !ok {
+			return true
+		}
+		if s.g.Fset.Position(as.Pos()).Line > sinkLine {
+			return false
+		}
+		for i, lhs := range as.Lhs {
+			id, ok := lhs.(*ast.Ident)
+			if !ok || id.Name != errName || i >= len(as.Rhs) {
+				continue
+			}
+			rhs := as.Rhs[i]
+			if call, ok := ast.Unparen(rhs).(*ast.CallExpr); ok {
+				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Wait" {
+					source = "errgroup.Wait"
+				} else {
+					source = "call"
+				}
+			}
+		}
+		return true
+	})
+	if source == "" {
+		return ""
+	}
+	return source + "@" + shortFileOf(site.File) + ":" + itoa(sinkLine)
+}
+
+// funcDeclOf 定位符号 ID 对应的函数声明。
+func (s *Slicer) funcDeclOf(symbolID string) *ast.FuncDecl {
+	return s.g.FuncDeclOf(symbolID)
+}
+
+// shortFileOf 取文件名（无目录）。
+func shortFileOf(path string) string {
+	if i := strings.LastIndexByte(path, '/'); i >= 0 {
+		return path[i+1:]
+	}
+	return path
+}
+
+// itoa 小整数转字符串（避免引入 strconv 全量）。
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var b []byte
+	for n > 0 {
+		b = append([]byte{byte('0' + n%10)}, b...)
+		n /= 10
+	}
+	if neg {
+		b = append([]byte{'-'}, b...)
+	}
+	return string(b)
 }
 
 // constFromErrCall 从错误构造器调用中提取常量实参。

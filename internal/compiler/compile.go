@@ -195,8 +195,11 @@ func Compile(in Input) (*Document, error) {
 					fmt.Sprintf("Business error (code=%d): %s", code, msg))
 			} else {
 				g.HasUnresolved = true
-				g.Description = appendDesc(g.Description,
-					"Business error (code unresolved from source)")
+				desc := "Business error (code unresolved from source)"
+				if r.Envelope != nil && r.Envelope.Msg != "" {
+					desc = "Business error (code unresolved from source; " + r.Envelope.Msg + ")"
+				}
+				g.Description = appendDesc(g.Description, desc)
 			}
 			if code >= 0 {
 				g.Codes = appendUniq(g.Codes, code)
