@@ -55,6 +55,9 @@ type ContractPayload struct {
 	RequestBody *BodyFact      `yaml:"requestBody,omitempty"`
 	Responses   []ResponseFact `yaml:"responses"`
 	Security    []string       `yaml:"security,omitempty"`
+	// Gaps 静态分析未能定型、需 LLM 兜底采集的缺口清单（档位判定输入）。
+	// 空 = 全静态可定型（档位1，0 token）；非空 = 候选兜底对象。
+	Gaps []string `yaml:"gaps,omitempty"`
 }
 
 // ParamFact 参数事实。

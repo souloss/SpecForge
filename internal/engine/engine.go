@@ -63,6 +63,8 @@ type Result struct {
 	Repo             string
 	FactsList        []*facts.Fact
 	Cached           bool // 命中运行级 memo 缓存（本次未重新分析）
+	// Gaps 静态缺口清单（档位判定输入）：每条 "METHOD /path: gap1; gap2"。
+	Gaps []string
 }
 
 // Run 执行完整生成。
@@ -182,6 +184,10 @@ func Run(cfg Config) (*Result, error) {
 		}
 	}
 	res.SchemaTypes = len(schemaFacts)
+
+	// 聚合缺口清单（GapReport）：静态管线留下的待兜底项，档位判定的输入。
+	// 每条是 "METHOD /path: gap1; gap2"。纯静态聚合，零 token。
+	res.Gaps = collectGaps(factList)
 
 	// 统计
 	res.FactsList = factList
@@ -540,13 +546,54 @@ func firstLine(s string) string {
 	return s
 }
 
+// collectGaps 聚合静态缺口清单：把 contract 事实里的 Gaps 提取成
+// "METHOD /path: gap1; gap2" 的可读行，供档位判定与 report 消费。
+func collectGaps(factList []*facts.Fact) []string {
+	var out []string
+	for _, f := range factList {
+		if f.Kind != facts.KindContract {
+			continue
+		}
+		cp, ok := f.Value.(facts.ContractPayload)
+		if !ok {
+			if cpp, ok2 := f.Value.(*facts.ContractPayload); ok2 {
+				cp = *cpp
+			} else {
+				continue
+			}
+		}
+		if len(cp.Gaps) == 0 {
+			continue
+		}
+		method, path := opMethodPath(f.ID)
+		out = append(out, method+" "+path+": "+strings.Join(cp.Gaps, "; "))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// opMethodPath 从 contract 事实 ID（"contract:op:METHOD:/path"）提取 method 与 path。
+func opMethodPath(factID string) (string, string) {
+	s := factID
+	s = strings.TrimPrefix(s, "contract:")
+	s = strings.TrimPrefix(s, "op:")
+	if i := strings.Index(s, ":"); i > 0 {
+		return s[:i], s[i+1:]
+	}
+	return "", s
+}
+
 // renderReport 置信度报告（F11）。
 func renderReport(doc *compiler.Document, res *Result) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# SpecForge 置信度报告\n\n")
 	fmt.Fprintf(&b, "- 生成时间: %s\n", time.Now().Format(time.RFC3339))
 	fmt.Fprintf(&b, "- operations: %d, schema types: %d\n", len(doc.Operations), len(doc.Schemas))
-	fmt.Fprintf(&b, "- 低置信项 (<0.8): %d\n\n", res.LowConf)
+	fmt.Fprintf(&b, "- 低置信项 (<0.8): %d\n", res.LowConf)
+	if len(res.Gaps) > 0 {
+		fmt.Fprintf(&b, "- 静态缺口 (待 LLM 兜底): %d\n", len(res.Gaps))
+	}
+	fmt.Fprintf(&b, "\n")
 
 	var low []*compiler.Operation
 	for i := range doc.Operations {

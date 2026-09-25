@@ -116,6 +116,9 @@ func (b *ContractPayloadBuilder) Build() (*facts.Fact, []*facts.Fact, []*facts.F
 		conf = 0.4
 	}
 
+	// 静态缺口固化到 contract 事实，供档位判定（LLM 兜底的前置输入）。
+	cp.Gaps = unknowns
+
 	cfact := &facts.Fact{
 		ID: "contract:" + b.opKey, Kind: facts.KindContract, Value: cp,
 		Source: facts.SourceStatic, Confidence: conf,
