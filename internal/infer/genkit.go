@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
@@ -62,8 +63,11 @@ func (p *genkitProvider) Name() string { return p.name }
 
 // Complete 实现 Provider：system + prompt + 可选输出 schema。
 // 返回模型输出的原始文本字节（期望是 JSON，但不做结构校验——校验在上层）。
+// 单次调用给 60s 超时；LLM 兜底按 operation 逐个调用，串行超时会拖垮全量，
+// 故调用方（engine）还需对每个 operation 单点容错。
 func (p *genkitProvider) Complete(system, prompt string, schema []byte) ([]byte, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
 	opts := []ai.GenerateOption{
 		ai.WithModel(p.model),
 		ai.WithSystem(system),
@@ -84,12 +88,14 @@ func (p *genkitProvider) Complete(system, prompt string, schema []byte) ([]byte,
 
 // CompleteWithTools 实现 ToolUser：注册工具后走 genkit 多轮生成（工具循环由
 // WithMaxTurns 自动驱动）。工具集按 name 幂等注册，同一 provider 复用。
+// 多轮工具循环给 180s 超时（工具调用往返 + 模型多轮推理）。
 func (p *genkitProvider) CompleteWithTools(system, prompt string, schema []byte, tools []ToolSpec, maxTurns int) ([]byte, error) {
 	refs, err := p.registerTools(tools)
 	if err != nil {
 		return nil, err
 	}
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
 	opts := []ai.GenerateOption{
 		ai.WithModel(p.model),
 		ai.WithSystem(system),
