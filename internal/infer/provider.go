@@ -9,107 +9,26 @@
 package infer
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"os"
-	"time"
 )
 
 // ErrNoProvider 无可用 LLM 配置（离线模式）。
 var ErrNoProvider = errors.New("infer: no LLM provider configured (offline mode)")
 
-// Provider LLM 供应方抽象（temperature=0 的结构化补全）。
+// Provider LLM 供应方抽象（结构化补全）。
 type Provider interface {
 	// Complete 结构化补全。system 与 prompt 注入; schema 为 JSON Schema
-	// 约束解码（防线 1，设计文档 §6.3）。
+	// （输出约束；具体是否被模型侧强制取决于插件，事后结构校验由上层承担）。
 	Complete(system, prompt string, schema []byte) ([]byte, error)
 	Name() string
 }
 
-// HTTPProvider OpenAI 兼容 /chat/completions 实现。
-type HTTPProvider struct {
-	BaseURL string // 如 https://api.example.com/v1
-	APIKey  string
-	Model   string
-	Client  *http.Client
-}
-
-// NewProviderFromEnv 从环境变量构造（SPECFORGE_LLM_BASE_URL 等）。
-// 未配置时返回 nil（离线模式）。
+// NewProviderFromEnv 从环境变量构造 Provider。
+// 优先走 Genkit Provider（Z.ai GLM）；未配置返回 nil（离线模式）。
 func NewProviderFromEnv() Provider {
-	base := os.Getenv("SPECFORGE_LLM_BASE_URL")
-	key := os.Getenv("SPECFORGE_LLM_API_KEY")
-	if base == "" || key == "" {
-		return nil
-	}
-	return &HTTPProvider{
-		BaseURL: base,
-		APIKey:  key,
-		Model:   envOr("SPECFORGE_LLM_MODEL", "glm-4.6"),
-		Client:  &http.Client{Timeout: 120 * time.Second},
-	}
-}
-
-// Name 实现 Provider。
-func (p *HTTPProvider) Name() string { return "http:" + p.Model }
-
-// Complete 实现 Provider: JSON Schema 约束 + temperature 0。
-func (p *HTTPProvider) Complete(system, prompt string, schema []byte) ([]byte, error) {
-	msgs := []map[string]interface{}{
-		{"role": "system", "content": system},
-		{"role": "user", "content": prompt},
-	}
-	body := map[string]interface{}{
-		"model":       p.Model,
-		"messages":    msgs,
-		"temperature": 0,
-	}
-	if len(schema) > 0 {
-		body["response_format"] = map[string]interface{}{
-			"type": "json_schema",
-			"json_schema": map[string]interface{}{
-				"name":   "specforge_fact",
-				"schema": json.RawMessage(schema),
-			},
-		}
-	}
-	raw, err := json.Marshal(body)
-	if err != nil {
-		return nil, err
-	}
-	req, err := http.NewRequest("POST", p.BaseURL+"/chat/completions", bytes.NewReader(raw))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+p.APIKey)
-	resp, err := p.Client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("infer: llm call: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return nil, fmt.Errorf("infer: llm http %d: %s", resp.StatusCode, string(b))
-	}
-	var out struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	if len(out.Choices) == 0 {
-		return nil, errors.New("infer: empty choices")
-	}
-	return []byte(out.Choices[0].Message.Content), nil
+	return NewGenkitProvider()
 }
 
 // TaskCard 档位 2/3 的任务卡（设计文档 §10.4）。
@@ -165,11 +84,4 @@ func EnrichOperation(p Provider, op, evidenceSummary string) (map[string]interfa
 		return nil, errors.New("infer: enrichment missing summary")
 	}
 	return out, nil
-}
-
-func envOr(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return def
 }
