@@ -3,8 +3,10 @@ package engine
 import (
 	"testing"
 
+	"github.com/specforge/specforge/internal/codegraph"
 	"github.com/specforge/specforge/internal/facts"
 	"github.com/specforge/specforge/internal/infer"
+	"github.com/specforge/specforge/internal/loader"
 	"github.com/specforge/specforge/internal/slicing"
 )
 
@@ -62,5 +64,46 @@ func TestApplyGapResolutionWritesBackValidCode(t *testing.T) {
 func TestResolveGapsOffline(t *testing.T) {
 	if _, err := infer.ResolveGaps(nil, infer.GapTask{}); err != infer.ErrNoProvider {
 		t.Fatalf("want ErrNoProvider, got %v", err)
+	}
+}
+
+// TestBuildToolsReadSymbol 工具闭包能读符号。
+func TestBuildToolsReadSymbol(t *testing.T) {
+	l, _ := loader.LoadRepo("/home/whj/projects/sample-ipo-rebase")
+	pkgs := l.ServiceFilter("service-ipo")
+	g, _ := codegraph.Build(pkgs, l.Fset)
+	tools := buildTools(g)
+	if len(tools) != 3 {
+		t.Fatalf("want 3 tools, got %d", len(tools))
+	}
+	// read_symbol 对已知符号应返回 JSON。
+	var readSym, calleesT, readType infer.ToolSpec
+	for _, t := range tools {
+		switch t.Name {
+		case "read_symbol":
+			readSym = t
+		case "callees":
+			calleesT = t
+		case "read_type":
+			readType = t
+		}
+	}
+	_ = readType
+	if readSym.Call == nil || calleesT.Call == nil {
+		t.Fatal("read_symbol / callees tools missing Call")
+	}
+	out, err := readSym.Call(map[string]any{"id": "trade/internal/common/app.ping"})
+	if err != nil {
+		t.Fatalf("read_symbol call: %v", err)
+	}
+	if len(out) == 0 || out[0] != '{' {
+		t.Fatalf("read_symbol should return JSON, got %q", out)
+	}
+	out2, err := calleesT.Call(map[string]any{"id": "trade/internal/common/app.ping"})
+	if err != nil {
+		t.Fatalf("callees call: %v", err)
+	}
+	if len(out2) == 0 {
+		t.Fatal("callees should return JSON")
 	}
 }

@@ -7,6 +7,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/types"
@@ -619,7 +620,18 @@ func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profi
 		}
 		method, path := opMethodPath(f.ID)
 		task := buildGapTask(method, path, cp.Gaps, g, prof, catalog)
-		resolution, err := infer.ResolveGaps(p, task)
+
+		// 档位3 优先：provider 支持工具时走多轮工具循环；否则退回档位2 模板化。
+		var resolution *infer.GapResolution
+		var err error
+		if hasAnyGap(cp.Gaps, "any/interface{}") {
+			if _, ok := p.(infer.ToolUser); ok {
+				resolution, err = infer.ResolveGapsWithTools(p, task, buildTools(g), 12)
+			}
+		}
+		if resolution == nil {
+			resolution, err = infer.ResolveGaps(p, task)
+		}
 		if err != nil {
 			// 单点失败降级：保持 unknown，不阻断。
 			continue
@@ -629,6 +641,85 @@ func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profi
 		f.Value = cp
 	}
 	return calls
+}
+
+// hasAnyGap 判断缺口清单里是否含指定子串。
+func hasAnyGap(gaps []string, substr string) bool {
+	for _, g := range gaps {
+		if strings.Contains(g, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildTools 构造档位3 子 Agent 的工具集：对代码图的只读查询闭包。
+// 每个工具返回文本结果（JSON 序列化），genkit 负责 schema 引导。
+func buildTools(g *codegraph.Graph) []infer.ToolSpec {
+	return []infer.ToolSpec{
+		{
+			Name:        "read_symbol",
+			Description: "Read a symbol's source location and doc. Input: {\"id\": \"<full symbol id>\"}.",
+			Call: func(input map[string]any) (string, error) {
+				id, _ := input["id"].(string)
+				if id == "" {
+					return `{"error":"id required"}`, nil
+				}
+				sym := g.Sym(id)
+				if sym == nil {
+					return `{"error":"symbol not found"}`, nil
+				}
+				b, _ := json.Marshal(map[string]any{
+					"id":   sym.ID,
+					"kind": sym.Kind,
+					"file": sym.File,
+					"line": sym.Line,
+					"doc":  sym.Doc,
+				})
+				return string(b), nil
+			},
+		},
+		{
+			Name:        "callees",
+			Description: "List a function's direct callees. Input: {\"id\": \"<symbol id>\"}.",
+			Call: func(input map[string]any) (string, error) {
+				id, _ := input["id"].(string)
+				if id == "" {
+					return `{"error":"id required"}`, nil
+				}
+				callees := g.CalleesOf(id)
+				b, _ := json.Marshal(map[string]any{"callees": callees})
+				return string(b), nil
+			},
+		},
+		{
+			Name:        "read_type",
+			Description: "Read a named type's fields. Input: {\"id\": \"<type id>\"}.",
+			Call: func(input map[string]any) (string, error) {
+				id, _ := input["id"].(string)
+				if id == "" {
+					return `{"error":"id required"}`, nil
+				}
+				ti := g.Type(id)
+				if ti == nil {
+					return `{"error":"type not found"}`, nil
+				}
+				var fields []map[string]any
+				for _, fld := range ti.Fields {
+					fields = append(fields, map[string]any{
+						"name":     fld.Name,
+						"json":     fld.JSONName,
+						"type":     fld.TypeStr,
+						"required": fld.Required,
+					})
+				}
+				b, _ := json.Marshal(map[string]any{
+					"id": ti.ID, "isStruct": ti.IsStruct, "fields": fields,
+				})
+				return string(b), nil
+			},
+		},
+	}
 }
 
 // buildGapTask 组装一次兜底采集的输入（证据切片 + 错误码目录）。

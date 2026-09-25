@@ -98,13 +98,7 @@ func ResolveGaps(p Provider, task GapTask) (*GapResolution, error) {
 	if p == nil {
 		return nil, ErrNoProvider
 	}
-	system := "You are an API contract extractor. Given code evidence and a list of " +
-		"unresolved gaps, produce ONLY the concrete facts that resolve them. " +
-		"For error codes, you may only use codes whose symbol appears in the " +
-		"provided errorCatalog — never invent a code. For response schemas, " +
-		"only report fields you can see in the evidence. Respond as JSON matching " +
-		"the output schema:\n" + gapOutputSchema
-
+	system := gapSystemPrompt
 	ev, err := json.Marshal(task)
 	if err != nil {
 		return nil, fmt.Errorf("infer: marshal gap task: %w", err)
@@ -113,11 +107,49 @@ func ResolveGaps(p Provider, task GapTask) (*GapResolution, error) {
 	if err != nil {
 		return nil, err
 	}
+	return parseGapResolution(raw)
+}
+
+// ResolveGapsWithTools 档位3：带工具的兜底采集（工具循环由 provider 侧
+// WithMaxTurns 驱动）。离线或 provider 不支持工具时返回 ErrNoProvider /
+// ErrToolsUnsupported，由 engine 降级到档位2。
+func ResolveGapsWithTools(p Provider, task GapTask, tools []ToolSpec, maxTurns int) (*GapResolution, error) {
+	if p == nil {
+		return nil, ErrNoProvider
+	}
+	tu, ok := p.(ToolUser)
+	if !ok {
+		return nil, ErrToolsUnsupported
+	}
+	ev, err := json.Marshal(task)
+	if err != nil {
+		return nil, fmt.Errorf("infer: marshal gap task: %w", err)
+	}
+	raw, err := tu.CompleteWithTools(gapSystemPrompt, string(ev), []byte(gapOutputSchema), tools, maxTurns)
+	if err != nil {
+		return nil, err
+	}
+	return parseGapResolution(raw)
+}
+
+// ErrToolsUnsupported provider 不支持工具调用（档位3 不可用）。
+var ErrToolsUnsupported = errors.New("infer: provider does not support tools")
+
+// gapSystemPrompt 档位2/3 共用的 system prompt。
+const gapSystemPrompt = "You are an API contract extractor. Given code evidence and a list of " +
+	"unresolved gaps, produce ONLY the concrete facts that resolve them. " +
+	"For error codes, you may only use codes whose symbol appears in the " +
+	"provided errorCatalog — never invent a code. For response schemas, " +
+	"only report fields you can see in the evidence (use tools to read " +
+	"source when the evidence is insufficient). Respond as JSON matching " +
+	"the output schema:\n" + gapOutputSchema
+
+// parseGapResolution 反序列化 + 防线2 结构校验。
+func parseGapResolution(raw []byte) (*GapResolution, error) {
 	var out GapResolution
 	if err := json.Unmarshal(raw, &out); err != nil {
 		return nil, fmt.Errorf("infer: gap resolution output invalid: %w", err)
 	}
-	// 防线2: 结构校验（§6.3）——codeRef 非空是最低要求，catalog 命中校验在 engine 侧。
 	for _, e := range out.ErrorCodes {
 		if e.CodeRef == "" {
 			return nil, errors.New("infer: gap resolution contains empty codeRef")
