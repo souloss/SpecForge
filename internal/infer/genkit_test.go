@@ -4,22 +4,34 @@ import (
 	"testing"
 )
 
-// TestNewProviderFromEnvOffline 无 API key 时返回 nil（离线模式），
+// TestNewProviderFromEnvOffline 无认证环境变量时返回 nil（离线模式），
 // 保证接入 Genkit 后离线降级行为不变（回归守卫）。
 func TestNewProviderFromEnvOffline(t *testing.T) {
-	t.Setenv("ZAI_API_KEY", "")
-	t.Setenv("SPECFORGE_LLM_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
 	if p := NewProviderFromEnv(); p != nil {
 		t.Fatalf("NewProviderFromEnv() = %v, want nil (offline)", p)
 	}
 }
 
-// TestFirstNonEmpty 边界。
-func TestFirstNonEmpty(t *testing.T) {
-	if got := firstNonEmpty("", "a", "b"); got != "a" {
-		t.Fatalf("firstNonEmpty = %q, want %q", got, "a")
+// TestNewProviderFromEnvModelDefault 默认模型名。
+func TestNewProviderFromEnvModelDefault(t *testing.T) {
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "sk-test")
+	t.Setenv("ANTHROPIC_MODEL", "")
+	if p := NewProviderFromEnv(); p == nil {
+		t.Fatalf("NewProviderFromEnv() = nil, want non-nil with auth token set")
+	} else if p.Name() != "genkit:anthropic:deepseek-v4-pro-0813" {
+		t.Fatalf("Name() = %q, want default model name", p.Name())
 	}
-	if got := firstNonEmpty(""); got != "" {
-		t.Fatalf("firstNonEmpty(all empty) = %q, want empty", got)
+}
+
+// TestEnvOr 边界。
+func TestEnvOr(t *testing.T) {
+	t.Setenv("SPECFORGE_TEST_ENV", "present")
+	if got := envOr("SPECFORGE_TEST_ENV", "def"); got != "present" {
+		t.Fatalf("envOr = %q, want %q", got, "present")
+	}
+	if got := envOr("SPECFORGE_TEST_ENV_MISSING", "def"); got != "def" {
+		t.Fatalf("envOr = %q, want default %q", got, "def")
 	}
 }

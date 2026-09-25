@@ -7,16 +7,23 @@ import (
 
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
-	"github.com/firebase/genkit/go/plugins/compat_oai/zai"
+	"github.com/firebase/genkit/go/plugins/anthropic"
 )
 
-// genkitProvider 用 Genkit 框架 + Z.ai GLM 插件实现 Provider。
+// genkitProvider 用 Genkit 框架 + anthropic 协议网关实现 Provider。
 //
-// 相对旧 HTTPProvider 的差异：
-//   - 走 genkit.Init / genkit.Generate，天然带 tracing 与 Dev UI 可观测；
-//   - Z.ai 不支持 json_schema 约束解码（zai 插件注释自陈），WithOutputSchema
-//     只会把 schema 作为 prompt 指令下发，故「事后结构校验」由上层
-//     （EnrichOperation / ResolveGaps）承担，本层只保证返回原始文本字节。
+// 目标网关满足 anthropic 协议（非官方，是三方网关），认证与端点全部由
+// anthropic-sdk-go 的 DefaultClientOptions 从环境变量读取：
+//
+//	ANTHROPIC_AUTH_TOKEN → authorization: Bearer <token>
+//	ANTHROPIC_BASE_URL   → 请求端点
+//
+// 模型名由 ANTHROPIC_MODEL 单独指定（SDK/插件均不读该变量），默认
+// deepseek-v4-pro-0813，作为 model ID 原样透传给网关。
+//
+// 结构校验分工：网关模型不在 anthropic 官方的 structured-output 白名单内，
+// WithOutputSchema 只把 schema 作为 prompt 指令下发（尽力而为），真正的
+// 结构校验由上层（EnrichOperation / ResolveGaps）承担，本层只返回原始文本。
 type genkitProvider struct {
 	g     *genkit.Genkit
 	model ai.ModelRef
@@ -48,40 +55,26 @@ func (p *genkitProvider) Complete(system, prompt string, schema []byte) ([]byte,
 	return []byte(resp.Text()), nil
 }
 
-// NewGenkitProvider 构造 Genkit Provider。
-// 优先读 Z.ai 插件标准环境变量（ZAI_API_KEY / ZAI_BASE_URL），
-// 回退到历史 SPECFORGE_LLM_* 变量。APIKey 为空返回 nil（离线模式）。
+// NewGenkitProvider 构造 Genkit Provider（anthropic 协议网关）。
+// 认证依赖环境变量 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY，
+// 二者皆空返回 nil（离线模式）。
 func NewGenkitProvider() Provider {
-	key := firstNonEmpty(os.Getenv("ZAI_API_KEY"), os.Getenv("SPECFORGE_LLM_API_KEY"))
-	if key == "" {
+	token := os.Getenv("ANTHROPIC_AUTH_TOKEN")
+	apiKey := os.Getenv("ANTHROPIC_API_KEY")
+	if token == "" && apiKey == "" {
 		return nil
 	}
-	// 兼容旧 SPECFORGE_LLM_BASE_URL：zai 插件的 Init 读 ZAI_BASE_URL，
-	// 仅在显式配置了旧变量而 ZAI_BASE_URL 未设时桥接一次。
-	if os.Getenv("ZAI_BASE_URL") == "" {
-		if base := os.Getenv("SPECFORGE_LLM_BASE_URL"); base != "" {
-			os.Setenv("ZAI_BASE_URL", base)
-		}
-	}
-	model := envOr("SPECFORGE_LLM_MODEL", "glm-4.6")
+	model := envOr("ANTHROPIC_MODEL", "deepseek-v4-pro-0813")
+	// 空结构体：认证与端点由 anthropic 插件 Init 与 SDK 的 DefaultClientOptions
+	// 从环境变量读取，避免在代码里显式持有 token。
 	g := genkit.Init(context.Background(),
-		genkit.WithPlugins(&zai.ZAI{APIKey: key}),
+		genkit.WithPlugins(&anthropic.Anthropic{}),
 	)
 	return &genkitProvider{
 		g:     g,
-		model: zai.ModelRef(model, nil),
-		name:  "genkit:zai:" + model,
+		model: anthropic.ModelRef(model, nil),
+		name:  "genkit:anthropic:" + model,
 	}
-}
-
-// firstNonEmpty 返回第一个非空字符串。
-func firstNonEmpty(vals ...string) string {
-	for _, v := range vals {
-		if v != "" {
-			return v
-		}
-	}
-	return ""
 }
 
 // envOr 读取环境变量，未设置时返回默认值。
