@@ -20,6 +20,7 @@ import (
 	"github.com/specforge/specforge/internal/compiler"
 	"github.com/specforge/specforge/internal/engine"
 	"github.com/specforge/specforge/internal/eval"
+	"github.com/specforge/specforge/internal/infer"
 )
 
 const Version = "0.4.0" // P0+P1 实现: 静态全流水线 + IR + 确定性编译 + 评测
@@ -73,8 +74,17 @@ func cmdGen(args []string) error {
 	profile := fs.String("profile", "", "convention profile yaml (optional)")
 	outDir := fs.String("out", "", "output dir (default: <repo>/.specforge/out)")
 	memoDir := fs.String("memo", "", "run-level memo cache dir (optional; reuse outputs when inputs unchanged)")
+	llm := fs.Bool("llm", false, "enable LLM gap-filling (tier 2) for statically-unresolved gaps")
 	jsonOut := fs.Bool("json", false, "agent-friendly JSON summary on stdout")
 	fs.Parse(args)
+
+	var provider infer.Provider
+	if *llm {
+		provider = infer.NewProviderFromEnv()
+		if provider == nil {
+			return fmt.Errorf("--llm requested but no provider configured (set ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY)")
+		}
+	}
 
 	t0 := time.Now()
 	result, err := engine.Run(engine.Config{
@@ -83,6 +93,7 @@ func cmdGen(args []string) error {
 		ProfilePath: *profile,
 		OutDir:      *outDir,
 		MemoDir:     *memoDir,
+		Provider:    provider,
 	})
 	if err != nil {
 		return err

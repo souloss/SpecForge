@@ -83,6 +83,8 @@ type ResponseFact struct {
 	SchemaType string    `yaml:"schemaType,omitempty"`
 	HasBody    bool      `yaml:"hasBody"`
 	Sink       string    `yaml:"sink"`
+	// Source 该行的事实来源：空 = static；"llm" = 由 LLM 兜底采集补齐。
+	Source string `yaml:"source,omitempty"`
 }
 
 // Envelope 业务错误码信封。

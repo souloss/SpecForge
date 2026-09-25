@@ -20,6 +20,7 @@ import (
 	"github.com/specforge/specforge/internal/codegraph"
 	"github.com/specforge/specforge/internal/compiler"
 	"github.com/specforge/specforge/internal/facts"
+	"github.com/specforge/specforge/internal/infer"
 	"github.com/specforge/specforge/internal/loader"
 	"github.com/specforge/specforge/internal/memo"
 	"github.com/specforge/specforge/internal/profile"
@@ -41,6 +42,8 @@ type Config struct {
 	OutDir      string
 	// MemoDir 运行级 memo 缓存目录；空 = 禁用（每次全量重算）。
 	MemoDir string
+	// Provider 可选 LLM 供应方；非 nil 时对静态缺口做档位2 兜底采集。
+	Provider infer.Provider
 }
 
 // Result 运行统计（CLI 与 --json 消费）。
@@ -65,6 +68,8 @@ type Result struct {
 	Cached           bool // 命中运行级 memo 缓存（本次未重新分析）
 	// Gaps 静态缺口清单（档位判定输入）：每条 "METHOD /path: gap1; gap2"。
 	Gaps []string
+	// LLMCalls LLM 兜底采集次数（0 = 未启用或全部静态可定型）。
+	LLMCalls int
 }
 
 // Run 执行完整生成。
@@ -174,6 +179,15 @@ func Run(cfg Config) (*Result, error) {
 		res.SinkSites += len(f)
 	}
 
+	// 聚合静态缺口清单（GapReport）：LLM 兜底之前的待补项，档位判定输入。
+	res.Gaps = collectGaps(factList)
+
+	// 9. LLM 兜底采集（档位2 模板化）：对静态缺口做单次调用补全事实。
+	// 显式启用（cfg.Provider != nil）才执行；离线时缺口保持 unknown，绝不静默编造。
+	if cfg.Provider != nil {
+		res.LLMCalls = resolveGaps(factList, g, prof, catalog, cfg.Provider)
+	}
+
 	// 收集全部 schema 事实（去重 by type ID）
 	schemaFacts := map[string]*typeschema.Schema{}
 	for _, f := range factList {
@@ -184,10 +198,6 @@ func Run(cfg Config) (*Result, error) {
 		}
 	}
 	res.SchemaTypes = len(schemaFacts)
-
-	// 聚合缺口清单（GapReport）：静态管线留下的待兜底项，档位判定的输入。
-	// 每条是 "METHOD /path: gap1; gap2"。纯静态聚合，零 token。
-	res.Gaps = collectGaps(factList)
 
 	// 统计
 	res.FactsList = factList
@@ -583,6 +593,135 @@ func opMethodPath(factID string) (string, string) {
 	return "", s
 }
 
+// resolveGaps 对带缺口的 operation 做档位2 模板化兜底采集（LLM 单次调用）。
+//
+// 只处理两类静态可判定的缺口：
+//  1. err 变量错误码未解析 → LLM 从错误码目录里选码（catalog 命中校验通过才写回）；
+//  2. any 响应不可定型 → LLM 从切片证据里读字段（字段名必须在证据中出现才写回）。
+//
+// 写回是「原地修补 contract 事实的 Responses」，不新增 fact——
+// 保持单一 contract 事实，编译器无需感知 LLM 来源，改动面最小。
+// 返回实际发生的 LLM 调用次数。单个 operation 失败不阻断整体（降级保持 unknown）。
+func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profile,
+	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider) int {
+
+	calls := 0
+	for _, f := range factList {
+		if f.Kind != facts.KindContract {
+			continue
+		}
+		cp, ok := f.Value.(facts.ContractPayload)
+		if !ok {
+			continue
+		}
+		if len(cp.Gaps) == 0 {
+			continue
+		}
+		method, path := opMethodPath(f.ID)
+		task := buildGapTask(method, path, cp.Gaps, g, prof, catalog)
+		resolution, err := infer.ResolveGaps(p, task)
+		if err != nil {
+			// 单点失败降级：保持 unknown，不阻断。
+			continue
+		}
+		calls++
+		applyGapResolution(&cp, resolution, catalog)
+		f.Value = cp
+	}
+	return calls
+}
+
+// buildGapTask 组装一次兜底采集的输入（证据切片 + 错误码目录）。
+func buildGapTask(method, path string, gaps []string, g *codegraph.Graph,
+	prof *profile.Profile, catalog map[string]slicing.ErrorCodeEntry) infer.GapTask {
+
+	task := infer.GapTask{
+		Method:   method,
+		Path:     path,
+		Gaps:     gaps,
+		Evidence: evidenceSummary(g, prof, method, path),
+	}
+	for id, e := range catalog {
+		task.ErrorCatalog = append(task.ErrorCatalog, infer.ErrorCodeItem{
+			Symbol: id, Code: e.Code, Msg: e.Msg,
+		})
+	}
+	return task
+}
+
+// evidenceSummary 组装给 LLM 的证据摘要（handler 源码 + 错误码目录行）。
+// 目前简化实现：错误码目录本身就是最强证据；handler 源码留待档位3 工具化补全。
+func evidenceSummary(g *codegraph.Graph, prof *profile.Profile, method, path string) string {
+	var b strings.Builder
+	b.WriteString("route: " + method + " " + path + "\n")
+	b.WriteString("error codes are enumerated in the errorCatalog field; ")
+	b.WriteString("pick codeRef symbols only from there.\n")
+	return b.String()
+}
+
+// applyGapResolution 把 LLM 产出写回 contract 的 Responses，并做防线校验。
+//
+// 防幻觉硬约束（设计文档 §8.3）：
+//   - errorCodes 的 codeRef 必须命中错误码目录，否则丢弃该条；
+//   - 补出的错误行只替换「未解析行」（Envelope.Code == -1），不碰静态已定的行。
+func applyGapResolution(cp *facts.ContractPayload, r *infer.GapResolution,
+	catalog map[string]slicing.ErrorCodeEntry) {
+
+	if r == nil {
+		return
+	}
+	// 建立 catalog 的 codeRef → entry 快速反查（catalog 的 key 即全限定符号）。
+	bySymbol := map[string]slicing.ErrorCodeEntry{}
+	for sym, e := range catalog {
+		bySymbol[sym] = e
+		bySymbol[shortSym(sym)] = e
+	}
+	// 未解析行集合：Envelope.Code == -1。
+	var unresolvedIdx []int
+	for i, row := range cp.Responses {
+		if row.Envelope != nil && row.Envelope.Code == -1 {
+			unresolvedIdx = append(unresolvedIdx, i)
+		}
+	}
+	if len(unresolvedIdx) == 0 || len(r.ErrorCodes) == 0 {
+		return
+	}
+	// 用 LLM 补出的错误码替换未解析行（逐个匹配；多出/缺省保守保留原样）。
+	used := map[int]bool{}
+	for _, ec := range r.ErrorCodes {
+		entry, ok := bySymbol[ec.CodeRef]
+		if !ok {
+			entry, ok = bySymbol[shortSym(ec.CodeRef)]
+		}
+		if !ok {
+			continue // 幻觉 codeRef：丢弃
+		}
+		// 找到下一个未替换的未解析行。
+		for _, idx := range unresolvedIdx {
+			if used[idx] {
+				continue
+			}
+			cp.Responses[idx].Envelope = &facts.Envelope{
+				Code:    entry.Code,
+				CodeRef: ec.CodeRef,
+				Msg:     entry.Msg,
+			}
+			cp.Responses[idx].Source = "llm"
+			used[idx] = true
+			break
+		}
+	}
+	// any 响应 schema：暂不写回（档位2 先解决错误码；schema 需要档位3 工具追类型）。
+}
+
+// shortSym 取符号 ID 的末段（pkg.ConstName → ConstName）。
+func shortSym(s string) string {
+	if i := strings.LastIndex(s, "."); i >= 0 {
+		return s[i+1:]
+	}
+	return s
+}
+
 // renderReport 置信度报告（F11）。
 func renderReport(doc *compiler.Document, res *Result) string {
 	var b strings.Builder
@@ -592,6 +731,9 @@ func renderReport(doc *compiler.Document, res *Result) string {
 	fmt.Fprintf(&b, "- 低置信项 (<0.8): %d\n", res.LowConf)
 	if len(res.Gaps) > 0 {
 		fmt.Fprintf(&b, "- 静态缺口 (待 LLM 兜底): %d\n", len(res.Gaps))
+	}
+	if res.LLMCalls > 0 {
+		fmt.Fprintf(&b, "- LLM 兜底调用: %d 次\n", res.LLMCalls)
 	}
 	fmt.Fprintf(&b, "\n")
 
