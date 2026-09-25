@@ -863,6 +863,8 @@ func WriteJSONSummary(r *Result, w *os.File) error {
 	fmt.Fprintf(&b, `"schema_types":%d,`, r.SchemaTypes)
 	fmt.Fprintf(&b, `"facts":%d,`, r.Facts)
 	fmt.Fprintf(&b, `"low_confidence":%d,`, r.LowConf)
+	fmt.Fprintf(&b, `"gaps":%d,`, len(r.Gaps))
+	fmt.Fprintf(&b, `"llm_calls":%d,`, r.LLMCalls)
 	fmt.Fprintf(&b, `"spec":%q`, r.OutDir+"/openapi.yaml")
 	b.WriteString("}\n")
 	_, err := w.WriteString(b.String())
