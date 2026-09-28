@@ -53,6 +53,9 @@ type Config struct {
 	// LearnProfile 用 LLM 从抽样接口归纳仓库约定画像（设计文档 §3.3 画像学习），
 	// 学习结果与现有画像合并（仅填补缺失项）。需 Provider 非 nil。
 	LearnProfile bool
+	// Verbose 打印详细进度日志到 stderr（各分析阶段 + 逐 operation LLM 兜底进度）。
+	// 默认 false，避免长时间运行时输出看起来「卡死」。
+	Verbose bool
 }
 
 // Result 运行统计（CLI 与 --json 消费）。
@@ -85,8 +88,14 @@ type Result struct {
 
 // Run 执行完整生成。
 func Run(cfg Config) (*Result, error) {
+	logf := func(format string, args ...interface{}) {
+		if cfg.Verbose {
+			fmt.Fprintf(os.Stderr, "[specforge] "+format+"\n", args...)
+		}
+	}
 	// 0. 运行级 memo 缓存：输入指纹未变直接复用上次产物，跳过整个分析管线。
 	// LLM 运行模式计入指纹（llmKey），避免离线/LLM 或不同 LLM 配置互相命中脏缓存。
+	logf("指纹计算 + memo 缓存查询…")
 	fp, err := memo.Fingerprint(cfg.RepoDir, cfg.Service, cfg.ProfilePath, Version, llmKeyOf(cfg))
 	if err != nil {
 		return nil, err
@@ -122,6 +131,7 @@ func Run(cfg Config) (*Result, error) {
 	}
 
 	// 1. 仓库摄入
+	logf("仓库摄入…")
 	l, err := loader.LoadRepo(cfg.RepoDir)
 	if err != nil {
 		return nil, err
@@ -144,6 +154,7 @@ func Run(cfg Config) (*Result, error) {
 	}
 
 	// 代码图
+	logf("代码图构建…")
 	g, err := codegraph.Build(pkgs, l.Fset)
 	if err != nil {
 		return nil, err
@@ -158,6 +169,7 @@ func Run(cfg Config) (*Result, error) {
 	}
 
 	// 4. 路由提取
+	logf("路由提取…")
 	routes := extractAllRoutes(g)
 	res.Routes = len(routes)
 
@@ -176,10 +188,12 @@ func Run(cfg Config) (*Result, error) {
 
 	// 4-1. 画像学习（可选）：LLM 归纳约定，与现有画像合并（仅填补缺失）。
 	if cfg.LearnProfile && cfg.Provider != nil {
+		logf("画像学习（LLM 归纳约定）…")
 		prof = learnProfileInto(cfg.Provider, prof, g, resolved)
 	}
 
 	// 5-6. handler 分析 + 响应追踪
+	logf("handler 分析 + 响应追踪（%d 个已解析路由）…", len(resolved))
 	slicer := slicing.New(g, prof)
 	synth := typeschema.New(g)
 	var factList []*facts.Fact
@@ -198,19 +212,22 @@ func Run(cfg Config) (*Result, error) {
 
 	// 聚合静态缺口清单（GapReport）：LLM 兜底之前的待补项，档位判定输入。
 	res.Gaps = collectGaps(factList)
+	logf("静态分析完成：%d operations，%d 静态缺口待 LLM 兜底", len(resolved), len(res.Gaps))
 
 	// 9. LLM 兜底采集（档位2 模板化）：对静态缺口做单次调用补全事实。
 	// 显式启用（cfg.Provider != nil）才执行；离线时缺口保持 unknown，绝不静默编造。
 	// LLMBudget 限制本次兜底的 operation 数（防全量串行卡死）。
 	if cfg.Provider != nil {
+		logf("LLM 兜底采集（budget=%d concurrency=%d）…", cfg.LLMBudget, cfg.LLMConcurrency)
 		var llmSchemas []*facts.Fact
-		res.LLMCalls, llmSchemas = resolveGaps(factList, g, prof, catalog, cfg.Provider, cfg.LLMBudget, cfg.LLMConcurrency)
+		res.LLMCalls, llmSchemas = resolveGaps(factList, g, prof, catalog, cfg.Provider, cfg.LLMBudget, cfg.LLMConcurrency, logf)
 		// LLM 兜底补出的 any 响应 schema 事实并入 factList，随既有管线编译。
 		factList = append(factList, llmSchemas...)
 		// 观测：累计 LLM 用量（token），供 CLI 打印。
 		if ur, ok := cfg.Provider.(infer.UsageReporter); ok {
 			res.LLMUsage = ur.LLMUsage()
 		}
+		logf("LLM 兜底完成：%d 次调用", res.LLMCalls)
 	}
 
 	// 收集全部 schema 事实（去重 by type ID）
@@ -722,8 +739,14 @@ type gapItem struct {
 }
 
 // resolveGaps 对带缺口的 operation 做兜底采集，支持受控并发。
+// logf 为进度日志回调（nil = 静默）；每个 operation 开始/完成时打印，避免长运行「卡死」观感。
 func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profile,
-	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, budget, concurrency int) (int, []*facts.Fact) {
+	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, budget, concurrency int,
+	logf func(string, ...interface{})) (int, []*facts.Fact) {
+
+	if logf == nil {
+		logf = func(string, ...interface{}) {}
+	}
 
 	// 预算按「缺口中收益最高者优先」排序：静态证据越强（候选越少越精准）的缺口
 	// 越值得花一次 LLM 调用。any 响应缺口（含 dataCandidates）和错误码候选明确的
@@ -748,25 +771,29 @@ func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profi
 		}
 		items = append(items, gapItem{f: f, cp: cp})
 	}
+	logf("待兜底缺口 %d 个", len(items))
 
 	if concurrency <= 1 {
 		// 串行路径：行为与旧实现完全一致（确定性、逐 operation 容错）。
-		return resolveGapsSerial(items, g, prof, catalog, p)
+		return resolveGapsSerial(items, g, prof, catalog, p, logf)
 	}
-	return resolveGapsParallel(items, g, prof, catalog, p, concurrency)
+	return resolveGapsParallel(items, g, prof, catalog, p, concurrency, logf)
 }
 
 // resolveGapsSerial 串行兜底采集：逐 operation 单点容错，返回 (调用次数, 新增 schema 事实)。
 func resolveGapsSerial(items []gapItem, g *codegraph.Graph, prof *profile.Profile,
-	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider) (int, []*facts.Fact) {
+	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider,
+	logf func(string, ...interface{})) (int, []*facts.Fact) {
 
 	calls := 0
 	var newFacts []*facts.Fact
 	successCode := successCodeOf(prof)
-	for _, it := range items {
+	for i, it := range items {
 		method, path := opMethodPath(it.f.ID)
+		logf("[%d/%d] LLM 兜底 %s %s …", i+1, len(items), method, path)
 		resolution, err := resolveOneGap(method, path, it.cp, g, prof, catalog, p)
 		if err != nil {
+			logf("[%d/%d] %s %s 失败（降级 unknown）: %v", i+1, len(items), method, path, err)
 			continue // 单点失败降级：保持 unknown，不阻断。
 		}
 		calls++
@@ -774,6 +801,7 @@ func resolveGapsSerial(items []gapItem, g *codegraph.Graph, prof *profile.Profil
 			newFacts = append(newFacts, scFact)
 		}
 		it.f.Value = it.cp
+		logf("[%d/%d] %s %s 完成", i+1, len(items), method, path)
 	}
 	return calls, newFacts
 }
@@ -781,7 +809,8 @@ func resolveGapsSerial(items []gapItem, g *codegraph.Graph, prof *profile.Profil
 // resolveGapsParallel 受控并发兜底采集：固定 worker 数，结果按原顺序写回
 // （保证确定性）。每个 operation 独立容错，失败保持 unknown。
 func resolveGapsParallel(items []gapItem, g *codegraph.Graph, prof *profile.Profile,
-	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, concurrency int) (int, []*facts.Fact) {
+	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, concurrency int,
+	logf func(string, ...interface{})) (int, []*facts.Fact) {
 
 	successCode := successCodeOf(prof)
 	type result struct {
@@ -800,12 +829,15 @@ func resolveGapsParallel(items []gapItem, g *codegraph.Graph, prof *profile.Prof
 			sem <- struct{}{}        // 抢占并发槽
 			defer func() { <-sem }() // 释放并发槽
 			method, path := opMethodPath(it.f.ID)
+			logf("[%d/%d] LLM 兜底 %s %s 开始…", i+1, len(items), method, path)
 			resolution, err := resolveOneGap(method, path, it.cp, g, prof, catalog, p)
 			if err != nil {
+				logf("[%d/%d] %s %s 失败（降级 unknown）: %v", i+1, len(items), method, path, err)
 				return // 失败不写回，保持 unknown
 			}
 			results <- result{idx: i, cp: it.cp,
 				scFact: applyGapResolution(&it.cp, resolution, catalog, g, successCode), resolved: true}
+			logf("[%d/%d] %s %s 完成", i+1, len(items), method, path)
 		}(i, it)
 	}
 	wg.Wait()

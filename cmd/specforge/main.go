@@ -78,6 +78,7 @@ func cmdGen(args []string) error {
 	llmBudget := fs.Int("llm-budget", 2, "max LLM gap-fill calls per run (0 = unlimited); caps serial LLM latency")
 	llmConcurrency := fs.Int("llm-concurrency", 0, "LLM gap-fill concurrency (0 = serial, default; >0 = bounded parallel workers)")
 	llmLearnProfile := fs.Bool("llm-learn-profile", false, "use LLM to learn repo conventions into the profile (fill missing only)")
+	verbose := fs.Bool("verbose", false, "print detailed progress logs to stderr (analysis stages + per-operation LLM progress)")
 	jsonOut := fs.Bool("json", false, "agent-friendly JSON summary on stdout")
 	fs.Parse(args)
 
@@ -100,6 +101,7 @@ func cmdGen(args []string) error {
 		LLMBudget:      *llmBudget,
 		LLMConcurrency: *llmConcurrency,
 		LearnProfile:   *llmLearnProfile,
+		Verbose:        *verbose,
 	})
 	if err != nil {
 		return err
