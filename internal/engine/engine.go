@@ -614,6 +614,14 @@ func opMethodPath(factID string) (string, string) {
 func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profile,
 	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, budget int) (int, []*facts.Fact) {
 
+	// 预算按「缺口中收益最高者优先」排序：静态证据越强（候选越少越精准）的缺口
+	// 越值得花一次 LLM 调用。any 响应缺口（含 dataCandidates）和错误码候选明确的
+	// 缺口排前，纯「err 变量不可解析 + 无候选」的排后——避免小预算把前 N 个
+	// 「无候选」缺口消耗掉，导致有候选的 any 缺口永远轮不到。
+	if budget > 0 {
+		reorderContractFacts(factList)
+	}
+
 	calls := 0
 	var newFacts []*facts.Fact
 	successCode := successCodeOf(prof)
@@ -664,6 +672,41 @@ func successCodeOf(prof *profile.Profile) int {
 		return prof.ResponseEnvelope.SuccessCode
 	}
 	return 0
+}
+
+// reorderContractFacts 按「兜底收益」稳定排序 contract 事实，让有限预算优先花在
+// 收益最高的缺口上。排序优先级（从高到低）：
+//
+//  1. any 响应缺口且带字段候选（dataCandidates > 0）——能补出完整 object schema，
+//     收益最高（把 unknown 变结构化）；
+//  2. err 缺口且错误码候选明确（0 < errCandidates ≤ 8）——候选收窄到位，选码可靠；
+//  3. 其余缺口（候选过多或全无）——LLM 仍可能空答，收益低，排在最后。
+//
+// 稳定排序保证同优先级事实保持原相对顺序，不影响离线确定性；仅在有预算限制
+// （budget > 0）时由 resolveGaps 调用，离线路径完全不触发。
+func reorderContractFacts(factList []*facts.Fact) {
+	// 候选收窄上限：错误码候选超过该数则视为「仍未收窄」，降级到最低优先级。
+	const errCandidateNarrowLimit = 8
+	priority := func(f *facts.Fact) int {
+		cp, ok := f.Value.(facts.ContractPayload)
+		if !ok {
+			return 3
+		}
+		hasAny := hasAnyGap(cp.Gaps, "any/interface{}")
+		// 1. any 缺口带字段候选：最高优先级。
+		if hasAny && len(cp.DataCandidates) > 0 {
+			return 0
+		}
+		// 2. err 缺口且错误码候选明确收窄。
+		if len(cp.ErrCandidates) > 0 && len(cp.ErrCandidates) <= errCandidateNarrowLimit {
+			return 1
+		}
+		// 3. 其余。
+		return 2
+	}
+	sort.SliceStable(factList, func(i, j int) bool {
+		return priority(factList[i]) < priority(factList[j])
+	})
 }
 
 // hasAnyGap 判断缺口清单里是否含指定子串。
