@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	anthropicsdk "github.com/anthropics/anthropic-sdk-go"
 	"github.com/firebase/genkit/go/ai"
 	"github.com/firebase/genkit/go/genkit"
 	"github.com/firebase/genkit/go/plugins/anthropic"
@@ -146,6 +147,10 @@ func (p *genkitProvider) registerTools(tools []ToolSpec) ([]ai.ToolRef, error) {
 // NewGenkitProvider 构造 Genkit Provider（anthropic 协议网关）。
 // 认证依赖环境变量 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY，
 // 二者皆空返回 nil（离线模式）。
+//
+// thinking 显式关闭：目标网关模型（deepseek-v4-pro 等）默认开深度思考，
+// 单次调用实测 50s+，兜底逐 operation 串行会拖垮全量。关闭 thinking 后
+// 只做单跳推理，大幅降低延迟；SPECFORGE_LLM_THINKING=on 可重新打开。
 func NewGenkitProvider() Provider {
 	token := os.Getenv("ANTHROPIC_AUTH_TOKEN")
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
@@ -158,9 +163,14 @@ func NewGenkitProvider() Provider {
 	g := genkit.Init(context.Background(),
 		genkit.WithPlugins(&anthropic.Anthropic{}),
 	)
+	cfg := &anthropicsdk.MessageNewParams{}
+	if os.Getenv("SPECFORGE_LLM_THINKING") != "on" {
+		disabled := anthropicsdk.NewThinkingConfigDisabledParam()
+		cfg.Thinking = anthropicsdk.ThinkingConfigParamUnion{OfDisabled: &disabled}
+	}
 	return &genkitProvider{
 		g:     g,
-		model: anthropic.ModelRef(model, nil),
+		model: anthropic.ModelRef(model, cfg),
 		name:  "genkit:anthropic:" + model,
 		tools: map[string]ai.ToolRef{},
 	}

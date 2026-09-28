@@ -45,6 +45,8 @@ type Config struct {
 	MemoDir string
 	// Provider 可选 LLM 供应方；非 nil 时对静态缺口做档位2 兜底采集。
 	Provider infer.Provider
+	// LLMBudget LLM 兜底采集的 operation 上限（0 = 不限，默认建议设值防全量卡死）。
+	LLMBudget int
 }
 
 // Result 运行统计（CLI 与 --json 消费）。
@@ -185,8 +187,9 @@ func Run(cfg Config) (*Result, error) {
 
 	// 9. LLM 兜底采集（档位2 模板化）：对静态缺口做单次调用补全事实。
 	// 显式启用（cfg.Provider != nil）才执行；离线时缺口保持 unknown，绝不静默编造。
+	// LLMBudget 限制本次兜底的 operation 数（防全量串行卡死）。
 	if cfg.Provider != nil {
-		res.LLMCalls = resolveGaps(factList, g, prof, catalog, cfg.Provider)
+		res.LLMCalls = resolveGaps(factList, g, prof, catalog, cfg.Provider, cfg.LLMBudget)
 	}
 
 	// 收集全部 schema 事实（去重 by type ID）
@@ -604,7 +607,7 @@ func opMethodPath(factID string) (string, string) {
 // 保持单一 contract 事实，编译器无需感知 LLM 来源，改动面最小。
 // 返回实际发生的 LLM 调用次数。单个 operation 失败不阻断整体（降级保持 unknown）。
 func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profile,
-	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider) int {
+	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, budget int) int {
 
 	calls := 0
 	for _, f := range factList {
@@ -617,6 +620,9 @@ func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profi
 		}
 		if len(cp.Gaps) == 0 {
 			continue
+		}
+		if budget > 0 && calls >= budget {
+			break // 预算耗尽：其余缺口留待下次，不阻塞全量
 		}
 		method, path := opMethodPath(f.ID)
 		task := buildGapTask(method, path, cp.Gaps, g, prof, catalog)

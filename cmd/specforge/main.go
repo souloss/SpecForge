@@ -75,6 +75,7 @@ func cmdGen(args []string) error {
 	outDir := fs.String("out", "", "output dir (default: <repo>/.specforge/out)")
 	memoDir := fs.String("memo", "", "run-level memo cache dir (optional; reuse outputs when inputs unchanged)")
 	llm := fs.Bool("llm", false, "enable LLM gap-filling (tier 2) for statically-unresolved gaps")
+	llmBudget := fs.Int("llm-budget", 10, "max LLM gap-fill calls per run (0 = unlimited); caps serial LLM latency")
 	jsonOut := fs.Bool("json", false, "agent-friendly JSON summary on stdout")
 	fs.Parse(args)
 
@@ -94,6 +95,7 @@ func cmdGen(args []string) error {
 		OutDir:      *outDir,
 		MemoDir:     *memoDir,
 		Provider:    provider,
+		LLMBudget:   *llmBudget,
 	})
 	if err != nil {
 		return err
