@@ -84,7 +84,8 @@ type Result struct {
 // Run 执行完整生成。
 func Run(cfg Config) (*Result, error) {
 	// 0. 运行级 memo 缓存：输入指纹未变直接复用上次产物，跳过整个分析管线。
-	fp, err := memo.Fingerprint(cfg.RepoDir, cfg.Service, cfg.ProfilePath, Version)
+	// LLM 运行模式计入指纹（llmKey），避免离线/LLM 或不同 LLM 配置互相命中脏缓存。
+	fp, err := memo.Fingerprint(cfg.RepoDir, cfg.Service, cfg.ProfilePath, Version, llmKeyOf(cfg))
 	if err != nil {
 		return nil, err
 	}
@@ -849,6 +850,18 @@ func successCodeOf(prof *profile.Profile) int {
 		return prof.ResponseEnvelope.SuccessCode
 	}
 	return 0
+}
+
+// llmKeyOf 计算本次运行的 LLM 配置指纹（计入 memo 指纹）。
+//
+// 离线（Provider 为 nil）返回 "offline"；否则返回 "llm:<provider名>:<budget>:
+// <concurrency>:<learnProfile>"——LLM 兜底结果不来自仓库文件，必须计入指纹，
+// 否则离线/LLM 运行会互相命中脏缓存。
+func llmKeyOf(cfg Config) string {
+	if cfg.Provider == nil {
+		return "offline"
+	}
+	return fmt.Sprintf("llm:%s:%d:%d:%v", cfg.Provider.Name(), cfg.LLMBudget, cfg.LLMConcurrency, cfg.LearnProfile)
 }
 
 // reorderContractFacts 按「兜底收益」稳定排序 contract 事实，让有限预算优先花在

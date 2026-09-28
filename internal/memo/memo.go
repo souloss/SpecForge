@@ -39,11 +39,15 @@ type Summary struct {
 // Fingerprint 计算一次运行的输入指纹。
 //
 // 覆盖：引擎版本 + 服务过滤名 + 画像内容（显式画像文件字节，无画像则
-// 记 "default-profile"）+ 仓库内全部 .go / go.mod / go.sum 的内容哈希
-// （按相对路径排序）。跳过 .git / .specforge / vendor / node_modules。
-func Fingerprint(repoDir, service, profilePath, engineVersion string) (string, error) {
+// 记 "default-profile"）+ LLM 运行模式（llmKey）+ 仓库内全部 .go / go.mod /
+// go.sum 的内容哈希（按相对路径排序）。跳过 .git / .specforge / vendor / node_modules。
+//
+// llmKey 是本次运行的 LLM 配置指纹（离线传 "offline"）：LLM 兜底结果不来自
+// 仓库文件，若不计入指纹，离线/LLM 两次运行会互相命中脏缓存——离线产物会被
+// LLM 运行复用（漏掉兜底），或 LLM 产物被不同模型/预算的运行复用（陈旧）。
+func Fingerprint(repoDir, service, profilePath, engineVersion, llmKey string) (string, error) {
 	h := sha256.New()
-	io.WriteString(h, "specforge-memo-v1\x00")
+	io.WriteString(h, "specforge-memo-v2\x00")
 	io.WriteString(h, engineVersion+"\x00")
 	io.WriteString(h, service+"\x00")
 	if profilePath != "" {
@@ -53,6 +57,7 @@ func Fingerprint(repoDir, service, profilePath, engineVersion string) (string, e
 	} else {
 		io.WriteString(h, "default-profile")
 	}
+	io.WriteString(h, "\x00"+llmKey+"\x00")
 	h.Write([]byte{0})
 
 	type fh struct {

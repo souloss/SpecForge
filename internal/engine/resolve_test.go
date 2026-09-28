@@ -228,3 +228,20 @@ func TestMergeProfileCandidateDoesNotOverride(t *testing.T) {
 		t.Fatalf("sinks should not be overridden, got %+v", merged.ResponseSinks)
 	}
 }
+
+// TestLLMKeyOfOfflineVsLLM 离线与 LLM 运行的指纹键必须不同（防脏缓存）。
+func TestLLMKeyOfOfflineVsLLM(t *testing.T) {
+	off := llmKeyOf(Config{})
+	if off != "offline" {
+		t.Fatalf("offline llmKey = %q, want offline", off)
+	}
+	p := &mockProvider{out: "{}"}
+	llm := llmKeyOf(Config{Provider: p, LLMBudget: 6, LLMConcurrency: 4, LearnProfile: true})
+	if llm == off {
+		t.Fatalf("llm key should differ from offline, both %q", llm)
+	}
+	llm2 := llmKeyOf(Config{Provider: p, LLMBudget: 2, LLMConcurrency: 4})
+	if llm2 == llm {
+		t.Fatalf("different budget should produce different key: %q", llm)
+	}
+}
