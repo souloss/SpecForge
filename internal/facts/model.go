@@ -61,6 +61,9 @@ type ContractPayload struct {
 	// ErrCandidates 切片内已出现的具体错误码候选（证据注入）：err 变量兜底时
 	// 作为 LLM 的候选目录，帮助其缩小选码范围而非在全量目录里空猜。
 	ErrCandidates []ErrCandidateFact `yaml:"errCandidates,omitempty"`
+	// DataCandidates any 响应兜底的字段候选（证据注入）：切片内已出现的字段名
+	// 作为 LLM 候选，帮助其收窄 any 响应结构而非从空证据里编造。
+	DataCandidates []DataCandidateFact `yaml:"dataCandidates,omitempty"`
 }
 
 // ErrCandidateFact 切片内错误码候选（供 LLM 兜底选码）。
@@ -68,6 +71,11 @@ type ErrCandidateFact struct {
 	Symbol string `yaml:"symbol"` // 全限定常量符号
 	Name   string `yaml:"name"`   // 末段常量名（跨包匹配键）
 	Code   int    `yaml:"code"`   // 码值（-1 表示未解析）
+}
+
+// DataCandidateFact any 响应兜底的字段候选（供 LLM 收窄结构）。
+type DataCandidateFact struct {
+	Name string `yaml:"name"` // 字段名（JSON 键）
 }
 
 // ParamFact 参数事实。

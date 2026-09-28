@@ -8,6 +8,7 @@ package slicing
 import (
 	"fmt"
 	"go/ast"
+	"go/token"
 	"go/types"
 	"sort"
 	"strings"
@@ -530,6 +531,165 @@ func isErrCtorCall(call *ast.CallExpr) bool {
 	}
 	name := sel.Sel.Name
 	return strings.HasPrefix(name, "New") && strings.Contains(name, "Error")
+}
+
+// constValueOfKey 解析 map 键表达式的常量字符串值（constant.Key / Key / "lit"）。
+// 用于 any 响应字段候选：map[string]any{ constant.K: v } 的 K 是常量标识符或
+// 选择器，其值就是 JSON 键名。返回 (值, 是否成功)。
+func (s *Slicer) constValueOfKey(key ast.Expr, info *types.Info) (string, bool) {
+	switch k := ast.Unparen(key).(type) {
+	case *ast.BasicLit:
+		if k.Kind == token.STRING {
+			return trimQuotes(k.Value), true
+		}
+	case *ast.Ident:
+		if obj := info.Uses[k]; obj != nil {
+			if c, ok := obj.(*types.Const); ok {
+				return trimQuotes(c.Val().ExactString()), true
+			}
+		}
+	case *ast.SelectorExpr:
+		if sel := info.Selections[k]; sel != nil && sel.Obj() != nil {
+			if c, ok := sel.Obj().(*types.Const); ok {
+				return trimQuotes(c.Val().ExactString()), true
+			}
+		}
+		if obj := info.Uses[k.Sel]; obj != nil {
+			switch o := obj.(type) {
+			case *types.Const:
+				return trimQuotes(o.Val().ExactString()), true
+			case *types.Var:
+				// 包级 var（如 constant.Key = "k"）非 const，go/types 归为 Var；
+				// 取其静态字符串字面量初值（其余返回空）。
+				return s.varStringValue(o), true
+			}
+		}
+	}
+	return "", false
+}
+
+// varStringValue 取包级 var 的字符串字面量初值（constant.Key = "k" 场景）。
+//
+// go/types 把非 const 的包级变量归为 *types.Var，其值需从声明语句的初值表达式
+// 解析。遍历其所在包的语法文件，定位该 var 的 ValueSpec 字符串字面量初值。
+// 仅支持字符串字面量（字段候选最常见的形态），其余返回空串。
+func (s *Slicer) varStringValue(v *types.Var) string {
+	pkg := v.Pkg()
+	if pkg == nil {
+		return ""
+	}
+	for _, p := range s.g.Pkgs() {
+		if p.PkgPath != pkg.Path() {
+			continue
+		}
+		for _, f := range p.Syntax {
+			for _, d := range f.Decls {
+				gd, ok := d.(*ast.GenDecl)
+				if !ok {
+					continue
+				}
+				for _, spec := range gd.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok {
+						continue
+					}
+					for i, name := range vs.Names {
+						if name.Name != v.Name() || i >= len(vs.Values) {
+							continue
+						}
+						if lit, ok := ast.Unparen(vs.Values[i]).(*ast.BasicLit); ok && lit.Kind == token.STRING {
+							return trimQuotes(lit.Value)
+						}
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// CollectDataCandidates 收集切片内已出现的数据字段候选。
+//
+// 这是 any 响应兜底的证据注入：any/interface{} 数据槽不可静态定型时，切片内
+// 其它可达函数的函数体字面量（map/struct 复合字面量的 JSON 键名）就是该 operation
+// 最可能返回的字段。注入给 LLM 后它据此缩小到几个候选字段，而非从空证据里编造。
+// 字段名必须在切片内实际出现过（确定性字面量），防幻觉由 applyResponseSchema 的
+// 白名单校验兜底。
+func (s *Slicer) CollectDataCandidates(handlerID string, hits []SinkHit) []DataCandidate {
+	// 只扫描 handler 正向可达函数体内的 map/struct 复合字面量键名——
+	// 这正是 any 数据槽实际赋值处（如 `data := map[string]interface{}{"k": v}`）
+	// 所在的函数体，覆盖 IPOSysConfig / PlacementOrderCancel 等 map 字面量场景。
+	keys := s.scanDataKeys(handlerID)
+	_ = hits // hits 仅用于将来按 data 槽表达式精确切片；当前全可达扫描已覆盖
+	seen := map[string]bool{}
+	var uniq []string
+	for _, k := range keys {
+		if !seen[k] {
+			seen[k] = true
+			uniq = append(uniq, k)
+		}
+	}
+	sort.Strings(uniq)
+	cands := make([]DataCandidate, 0, len(uniq))
+	for _, k := range uniq {
+		cands = append(cands, DataCandidate{Name: k})
+	}
+	return cands
+}
+
+// DataCandidate any 响应兜底的字段候选。
+type DataCandidate struct {
+	Name string // 字段名（JSON 键）
+}
+
+// scanDataKeys 扫描 handler 正向可达函数体内的 map[string]any / struct 复合
+// 字面量键名。优先字符串字面量键（map key），其次是结构体字段 json tag。
+func (s *Slicer) scanDataKeys(handlerID string) []string {
+	roots := []string{handlerID}
+	if s.g.FuncDeclOf(handlerID) == nil {
+		roots = append(roots, s.g.ConcreteImplsOf(handlerID)...)
+	}
+	scanned := map[string]bool{}
+	var out []string
+	for _, root := range roots {
+		reach := s.g.ForwardReach(root, MaxDepth)
+		for fn := range reach {
+			if scanned[fn] {
+				continue
+			}
+			scanned[fn] = true
+			fd := s.g.FuncDeclOf(fn)
+			if fd == nil || fd.Body == nil {
+				continue
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				cl, ok := n.(*ast.CompositeLit)
+				if !ok {
+					return true
+				}
+				for _, elt := range cl.Elts {
+					kv, ok := elt.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+					if lit, ok := kv.Key.(*ast.BasicLit); ok && lit.Kind == token.STRING {
+						out = append(out, trimQuotes(lit.Value))
+						continue
+					}
+					// 常量标识符 / 选择器键（constant.Key 或 Key），解析常量值。
+					info := s.g.TypeInfoOfFunc(fn)
+					if info == nil {
+						continue
+					}
+					if v, ok := s.constValueOfKey(kv.Key, info); ok && v != "" {
+						out = append(out, v)
+					}
+				}
+				return true
+			})
+		}
+	}
+	return out
 }
 
 // ErrCandidate err 兜底的候选错误码（切片内已出现的具体码）。

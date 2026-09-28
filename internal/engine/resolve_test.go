@@ -85,6 +85,9 @@ func TestApplyResponseSchemaWritesBackFieldInWhitelist(t *testing.T) {
 		Responses: []facts.ResponseFact{
 			{Status: 200, Envelope: &facts.Envelope{Code: 0}},
 		},
+		DataCandidates: []facts.DataCandidateFact{
+			{Name: "order_id"}, {Name: "amount"},
+		},
 	}
 	rs := &infer.ResolvedSchema{Properties: []infer.ResolvedProp{
 		{Name: "order_id", Type: "string", Required: true},
@@ -126,6 +129,9 @@ func TestApplyResponseSchemaRejectsHallucinatedField(t *testing.T) {
 		OperationID: "orderCheck",
 		Responses: []facts.ResponseFact{
 			{Status: 200, Envelope: &facts.Envelope{Code: 0}},
+		},
+		DataCandidates: []facts.DataCandidateFact{
+			{Name: "order_id"},
 		},
 	}
 	rs := &infer.ResolvedSchema{Properties: []infer.ResolvedProp{

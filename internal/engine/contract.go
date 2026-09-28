@@ -119,6 +119,9 @@ func (b *ContractPayloadBuilder) Build() (*facts.Fact, []*facts.Fact, []*facts.F
 	// 切片内错误码候选（证据注入）：err 变量兜底时把切片里已出现的具体码
 	// 收集起来，作为 LLM 的候选目录——LLM 据此缩小到几个候选而非空猜。
 	cp.ErrCandidates = errCandidatesOf(b.slicer, b.route.Handler, hits)
+	// any 响应字段候选（证据注入）：any 数据槽不可定型时，把切片内已出现的
+	// 字段名收集起来，作为 LLM 候选收窄结构。
+	cp.DataCandidates = dataCandidatesOf(b.slicer, b.route.Handler, hits)
 
 	// 静态缺口固化到 contract 事实，供档位判定（LLM 兜底的前置输入）。
 	cp.Gaps = unknowns
@@ -604,6 +607,16 @@ func errCandidatesOf(slicer *slicing.Slicer, handlerID string, hits []slicing.Si
 		out = append(out, facts.ErrCandidateFact{
 			Symbol: c.Symbol, Name: c.Name, Code: c.Code,
 		})
+	}
+	return out
+}
+
+// dataCandidatesOf 把切片内数据字段候选转成 fact 载荷（证据注入）。
+func dataCandidatesOf(slicer *slicing.Slicer, handlerID string, hits []slicing.SinkHit) []facts.DataCandidateFact {
+	cands := slicer.CollectDataCandidates(handlerID, hits)
+	out := make([]facts.DataCandidateFact, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, facts.DataCandidateFact{Name: c.Name})
 	}
 	return out
 }

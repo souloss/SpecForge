@@ -632,7 +632,7 @@ func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profi
 			break // 预算耗尽：其余缺口留待下次，不阻塞全量
 		}
 		method, path := opMethodPath(f.ID)
-		task := buildGapTask(method, path, cp.Gaps, g, prof, catalog, cp.ErrCandidates)
+		task := buildGapTask(method, path, cp.Gaps, g, prof, catalog, cp.ErrCandidates, cp.DataCandidates)
 
 		// 档位3 优先：provider 支持工具时走多轮工具循环；否则退回档位2 模板化。
 		var resolution *infer.GapResolution
@@ -747,11 +747,12 @@ func buildTools(g *codegraph.Graph) []infer.ToolSpec {
 
 // buildGapTask 组装一次兜底采集的输入（证据切片 + 错误码目录 + 切片候选）。
 //
-// errCandidates 是证据注入的关键：err 变量兜底时，切片内已出现过的具体错误码
-// 作为 LLM 候选目录，它据此缩小选码范围（而非在 241 条全量目录里空猜）。
+// errCandidates / dataCandidates 是证据注入的关键：err 变量兜底时切片内已出现的
+// 具体错误码、any 响应兜底时切片内已出现的字段名，分别作为 LLM 候选目录，它据此
+// 缩小选码/选字段范围（而非在全量目录里空猜、或从空证据里编字段）。
 func buildGapTask(method, path string, gaps []string, g *codegraph.Graph,
 	prof *profile.Profile, catalog map[string]slicing.ErrorCodeEntry,
-	errCandidates []facts.ErrCandidateFact) infer.GapTask {
+	errCandidates []facts.ErrCandidateFact, dataCandidates []facts.DataCandidateFact) infer.GapTask {
 
 	task := infer.GapTask{
 		Method:   method,
@@ -768,6 +769,9 @@ func buildGapTask(method, path string, gaps []string, g *codegraph.Graph,
 		task.ErrCandidates = append(task.ErrCandidates, infer.ErrCandidateItem{
 			Symbol: c.Symbol, Name: c.Name, Code: c.Code,
 		})
+	}
+	for _, c := range dataCandidates {
+		task.DataCandidates = append(task.DataCandidates, infer.DataCandidateItem{Name: c.Name})
 	}
 	return task
 }
@@ -854,9 +858,13 @@ func shortSym(s string) string {
 // applyResponseSchema 把 LLM 补出的 any 响应结构写回：新增一条 KindSchema 事实，
 // 并让成功响应行指向该 schema，交由编译器既有 refOf 管线 emit 进 components。
 //
-// 防幻觉硬约束：LLM 只报字段名，字段类型必须从代码图命名类型字段白名单反查
-// （不信任 LLM 的 type 字符串，防类型漂移）；全部字段命中才采纳，任一字段不在
-// 白名单内则整条丢弃，保持 unknown。返回新 schema 事实，丢弃时返回 nil。
+// 防幻觉硬约束：
+//   - 字段名必须命中 cp.DataCandidates（切片内已出现的字段候选，证据注入），
+//     任一字段不在候选内则整条丢弃，保持 unknown——禁止编造结构；
+//   - 字段类型优先从代码图命名类型字段白名单反查；反查不到（map[string]any 键值
+//     本就不可静态定型）时才降级用 LLM 报的 type，但限定在封闭类型集内。
+//
+// 返回新 schema 事实，丢弃时返回 nil。
 func applyResponseSchema(cp *facts.ContractPayload, rs *infer.ResolvedSchema,
 	g *codegraph.Graph, successCode int) *facts.Fact {
 
@@ -874,14 +882,25 @@ func applyResponseSchema(cp *facts.ContractPayload, rs *infer.ResolvedSchema,
 	if target < 0 {
 		return nil
 	}
-	// 命名类型字段白名单：field JSON 名 → 代码图字段类型串。
-	whitelist := fieldWhitelist(g)
+	// 字段候选白名单（证据注入）：字段名必须来自切片内实际出现的键名。
+	candSet := map[string]bool{}
+	for _, c := range cp.DataCandidates {
+		candSet[c.Name] = true
+	}
+	if len(candSet) == 0 {
+		return nil // 无字段候选证据：拒绝编造
+	}
+	// 命名类型字段白名单：field JSON 名 → 代码图字段类型串（更强类型证据）。
+	namedTypes := fieldWhitelist(g)
 	var props []typeschema.Prop
 	var required []string
 	for _, p := range rs.Properties {
-		typ, ok := whitelist[p.Name]
-		if !ok {
-			return nil // 字段名不在代码图任何命名类型中：幻觉，整条丢弃
+		if !candSet[p.Name] {
+			return nil // 字段名不在切片候选内：幻觉，整条丢弃
+		}
+		typ := namedTypes[p.Name]
+		if typ == "" {
+			typ = sanitizeType(p.Type)
 		}
 		props = append(props, typeschema.Prop{
 			Name: p.Name, Schema: &typeschema.Schema{Type: typ}, Required: p.Required,
@@ -902,6 +921,17 @@ func applyResponseSchema(cp *facts.ContractPayload, rs *infer.ResolvedSchema,
 		Evidence: []facts.Evidence{{File: "llm:response-schema", Quote: schemaID}},
 		Status:   "verified",
 	}
+}
+
+// sanitizeType 把 LLM 报的 type 字符串限定在封闭类型集内（防类型漂移）。
+// 合法值映射为 OpenAPI 类型；非法值保守回退 "string"（字段名已过候选校验，
+// 类型仅在此集合内取值，杜绝任意类型注入）。
+func sanitizeType(t string) string {
+	switch strings.TrimSpace(t) {
+	case "integer", "number", "boolean", "object", "array", "string":
+		return strings.TrimSpace(t)
+	}
+	return "string"
 }
 
 // fieldWhitelist 建命名类型字段白名单：字段 JSON 名 → 底层类型名。
