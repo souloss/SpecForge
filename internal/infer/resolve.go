@@ -94,16 +94,20 @@ const gapOutputSchema = `{
 
 // ResolveGaps 对单个 operation 的缺口做一次模板化兜底采集。
 // 离线（p == nil）返回 ErrNoProvider，由 engine 显式降级。
+//
+// 关键：不把 schema 作为 WithOutputSchema 下发，而是内嵌在 gapSystemPrompt 文本里。
+// 实测三方网关模型在 structured-output 模式下会把「全 optional 字段的 schema」合法地
+// 输出成空对象（errorCodes 缺失，兜底失效）；内嵌 prompt 则按语义认真选码。
+// 结构校验仍由 parseGapResolution 事后承担，防幻觉防线不变。
 func ResolveGaps(p Provider, task GapTask) (*GapResolution, error) {
 	if p == nil {
 		return nil, ErrNoProvider
 	}
-	system := gapSystemPrompt
 	ev, err := json.Marshal(task)
 	if err != nil {
 		return nil, fmt.Errorf("infer: marshal gap task: %w", err)
 	}
-	raw, err := p.Complete(system, string(ev), []byte(gapOutputSchema))
+	raw, err := p.Complete(gapSystemPrompt, string(ev), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +117,7 @@ func ResolveGaps(p Provider, task GapTask) (*GapResolution, error) {
 // ResolveGapsWithTools 档位3：带工具的兜底采集（工具循环由 provider 侧
 // WithMaxTurns 驱动）。离线或 provider 不支持工具时返回 ErrNoProvider /
 // ErrToolsUnsupported，由 engine 降级到档位2。
+// schema 同样内嵌 prompt（同 ResolveGaps 的空答根因）。
 func ResolveGapsWithTools(p Provider, task GapTask, tools []ToolSpec, maxTurns int) (*GapResolution, error) {
 	if p == nil {
 		return nil, ErrNoProvider
@@ -125,7 +130,7 @@ func ResolveGapsWithTools(p Provider, task GapTask, tools []ToolSpec, maxTurns i
 	if err != nil {
 		return nil, fmt.Errorf("infer: marshal gap task: %w", err)
 	}
-	raw, err := tu.CompleteWithTools(gapSystemPrompt, string(ev), []byte(gapOutputSchema), tools, maxTurns)
+	raw, err := tu.CompleteWithTools(gapSystemPrompt, string(ev), nil, tools, maxTurns)
 	if err != nil {
 		return nil, err
 	}

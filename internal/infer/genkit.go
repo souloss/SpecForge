@@ -64,10 +64,11 @@ func (p *genkitProvider) Name() string { return p.name }
 
 // Complete 实现 Provider：system + prompt + 可选输出 schema。
 // 返回模型输出的原始文本字节（期望是 JSON，但不做结构校验——校验在上层）。
-// 单次调用给 60s 超时；LLM 兜底按 operation 逐个调用，串行超时会拖垮全量，
-// 故调用方（engine）还需对每个 operation 单点容错。
+// 单次调用超时由 SPECFORGE_LLM_TIMEOUT 控制（默认 120s）：保留深度思考时单 op
+// 实测 50s+，60s 会误杀有效产出；关闭思考可调小。LLM 兜底按 operation 逐个
+// 调用，串行超时会拖垮全量，故调用方（engine）还需对每个 operation 单点容错。
 func (p *genkitProvider) Complete(system, prompt string, schema []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), llmTimeout())
 	defer cancel()
 	opts := []ai.GenerateOption{
 		ai.WithModel(p.model),
@@ -148,9 +149,10 @@ func (p *genkitProvider) registerTools(tools []ToolSpec) ([]ai.ToolRef, error) {
 // 认证依赖环境变量 ANTHROPIC_AUTH_TOKEN 或 ANTHROPIC_API_KEY，
 // 二者皆空返回 nil（离线模式）。
 //
-// thinking 显式关闭：目标网关模型（deepseek-v4-pro 等）默认开深度思考，
-// 单次调用实测 50s+，兜底逐 operation 串行会拖垮全量。关闭 thinking 后
-// 只做单跳推理，大幅降低延迟；SPECFORGE_LLM_THINKING=on 可重新打开。
+// thinking 保留开启（网关默认深度思考）：实测关闭 thinking 会让模型对「从目录
+// 选错误码」这类结构化任务退化成空答（errorCodes 缺失），兜底失效。故默认沿用
+// 网关深度思考，仅 SPECFORGE_LLM_THINKING=off 时显式关闭。深度思考单 op 实测
+// 50s+，须配合 engine 侧 --llm-budget 超小预算（默认 2）防止全量串行卡死。
 func NewGenkitProvider() Provider {
 	token := os.Getenv("ANTHROPIC_AUTH_TOKEN")
 	apiKey := os.Getenv("ANTHROPIC_API_KEY")
@@ -164,7 +166,7 @@ func NewGenkitProvider() Provider {
 		genkit.WithPlugins(&anthropic.Anthropic{}),
 	)
 	cfg := &anthropicsdk.MessageNewParams{}
-	if os.Getenv("SPECFORGE_LLM_THINKING") != "on" {
+	if os.Getenv("SPECFORGE_LLM_THINKING") == "off" {
 		disabled := anthropicsdk.NewThinkingConfigDisabledParam()
 		cfg.Thinking = anthropicsdk.ThinkingConfigParamUnion{OfDisabled: &disabled}
 	}
@@ -182,4 +184,15 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+// llmTimeout 单次 Complete 的超时时长：默认 120s（保留深度思考时单 op 50s+，
+// 60s 会误杀有效产出），SPECFORGE_LLM_TIMEOUT 可覆盖（如 "60s"、"30s"）。
+func llmTimeout() time.Duration {
+	if v := os.Getenv("SPECFORGE_LLM_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return 120 * time.Second
 }
