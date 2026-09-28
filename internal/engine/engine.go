@@ -50,6 +50,9 @@ type Config struct {
 	LLMBudget int
 	// LLMConcurrency LLM 兜底采集的并发数（0 = 串行；>0 时用受控并发）。
 	LLMConcurrency int
+	// LearnProfile 用 LLM 从抽样接口归纳仓库约定画像（设计文档 §3.3 画像学习），
+	// 学习结果与现有画像合并（仅填补缺失项）。需 Provider 非 nil。
+	LearnProfile bool
 }
 
 // Result 运行统计（CLI 与 --json 消费）。
@@ -166,6 +169,11 @@ func Run(cfg Config) (*Result, error) {
 		} else {
 			res.RoutesUnresolved++
 		}
+	}
+
+	// 4-1. 画像学习（可选）：LLM 归纳约定，与现有画像合并（仅填补缺失）。
+	if cfg.LearnProfile && cfg.Provider != nil {
+		prof = learnProfileInto(cfg.Provider, prof, g, resolved)
 	}
 
 	// 5-6. handler 分析 + 响应追踪
@@ -287,6 +295,78 @@ func loadProfile(cfg Config, l *loader.Loaded) (*profile.Profile, error) {
 		return profile.Load(cand)
 	}
 	return profile.Default(), nil
+}
+
+// learnProfileInto 用 LLM 从抽样接口归纳仓库约定画像，与现有画像合并。
+//
+// 抽样策略：取前 learnSampleOpsMax 个已解析路由，组装 SampleOp（method/path +
+// handler godoc 证据摘要）。LLM 只从证据归纳「响应汇聚点符号 / 鉴权中间件 / 信封」，
+// 归纳结果与现有画像合并——仅当现有画像缺失该字段时才采纳 LLM 值，绝不覆盖
+// 已有约定（防幻觉：手工画像优先）。学习失败静默降级为原画像（不阻断生成）。
+func learnProfileInto(p infer.Provider, prof *profile.Profile, g *codegraph.Graph,
+	resolved []adapter.Route) *profile.Profile {
+
+	samples := buildLearnSamples(g, resolved)
+	if len(samples) == 0 {
+		return prof
+	}
+	cand, err := infer.LearnProfile(p, samples)
+	if err != nil || cand == nil {
+		return prof // 学习失败：降级原画像
+	}
+	return mergeProfileCandidate(prof, cand)
+}
+
+// learnSampleOpsMax 画像学习的抽样接口上限（避免一次喂入过多证据拖慢 LLM）。
+const learnSampleOpsMax = 5
+
+// buildLearnSamples 从已解析路由抽样，组装画像学习的 SampleOp 证据。
+func buildLearnSamples(g *codegraph.Graph, resolved []adapter.Route) []infer.SampleOp {
+	var out []infer.SampleOp
+	for _, r := range resolved {
+		if len(out) >= learnSampleOpsMax {
+			break
+		}
+		evidence := ""
+		if sym := g.Sym(r.Handler); sym != nil {
+			evidence = firstLine(sym.Doc)
+		}
+		out = append(out, infer.SampleOp{
+			Method: r.Method, Path: r.Path, Evidence: evidence,
+		})
+	}
+	return out
+}
+
+// mergeProfileCandidate 把 LLM 归纳的画像候选合并进现有画像（仅填补缺失）。
+func mergeProfileCandidate(prof *profile.Profile, cand *infer.ProfileCandidate) *profile.Profile {
+	merged := *prof // 浅拷贝，就地补齐
+	if merged.Framework == "" || merged.Framework == "unknown" {
+		merged.Framework = cand.Framework
+	}
+	if len(merged.ResponseSinks) == 0 {
+		for _, sc := range cand.ResponseSinks {
+			merged.ResponseSinks = append(merged.ResponseSinks, profile.SinkPattern{
+				Symbol: sc.Symbol, Signature: sc.Signature,
+				DataSlot: sc.DataSlot, ErrSlot: sc.ErrSlot, Status: sc.Status,
+			})
+		}
+	}
+	if merged.ResponseEnvelope == nil && cand.Envelope != nil {
+		merged.ResponseEnvelope = &profile.EnvelopeSpec{
+			Type: cand.Envelope.Type, Properties: cand.Envelope.Properties,
+			DataSlot: cand.Envelope.DataSlot, SuccessCode: cand.Envelope.SuccessCode,
+		}
+	}
+	if len(merged.AuthMiddleware) == 0 {
+		merged.AuthMiddleware = map[string]profile.SecurityMapping{}
+		for name, ac := range cand.AuthMiddleware {
+			merged.AuthMiddleware[name] = profile.SecurityMapping{
+				Header: ac.Header, Scheme: ac.Scheme, Required: ac.Required,
+			}
+		}
+	}
+	return &merged
 }
 
 // extractAllRoutes 全仓路由抽取（fiber 模式）。

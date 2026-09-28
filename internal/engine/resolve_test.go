@@ -7,6 +7,7 @@ import (
 	"github.com/specforge/specforge/internal/facts"
 	"github.com/specforge/specforge/internal/infer"
 	"github.com/specforge/specforge/internal/loader"
+	"github.com/specforge/specforge/internal/profile"
 	"github.com/specforge/specforge/internal/slicing"
 	"github.com/specforge/specforge/internal/typeschema"
 )
@@ -183,5 +184,47 @@ func TestBuildToolsReadSymbol(t *testing.T) {
 	}
 	if len(out2) == 0 {
 		t.Fatal("callees should return JSON")
+	}
+}
+
+// TestMergeProfileCandidateFillsMissing 画像候选填补缺失（framework / sinks）。
+func TestMergeProfileCandidateFillsMissing(t *testing.T) {
+	prof := profile.Default()
+	cand := &infer.ProfileCandidate{
+		Framework: "gofiber/v2",
+		ResponseSinks: []infer.SinkCandidate{
+			{Symbol: "code.WriteResponse", Signature: "(c,err,data)", DataSlot: 2, ErrSlot: 1, Status: 200},
+		},
+	}
+	merged := mergeProfileCandidate(prof, cand)
+	if merged.Framework != "gofiber/v2" {
+		t.Fatalf("framework = %q, want gofiber/v2", merged.Framework)
+	}
+	if len(merged.ResponseSinks) != 1 || merged.ResponseSinks[0].Symbol != "code.WriteResponse" {
+		t.Fatalf("sinks = %+v", merged.ResponseSinks)
+	}
+}
+
+// TestMergeProfileCandidateDoesNotOverride 画像候选不覆盖既有约定。
+func TestMergeProfileCandidateDoesNotOverride(t *testing.T) {
+	prof := &profile.Profile{
+		Framework: "gofiber/v2",
+		ResponseSinks: []profile.SinkPattern{
+			{Symbol: "existing.Sink", DataSlot: 2, ErrSlot: 1, Status: 200},
+		},
+		AuthMiddleware: map[string]profile.SecurityMapping{},
+	}
+	cand := &infer.ProfileCandidate{
+		Framework: "gin",
+		ResponseSinks: []infer.SinkCandidate{
+			{Symbol: "llm.Sink", DataSlot: 1},
+		},
+	}
+	merged := mergeProfileCandidate(prof, cand)
+	if merged.Framework != "gofiber/v2" {
+		t.Fatalf("framework should not be overridden, got %q", merged.Framework)
+	}
+	if len(merged.ResponseSinks) != 1 || merged.ResponseSinks[0].Symbol != "existing.Sink" {
+		t.Fatalf("sinks should not be overridden, got %+v", merged.ResponseSinks)
 	}
 }
