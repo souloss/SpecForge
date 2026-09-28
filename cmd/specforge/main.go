@@ -131,6 +131,13 @@ func cmdGen(args []string) error {
 		result.Operations, result.SchemaTypes, result.SinkSites,
 		result.Facts, result.Dropped, result.LowConf, reportPath, specPath, el, cacheNote)
 
+	// LLM 用量观测：token 消耗（provider 支持上报时）。
+	if result.LLMCalls > 0 || result.LLMUsage.TotalTokens() > 0 {
+		fmt.Printf("  llm:                 %d calls, %d input + %d output tokens (total %d)\n",
+			result.LLMCalls, result.LLMUsage.InputTokens, result.LLMUsage.OutputTokens,
+			result.LLMUsage.TotalTokens())
+	}
+
 	// 自确定性检查: 编译两次并比对逐字节 (设计文档 §8.5)
 	if result.Cached {
 		fmt.Printf("  determinism:          OK (cached — byte-identical by construction)\n")

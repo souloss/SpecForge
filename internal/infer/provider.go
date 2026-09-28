@@ -25,6 +25,25 @@ type Provider interface {
 	Name() string
 }
 
+// UsageReporter 可上报 token 用量的 Provider（可选接口）。
+//
+// engine 以类型断言判定：非 UsageReporter 的 Provider（如离线 mock）用量记 0。
+// 用量是 provider 内部跨调用累加的，供 CLI 打印 token 消耗与成本估算。
+type UsageReporter interface {
+	// LLMUsage 返回该 provider 从创建至今的累计调用次数与 token 用量。
+	LLMUsage() LLMUsage
+}
+
+// LLMUsage 一次运行的 LLM 累计用量（观测字段，非协议数据）。
+type LLMUsage struct {
+	Calls        int   // 实际发生的 LLM 调用次数
+	InputTokens  int64 // 累计输入 token
+	OutputTokens int64 // 累计输出 token
+}
+
+// TotalTokens 输入+输出 token 总和。
+func (u LLMUsage) TotalTokens() int64 { return u.InputTokens + u.OutputTokens }
+
 // NewProviderFromEnv 从环境变量构造 Provider。
 // 优先走 Genkit Provider（Z.ai GLM）；未配置返回 nil（离线模式）。
 func NewProviderFromEnv() Provider {

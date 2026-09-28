@@ -79,6 +79,8 @@ type Result struct {
 	Gaps []string
 	// LLMCalls LLM 兜底采集次数（0 = 未启用或全部静态可定型）。
 	LLMCalls int
+	// LLMUsage LLM 累计 token 用量（观测字段，CLI 打印 token 消耗）。
+	LLMUsage infer.LLMUsage
 }
 
 // Run 执行完整生成。
@@ -205,6 +207,10 @@ func Run(cfg Config) (*Result, error) {
 		res.LLMCalls, llmSchemas = resolveGaps(factList, g, prof, catalog, cfg.Provider, cfg.LLMBudget, cfg.LLMConcurrency)
 		// LLM 兜底补出的 any 响应 schema 事实并入 factList，随既有管线编译。
 		factList = append(factList, llmSchemas...)
+		// 观测：累计 LLM 用量（token），供 CLI 打印。
+		if ur, ok := cfg.Provider.(infer.UsageReporter); ok {
+			res.LLMUsage = ur.LLMUsage()
+		}
 	}
 
 	// 收集全部 schema 事实（去重 by type ID）

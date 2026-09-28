@@ -57,6 +57,10 @@ type genkitProvider struct {
 	// toolsMu 保护 tools 注册（同一个 Genkit registry 重复注册同名工具会 panic）。
 	toolsMu sync.Mutex
 	tools   map[string]ai.ToolRef
+
+	// usageMu 保护 usage 累加（并发兜底采集时多 goroutine 竞争）。
+	usageMu sync.Mutex
+	usage   LLMUsage
 }
 
 // Name 实现 Provider。
@@ -85,7 +89,27 @@ func (p *genkitProvider) Complete(system, prompt string, schema []byte) ([]byte,
 	if err != nil {
 		return nil, err
 	}
+	p.recordUsage(resp)
 	return []byte(resp.Text()), nil
+}
+
+// recordUsage 累加一次生成调用的 token 用量（线程安全，并发兜底采集时多 goroutine 竞争）。
+func (p *genkitProvider) recordUsage(resp *ai.ModelResponse) {
+	if resp == nil || resp.Usage == nil {
+		return
+	}
+	p.usageMu.Lock()
+	defer p.usageMu.Unlock()
+	p.usage.Calls++
+	p.usage.InputTokens += int64(resp.Usage.InputTokens)
+	p.usage.OutputTokens += int64(resp.Usage.OutputTokens)
+}
+
+// LLMUsage 实现 UsageReporter：返回累计调用次数与 token 用量。
+func (p *genkitProvider) LLMUsage() LLMUsage {
+	p.usageMu.Lock()
+	defer p.usageMu.Unlock()
+	return p.usage
 }
 
 // CompleteWithTools 实现 ToolUser：注册工具后走 genkit 多轮生成（工具循环由
@@ -117,6 +141,7 @@ func (p *genkitProvider) CompleteWithTools(system, prompt string, schema []byte,
 	if err != nil {
 		return nil, err
 	}
+	p.recordUsage(resp)
 	return []byte(resp.Text()), nil
 }
 
