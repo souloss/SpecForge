@@ -625,14 +625,27 @@ func buildOperationFacts(g *codegraph.Graph, prof *profile.Profile,
 	fl = append(fl, schemaFacts...)
 	fl = append(fl, extra...)
 
-	// 语义增强: godoc（零成本 enrichment，设计文档 §5.8）
+	// 语义增强: godoc（零成本 enrichment，设计文档 §5.8）。
+	// handler 常经接口分发到具体实现，接口方法无函数体也无 doc，
+	// 需解析到具体实现再取其 doc 作为 summary 来源。
+	var enrichSym *codegraph.Symbol
 	if sym := g.Sym(r.Handler); sym != nil && sym.Doc != "" {
+		enrichSym = sym
+	} else {
+		for _, impl := range g.ConcreteImplsOf(r.Handler) {
+			if isym := g.Sym(impl); isym != nil && isym.Doc != "" {
+				enrichSym = isym
+				break
+			}
+		}
+	}
+	if enrichSym != nil {
 		fl = append(fl, &facts.Fact{
 			ID: opKey + ":enrich", Kind: facts.KindEnrichment,
-			Value:  facts.EnrichmentPayload{Summary: firstLine(sym.Doc)},
+			Value:  facts.EnrichmentPayload{Summary: firstLine(enrichSym.Doc)},
 			Source: facts.SourceStatic, Confidence: 0.9,
-			Evidence: []facts.Evidence{{File: sym.File, StartLine: sym.Line, EndLine: sym.Line,
-				BlobSHA: g.FileHashOf(sym.File), Quote: firstLine(sym.Doc)}},
+			Evidence: []facts.Evidence{{File: enrichSym.File, StartLine: enrichSym.Line, EndLine: enrichSym.Line,
+				BlobSHA: g.FileHashOf(enrichSym.File), Quote: firstLine(enrichSym.Doc)}},
 			Status: "verified",
 		})
 	}

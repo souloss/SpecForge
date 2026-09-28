@@ -153,7 +153,7 @@ func Compile(in Input) (*Document, error) {
 			OperationID: cp.OperationID,
 			Tags:        cp.Tags,
 		}
-		if ep, ok := enrichByOp[opKey]; ok {
+		if ep, ok := enrichByOp[strings.TrimPrefix(opKey, "contract:")]; ok {
 			op.Summary = ep.Summary
 			op.Description = ep.Description
 		}
