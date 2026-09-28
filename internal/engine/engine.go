@@ -189,7 +189,10 @@ func Run(cfg Config) (*Result, error) {
 	// 显式启用（cfg.Provider != nil）才执行；离线时缺口保持 unknown，绝不静默编造。
 	// LLMBudget 限制本次兜底的 operation 数（防全量串行卡死）。
 	if cfg.Provider != nil {
-		res.LLMCalls = resolveGaps(factList, g, prof, catalog, cfg.Provider, cfg.LLMBudget)
+		var llmSchemas []*facts.Fact
+		res.LLMCalls, llmSchemas = resolveGaps(factList, g, prof, catalog, cfg.Provider, cfg.LLMBudget)
+		// LLM 兜底补出的 any 响应 schema 事实并入 factList，随既有管线编译。
+		factList = append(factList, llmSchemas...)
 	}
 
 	// 收集全部 schema 事实（去重 by type ID）
@@ -597,19 +600,23 @@ func opMethodPath(factID string) (string, string) {
 	return "", s
 }
 
-// resolveGaps 对带缺口的 operation 做档位2 模板化兜底采集（LLM 单次调用）。
+// resolveGaps 对带缺口的 operation 做档位2/3 兜底采集（LLM 调用）。
 //
 // 只处理两类静态可判定的缺口：
 //  1. err 变量错误码未解析 → LLM 从错误码目录里选码（catalog 命中校验通过才写回）；
-//  2. any 响应不可定型 → LLM 从切片证据里读字段（字段名必须在证据中出现才写回）。
+//  2. any 响应不可定型 → LLM 从切片证据里读字段（字段名必须命中代码图白名单才写回）。
 //
-// 写回是「原地修补 contract 事实的 Responses」，不新增 fact——
-// 保持单一 contract 事实，编译器无需感知 LLM 来源，改动面最小。
-// 返回实际发生的 LLM 调用次数。单个 operation 失败不阻断整体（降级保持 unknown）。
+// 错误码写回是「原地修补 contract 事实的 Responses」；any 响应 schema 写回则新增一条
+// KindSchema 事实（Value 为 *typeschema.Schema），由编译器经既有 refOf 管线自动 emit
+// 进 components——编译器无需感知 LLM 来源，改动面最小。
+// 返回 (实际发生的 LLM 调用次数, 新增的 schema 事实)。单个 operation 失败不阻断整体
+// （降级保持 unknown）。
 func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profile,
-	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, budget int) int {
+	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, budget int) (int, []*facts.Fact) {
 
 	calls := 0
+	var newFacts []*facts.Fact
+	successCode := successCodeOf(prof)
 	for _, f := range factList {
 		if f.Kind != facts.KindContract {
 			continue
@@ -643,10 +650,20 @@ func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profi
 			continue
 		}
 		calls++
-		applyGapResolution(&cp, resolution, catalog)
+		if scFact := applyGapResolution(&cp, resolution, catalog, g, successCode); scFact != nil {
+			newFacts = append(newFacts, scFact)
+		}
 		f.Value = cp
 	}
-	return calls
+	return calls, newFacts
+}
+
+// successCodeOf 取画像信封的成功码（无画像默认 0）。
+func successCodeOf(prof *profile.Profile) int {
+	if prof != nil && prof.ResponseEnvelope != nil {
+		return prof.ResponseEnvelope.SuccessCode
+	}
+	return 0
 }
 
 // hasAnyGap 判断缺口清单里是否含指定子串。
@@ -760,12 +777,16 @@ func evidenceSummary(g *codegraph.Graph, prof *profile.Profile, method, path str
 //
 // 防幻觉硬约束（设计文档 §8.3）：
 //   - errorCodes 的 codeRef 必须命中错误码目录，否则丢弃该条；
-//   - 补出的错误行只替换「未解析行」（Envelope.Code == -1），不碰静态已定的行。
+//   - 补出的错误行只替换「未解析行」（Envelope.Code == -1），不碰静态已定的行；
+//   - responseSchema 的每个字段名必须命中代码图里的命名类型字段（Type 白名单校验），
+//     否则整条 responseSchema 丢弃（禁止编造结构）。
+//
+// 返回值为补出的 any 响应 schema 事实（*facts.Fact，KindSchema）；未补出时返回 nil。
 func applyGapResolution(cp *facts.ContractPayload, r *infer.GapResolution,
-	catalog map[string]slicing.ErrorCodeEntry) {
+	catalog map[string]slicing.ErrorCodeEntry, g *codegraph.Graph, successCode int) *facts.Fact {
 
 	if r == nil {
-		return
+		return nil
 	}
 	// 建立 catalog 的 codeRef → entry 快速反查（catalog 的 key 即全限定符号）。
 	bySymbol := map[string]slicing.ErrorCodeEntry{}
@@ -780,35 +801,37 @@ func applyGapResolution(cp *facts.ContractPayload, r *infer.GapResolution,
 			unresolvedIdx = append(unresolvedIdx, i)
 		}
 	}
-	if len(unresolvedIdx) == 0 || len(r.ErrorCodes) == 0 {
-		return
-	}
-	// 用 LLM 补出的错误码替换未解析行（逐个匹配；多出/缺省保守保留原样）。
-	used := map[int]bool{}
-	for _, ec := range r.ErrorCodes {
-		entry, ok := bySymbol[ec.CodeRef]
-		if !ok {
-			entry, ok = bySymbol[shortSym(ec.CodeRef)]
-		}
-		if !ok {
-			continue // 幻觉 codeRef：丢弃
-		}
-		// 找到下一个未替换的未解析行。
-		for _, idx := range unresolvedIdx {
-			if used[idx] {
-				continue
+	if len(unresolvedIdx) > 0 && len(r.ErrorCodes) > 0 {
+		// 用 LLM 补出的错误码替换未解析行（逐个匹配；多出/缺省保守保留原样）。
+		used := map[int]bool{}
+		for _, ec := range r.ErrorCodes {
+			entry, ok := bySymbol[ec.CodeRef]
+			if !ok {
+				entry, ok = bySymbol[shortSym(ec.CodeRef)]
 			}
-			cp.Responses[idx].Envelope = &facts.Envelope{
-				Code:    entry.Code,
-				CodeRef: ec.CodeRef,
-				Msg:     entry.Msg,
+			if !ok {
+				continue // 幻觉 codeRef：丢弃
 			}
-			cp.Responses[idx].Source = "llm"
-			used[idx] = true
-			break
+			// 找到下一个未替换的未解析行。
+			for _, idx := range unresolvedIdx {
+				if used[idx] {
+					continue
+				}
+				cp.Responses[idx].Envelope = &facts.Envelope{
+					Code:    entry.Code,
+					CodeRef: ec.CodeRef,
+					Msg:     entry.Msg,
+				}
+				cp.Responses[idx].Source = "llm"
+				used[idx] = true
+				break
+			}
 		}
 	}
-	// any 响应 schema：暂不写回（档位2 先解决错误码；schema 需要档位3 工具追类型）。
+
+	// any 响应 schema 写回：LLM 只读证据报字段名，命中代码图命名类型字段白名单
+	// 才采纳；字段类型从代码图反查（而非信任 LLM 的 type 字符串，防类型漂移）。
+	return applyResponseSchema(cp, r.ResponseSchema, g, successCode)
 }
 
 // shortSym 取符号 ID 的末段（pkg.ConstName → ConstName）。
@@ -817,6 +840,111 @@ func shortSym(s string) string {
 		return s[i+1:]
 	}
 	return s
+}
+
+// applyResponseSchema 把 LLM 补出的 any 响应结构写回：新增一条 KindSchema 事实，
+// 并让成功响应行指向该 schema，交由编译器既有 refOf 管线 emit 进 components。
+//
+// 防幻觉硬约束：LLM 只报字段名，字段类型必须从代码图命名类型字段白名单反查
+// （不信任 LLM 的 type 字符串，防类型漂移）；全部字段命中才采纳，任一字段不在
+// 白名单内则整条丢弃，保持 unknown。返回新 schema 事实，丢弃时返回 nil。
+func applyResponseSchema(cp *facts.ContractPayload, rs *infer.ResolvedSchema,
+	g *codegraph.Graph, successCode int) *facts.Fact {
+
+	if rs == nil || len(rs.Properties) == 0 {
+		return nil
+	}
+	// 定位 any 响应未定型的成功行（Envelope.Code == successCode 且 SchemaType 为空）。
+	target := -1
+	for i, row := range cp.Responses {
+		if row.Envelope != nil && row.Envelope.Code == successCode && row.SchemaType == "" {
+			target = i
+			break
+		}
+	}
+	if target < 0 {
+		return nil
+	}
+	// 命名类型字段白名单：field JSON 名 → 代码图字段类型串。
+	whitelist := fieldWhitelist(g)
+	var props []typeschema.Prop
+	var required []string
+	for _, p := range rs.Properties {
+		typ, ok := whitelist[p.Name]
+		if !ok {
+			return nil // 字段名不在代码图任何命名类型中：幻觉，整条丢弃
+		}
+		props = append(props, typeschema.Prop{
+			Name: p.Name, Schema: &typeschema.Schema{Type: typ}, Required: p.Required,
+		})
+		if p.Required {
+			required = append(required, p.Name)
+		}
+	}
+	sort.Strings(required)
+	// 合成 object schema：字段序按 LLM 报出顺序（确定性由 LLM 输入顺序保证）。
+	synth := &typeschema.Schema{Type: "object", Props: props, Required: required}
+	schemaID := "llm:any:" + cp.OperationID
+	cp.Responses[target].SchemaType = schemaID
+	cp.Responses[target].Source = "llm"
+	return &facts.Fact{
+		ID: "schema:" + schemaID, Kind: facts.KindSchema, Value: synth,
+		Source: facts.SourceLLM, Confidence: 0.8,
+		Evidence: []facts.Evidence{{File: "llm:response-schema", Quote: schemaID}},
+		Status:   "verified",
+	}
+}
+
+// fieldWhitelist 建命名类型字段白名单：字段 JSON 名 → 底层类型名。
+//
+// 跨全仓命名类型聚合：LLM 补出的响应字段名只有命中该白名单才被采纳，
+// 类型从代码图反查（而非信任 LLM 的 type 字符串），防止结构幻觉与类型漂移。
+func fieldWhitelist(g *codegraph.Graph) map[string]string {
+	wl := map[string]string{}
+	for _, ti := range g.Types {
+		if !ti.IsStruct {
+			continue
+		}
+		for _, f := range ti.Fields {
+			if f.JSONName == "-" {
+				continue
+			}
+			typ := basicKindStrOf(f.TypeStr)
+			if typ == "" {
+				typ = "string"
+			}
+			wl[f.JSONName] = typ
+		}
+	}
+	return wl
+}
+
+// basicKindStrOf 提取类型串的底层 JSON schema 类型名（含切片/映射降级）。
+func basicKindStrOf(typeStr string) string {
+	s := strings.TrimPrefix(typeStr, "*")
+	if strings.HasPrefix(s, "[]") {
+		return "array"
+	}
+	if strings.HasPrefix(s, "map[") {
+		return "object"
+	}
+	// 命名类型截取末段（如 mapping.T → T，仍映射到 string 兜底）。
+	if i := strings.LastIndex(s, "."); i >= 0 {
+		s = s[i+1:]
+	}
+	switch strings.TrimSpace(s) {
+	case "string":
+		return "string"
+	case "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr":
+		return "integer"
+	case "float32", "float64":
+		return "number"
+	case "bool":
+		return "boolean"
+	case "byte", "time.Time":
+		return "string"
+	}
+	return ""
 }
 
 // renderReport 置信度报告（F11）。
