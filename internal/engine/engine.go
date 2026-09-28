@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/specforge/specforge/internal/adapter"
@@ -47,6 +48,8 @@ type Config struct {
 	Provider infer.Provider
 	// LLMBudget LLM 兜底采集的 operation 上限（0 = 不限，默认建议设值防全量卡死）。
 	LLMBudget int
+	// LLMConcurrency LLM 兜底采集的并发数（0 = 串行；>0 时用受控并发）。
+	LLMConcurrency int
 }
 
 // Result 运行统计（CLI 与 --json 消费）。
@@ -190,7 +193,7 @@ func Run(cfg Config) (*Result, error) {
 	// LLMBudget 限制本次兜底的 operation 数（防全量串行卡死）。
 	if cfg.Provider != nil {
 		var llmSchemas []*facts.Fact
-		res.LLMCalls, llmSchemas = resolveGaps(factList, g, prof, catalog, cfg.Provider, cfg.LLMBudget)
+		res.LLMCalls, llmSchemas = resolveGaps(factList, g, prof, catalog, cfg.Provider, cfg.LLMBudget, cfg.LLMConcurrency)
 		// LLM 兜底补出的 any 响应 schema 事实并入 factList，随既有管线编译。
 		factList = append(factList, llmSchemas...)
 	}
@@ -611,8 +614,16 @@ func opMethodPath(factID string) (string, string) {
 // 进 components——编译器无需感知 LLM 来源，改动面最小。
 // 返回 (实际发生的 LLM 调用次数, 新增的 schema 事实)。单个 operation 失败不阻断整体
 // （降级保持 unknown）。
+//
+// gapItem 是带缺口的 contract 事实 + 其载荷快照（并发路径写回前的隔离副本）。
+type gapItem struct {
+	f  *facts.Fact
+	cp facts.ContractPayload
+}
+
+// resolveGaps 对带缺口的 operation 做兜底采集，支持受控并发。
 func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profile,
-	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, budget int) (int, []*facts.Fact) {
+	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, budget, concurrency int) (int, []*facts.Fact) {
 
 	// 预算按「缺口中收益最高者优先」排序：静态证据越强（候选越少越精准）的缺口
 	// 越值得花一次 LLM 调用。any 响应缺口（含 dataCandidates）和错误码候选明确的
@@ -622,48 +633,121 @@ func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profi
 		reorderContractFacts(factList)
 	}
 
-	calls := 0
-	var newFacts []*facts.Fact
-	successCode := successCodeOf(prof)
+	// 收集带缺口的 contract 事实索引（保持排序后的相对顺序）。
+	var items []gapItem
 	for _, f := range factList {
 		if f.Kind != facts.KindContract {
 			continue
 		}
 		cp, ok := f.Value.(facts.ContractPayload)
-		if !ok {
+		if !ok || len(cp.Gaps) == 0 {
 			continue
 		}
-		if len(cp.Gaps) == 0 {
-			continue
-		}
-		if budget > 0 && calls >= budget {
+		if budget > 0 && len(items) >= budget {
 			break // 预算耗尽：其余缺口留待下次，不阻塞全量
 		}
-		method, path := opMethodPath(f.ID)
-		task := buildGapTask(method, path, cp.Gaps, g, prof, catalog, cp.ErrCandidates, cp.DataCandidates)
+		items = append(items, gapItem{f: f, cp: cp})
+	}
 
-		// 档位3 优先：provider 支持工具时走多轮工具循环；否则退回档位2 模板化。
-		var resolution *infer.GapResolution
-		var err error
-		if hasAnyGap(cp.Gaps, "any/interface{}") {
-			if _, ok := p.(infer.ToolUser); ok {
-				resolution, err = infer.ResolveGapsWithTools(p, task, buildTools(g), 12)
-			}
-		}
-		if resolution == nil {
-			resolution, err = infer.ResolveGaps(p, task)
-		}
+	if concurrency <= 1 {
+		// 串行路径：行为与旧实现完全一致（确定性、逐 operation 容错）。
+		return resolveGapsSerial(items, g, prof, catalog, p)
+	}
+	return resolveGapsParallel(items, g, prof, catalog, p, concurrency)
+}
+
+// resolveGapsSerial 串行兜底采集：逐 operation 单点容错，返回 (调用次数, 新增 schema 事实)。
+func resolveGapsSerial(items []gapItem, g *codegraph.Graph, prof *profile.Profile,
+	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider) (int, []*facts.Fact) {
+
+	calls := 0
+	var newFacts []*facts.Fact
+	successCode := successCodeOf(prof)
+	for _, it := range items {
+		method, path := opMethodPath(it.f.ID)
+		resolution, err := resolveOneGap(method, path, it.cp, g, prof, catalog, p)
 		if err != nil {
-			// 单点失败降级：保持 unknown，不阻断。
+			continue // 单点失败降级：保持 unknown，不阻断。
+		}
+		calls++
+		if scFact := applyGapResolution(&it.cp, resolution, catalog, g, successCode); scFact != nil {
+			newFacts = append(newFacts, scFact)
+		}
+		it.f.Value = it.cp
+	}
+	return calls, newFacts
+}
+
+// resolveGapsParallel 受控并发兜底采集：固定 worker 数，结果按原顺序写回
+// （保证确定性）。每个 operation 独立容错，失败保持 unknown。
+func resolveGapsParallel(items []gapItem, g *codegraph.Graph, prof *profile.Profile,
+	catalog map[string]slicing.ErrorCodeEntry, p infer.Provider, concurrency int) (int, []*facts.Fact) {
+
+	successCode := successCodeOf(prof)
+	type result struct {
+		idx      int
+		cp       facts.ContractPayload
+		scFact   *facts.Fact
+		resolved bool
+	}
+	results := make(chan result, len(items))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, concurrency)
+	for i, it := range items {
+		wg.Add(1)
+		go func(i int, it gapItem) {
+			defer wg.Done()
+			sem <- struct{}{}        // 抢占并发槽
+			defer func() { <-sem }() // 释放并发槽
+			method, path := opMethodPath(it.f.ID)
+			resolution, err := resolveOneGap(method, path, it.cp, g, prof, catalog, p)
+			if err != nil {
+				return // 失败不写回，保持 unknown
+			}
+			results <- result{idx: i, cp: it.cp,
+				scFact: applyGapResolution(&it.cp, resolution, catalog, g, successCode), resolved: true}
+		}(i, it)
+	}
+	wg.Wait()
+	close(results)
+
+	// 按原顺序写回，保证确定性。
+	byIdx := make([]result, len(items))
+	for r := range results {
+		byIdx[r.idx] = r
+	}
+	calls := 0
+	var newFacts []*facts.Fact
+	for i, it := range items {
+		r := byIdx[i]
+		if !r.resolved {
 			continue
 		}
 		calls++
-		if scFact := applyGapResolution(&cp, resolution, catalog, g, successCode); scFact != nil {
-			newFacts = append(newFacts, scFact)
+		if r.scFact != nil {
+			newFacts = append(newFacts, r.scFact)
 		}
-		f.Value = cp
+		it.f.Value = r.cp
 	}
 	return calls, newFacts
+}
+
+// resolveOneGap 对单个 operation 做一次兜底采集（档位3 优先，退回档位2）。
+func resolveOneGap(method, path string, cp facts.ContractPayload, g *codegraph.Graph,
+	prof *profile.Profile, catalog map[string]slicing.ErrorCodeEntry, p infer.Provider) (*infer.GapResolution, error) {
+
+	task := buildGapTask(method, path, cp.Gaps, g, prof, catalog, cp.ErrCandidates, cp.DataCandidates)
+	var resolution *infer.GapResolution
+	var err error
+	if hasAnyGap(cp.Gaps, "any/interface{}") {
+		if _, ok := p.(infer.ToolUser); ok {
+			resolution, err = infer.ResolveGapsWithTools(p, task, buildTools(g), 12)
+		}
+	}
+	if resolution == nil {
+		resolution, err = infer.ResolveGaps(p, task)
+	}
+	return resolution, err
 }
 
 // successCodeOf 取画像信封的成功码（无画像默认 0）。

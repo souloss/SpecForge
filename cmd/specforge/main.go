@@ -76,6 +76,7 @@ func cmdGen(args []string) error {
 	memoDir := fs.String("memo", "", "run-level memo cache dir (optional; reuse outputs when inputs unchanged)")
 	llm := fs.Bool("llm", false, "enable LLM gap-filling (tier 2) for statically-unresolved gaps")
 	llmBudget := fs.Int("llm-budget", 2, "max LLM gap-fill calls per run (0 = unlimited); caps serial LLM latency")
+	llmConcurrency := fs.Int("llm-concurrency", 0, "LLM gap-fill concurrency (0 = serial, default; >0 = bounded parallel workers)")
 	jsonOut := fs.Bool("json", false, "agent-friendly JSON summary on stdout")
 	fs.Parse(args)
 
@@ -89,13 +90,14 @@ func cmdGen(args []string) error {
 
 	t0 := time.Now()
 	result, err := engine.Run(engine.Config{
-		RepoDir:     *repo,
-		Service:     *service,
-		ProfilePath: *profile,
-		OutDir:      *outDir,
-		MemoDir:     *memoDir,
-		Provider:    provider,
-		LLMBudget:   *llmBudget,
+		RepoDir:        *repo,
+		Service:        *service,
+		ProfilePath:    *profile,
+		OutDir:         *outDir,
+		MemoDir:        *memoDir,
+		Provider:       provider,
+		LLMBudget:      *llmBudget,
+		LLMConcurrency: *llmConcurrency,
 	})
 	if err != nil {
 		return err
