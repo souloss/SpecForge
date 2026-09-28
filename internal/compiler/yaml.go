@@ -165,6 +165,11 @@ func writeOperation(w func(string, ...interface{}), b *strings.Builder, op Opera
 				} else if r.HasBody && r.SchemaName != "" {
 					w("%s        data:\n", p4)
 					w("%s          $ref: '#/components/schemas/%s'\n", p4, escapeRef(r.SchemaName))
+				} else if r.HasBody && r.MapValueType != "" {
+					w("%s        data:\n", p4)
+					w("%s          type: object\n", p4)
+					w("%s          additionalProperties:\n", p4)
+					w("%s            type: %s\n", p4, r.MapValueType)
 				}
 			}
 			if len(r.Sinks) > 0 {

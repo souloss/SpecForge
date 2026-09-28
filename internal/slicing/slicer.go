@@ -29,6 +29,7 @@ type SinkHit struct {
 	Success       bool               // err 槽为 nil → 成功信封
 	DataTypeID    string             // data 槽静态类型 ID（nil/unknown 时为空）
 	DataUnknown   bool               // any/interface{}: 无法定型
+	DataMapValue  string             // data 槽为 map[K]V 且 V 为基础类型时，V 的 JSON schema 类型（integer/string/...）；空 = 非 map 或值不可定型
 	HasBody       bool
 	ErrConstID    string   // 错误码常量符号（可解析时）
 	ErrCallCallee string   // 错误构造器调用（如 code.NewDefaultError）
@@ -119,7 +120,14 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 				hit.DataTypeID = id
 				hit.HasBody = true
 			} else {
-				hit.DataUnknown = true
+				// map[K]V 且 V 为基础类型时，静态可定型为 additionalProperties；
+				// 否则才标 DataUnknown（真 any）。
+				if mv, ok := mapValueType(t); ok {
+					hit.DataMapValue = mv
+					hit.HasBody = true
+				} else {
+					hit.DataUnknown = true
+				}
 			}
 		}
 		// 切片数据响应: []pkg.T → 数组 schema（设计文档 §7.1）
@@ -705,4 +713,38 @@ func (s *Slicer) codeOfConst(constID string) int {
 		return parseCodeValue(v)
 	}
 	return -1
+}
+
+// mapValueType 解析 map[K]V 的 V：V 是基础类型时返回其 JSON schema 类型名
+// （integer/string/number/boolean/object），用于静态定型 additionalProperties map；
+// V 是 any/interface{} 或非基础类型时返回空（不可静态定型，走 LLM 兜底）。
+func mapValueType(typeStr string) (string, bool) {
+	if !strings.HasPrefix(typeStr, "map[") {
+		return "", false
+	}
+	end := strings.Index(typeStr, "]")
+	if end < 0 || end+1 >= len(typeStr) {
+		return "", false
+	}
+	val := strings.TrimSpace(typeStr[end+1:])
+	// 剥离指针
+	val = strings.TrimPrefix(val, "*")
+	switch val {
+	case "string":
+		return "string", true
+	case "int", "int8", "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64", "uintptr":
+		return "integer", true
+	case "float32", "float64":
+		return "number", true
+	case "bool":
+		return "boolean", true
+	case "any", "interface{}":
+		return "", false // 值本身 any：不可定型
+	}
+	// 命名类型：若能解析为命名类型 ID，视为 object（可引用组件）；否则不可定型。
+	if id := normalizeTypeID(val); id != "" {
+		return "object", true
+	}
+	return "", false
 }

@@ -281,6 +281,10 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 				} else {
 					schemaFacts = append(schemaFacts, b.schemaFact(h.DataTypeID))
 				}
+			} else if h.DataMapValue != "" {
+				// map[K]V 且 V 为基础类型：静态定型为 additionalProperties map（§7.2.3），
+				// 不进 components，编译期直接展开。
+				row.MapValueType = h.DataMapValue
 			}
 			if h.DataUnknown {
 				row.SchemaType = ""

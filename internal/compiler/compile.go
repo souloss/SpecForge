@@ -77,6 +77,7 @@ type ResponseOut struct {
 	SchemaName    string // 信封 data 槽的 $ref 名（空 = 无 body）
 	ArrayElem     string // 切片响应: data 为 array，元素 $ref 名
 	HasBody       bool
+	MapValueType  string // map[K]V 响应: data 为 additionalProperties map，值类型
 	Sinks         []string
 }
 
@@ -220,6 +221,10 @@ func Compile(in Input) (*Document, error) {
 				} else {
 					op.Unknowns = append(op.Unknowns, "response schema not synthesized: "+r.SchemaType)
 				}
+			}
+			if r.MapValueType != "" {
+				g.MapValueType = r.MapValueType
+				g.HasBody = true
 			}
 			if r.Sink != "" && r.Sink != "(multiple)" {
 				g.Sinks = appendUniqStr(g.Sinks, r.Sink)

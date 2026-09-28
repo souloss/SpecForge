@@ -106,6 +106,9 @@ type ResponseFact struct {
 	// ErrSource 错误码未静态解析时，err 变量的来源证据（如
 	// "errgroup.Wait@ipoServer.go:233"），供 LLM 兜底定位码归因依据。
 	ErrSource string `yaml:"errSource,omitempty"`
+	// MapValueType data 槽为 map[K]V 且 V 为基础类型时，V 的 JSON schema 类型
+	// （integer/string/...）；空 = 非 map 或值不可定型。用于编译 additionalProperties map。
+	MapValueType string `yaml:"mapValueType,omitempty"`
 }
 
 // Envelope 业务错误码信封。
