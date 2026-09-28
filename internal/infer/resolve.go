@@ -16,6 +16,8 @@ type GapTask struct {
 	Gaps         []string        `json:"gaps"`         // 缺口描述
 	Evidence     string          `json:"evidence"`     // 已切片的代码证据（handler + service 关键分支）
 	ErrorCatalog []ErrorCodeItem `json:"errorCatalog"` // 错误码目录（LLM 只能从这里选码）
+	// ErrCandidates 切片内已出现的具体错误码候选（证据注入）：LLM 优先从这里选。
+	ErrCandidates []ErrCandidateItem `json:"errCandidates,omitempty"`
 }
 
 // ErrorCodeItem 错误码目录条目（序列化给 LLM）。
@@ -23,6 +25,13 @@ type ErrorCodeItem struct {
 	Symbol string `json:"symbol"` // 全限定常量符号（codeRef 证据）
 	Code   int    `json:"code"`
 	Msg    string `json:"msg"`
+}
+
+// ErrCandidateItem 切片内错误码候选（证据注入，供 LLM 优先选码）。
+type ErrCandidateItem struct {
+	Symbol string `json:"symbol"` // 全限定常量符号
+	Name   string `json:"name"`   // 末段常量名
+	Code   int    `json:"code"`   // 码值（-1 未解析）
 }
 
 // GapResolution LLM 兜底采集的产出（结构化，反序列化为强类型）。
@@ -144,10 +153,12 @@ var ErrToolsUnsupported = errors.New("infer: provider does not support tools")
 const gapSystemPrompt = "You are an API contract extractor. Given code evidence and a list of " +
 	"unresolved gaps, produce ONLY the concrete facts that resolve them. " +
 	"For error codes, you may only use codes whose symbol appears in the " +
-	"provided errorCatalog — never invent a code. For response schemas, " +
-	"only report fields you can see in the evidence (use tools to read " +
-	"source when the evidence is insufficient). Respond as JSON matching " +
-	"the output schema:\n" + gapOutputSchema
+	"provided errorCatalog — never invent a code. Prefer codes listed in " +
+	"errCandidates when present: those are error codes already observed in the " +
+	"same operation's code slice, so they are the most likely correct answers. " +
+	"For response schemas, only report fields you can see in the evidence " +
+	"(use tools to read source when the evidence is insufficient). Respond as " +
+	"JSON matching the output schema:\n" + gapOutputSchema
 
 // parseGapResolution 反序列化 + 防线2 结构校验。
 func parseGapResolution(raw []byte) (*GapResolution, error) {

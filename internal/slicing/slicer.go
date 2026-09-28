@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/types"
+	"sort"
 	"strings"
 
 	"github.com/specforge/specforge/internal/codegraph"
@@ -277,7 +278,6 @@ func (s *Slicer) typeInfoOf(n ast.Node) *types.Info {
 }
 
 // ---- 错误码目录 ---------------------------------------------------------
-
 // BuildErrorCatalog 扫描 profile 指定的错误码包（F7 横切）。
 func (s *Slicer) BuildErrorCatalog() map[string]ErrorCodeEntry {
 	out := map[string]ErrorCodeEntry{}
@@ -403,4 +403,146 @@ func sortedCallees(g *codegraph.Graph, fn string) []string {
 	out := append([]string{}, g.Callees[fn]...)
 	sortStrings(out)
 	return out
+}
+
+// constIDOf 取常量符号的全限定 ID（等价 codegraph 内 constID 的包级重写，
+// 避免 slicer 直接依赖 codegraph 未导出符号）。
+func constIDOf(c *types.Const) string {
+	if c.Pkg() != nil {
+		return c.Pkg().Path() + "." + c.Name()
+	}
+	return c.Name()
+}
+
+// methodIDOf 取方法/函数的全限定符号 ID（含接收者，与 codegraph 的 ID 口径一致）。
+func methodIDOf(fn *types.Func) string {
+	sig := fn.Type().(*types.Signature)
+	if sig.Recv() != nil {
+		recv := sig.Recv().Type()
+		if pt, ok := recv.(*types.Pointer); ok {
+			recv = pt.Elem()
+		}
+		return typeIDOf(recv) + "." + fn.Name()
+	}
+	if pkg := fn.Pkg(); pkg != nil {
+		return pkg.Path() + "." + fn.Name()
+	}
+	return fn.Name()
+}
+
+// typeIDOf 取类型的全限定 ID（命名类型取包路径 + 类型名；其余取类型串）。
+func typeIDOf(t types.Type) string {
+	if named, ok := t.(*types.Named); ok {
+		if obj := named.Obj(); obj != nil && obj.Pkg() != nil {
+			return obj.Pkg().Path() + "." + obj.Name()
+		}
+	}
+	return types.TypeString(t, func(p *types.Package) string { return p.Path() })
+}
+
+// CollectErrCandidates 收集切片内已出现的具体错误码候选。
+//
+// 这是「证据注入」的关键：err 变量兜底时，切片内其它汇聚点的 err 槽若是直接
+// 错误构造器调用（如 code.Response(c, code.NewDefaultError(code.ErrDatabase), nil)），
+// 其常量实参已由 analyzeHit 提取到 ErrConstID；此外 errgroup 协程里
+// `return code.NewDefaultError(code.X)` 的错误码也一并扫描——这些就是该 operation
+// 最可能的码。注入给 LLM 后它能据此缩小到几个候选，而非在全量目录里空猜。
+func (s *Slicer) CollectErrCandidates(handlerID string, hits []SinkHit) []ErrCandidate {
+	seen := map[string]bool{}
+	var out []ErrCandidate
+	add := func(constID string) {
+		if constID == "" || seen[constID] {
+			return
+		}
+		seen[constID] = true
+		out = append(out, ErrCandidate{
+			Symbol: constID,
+			Name:   lastSeg(constID),
+			Code:   s.codeOfConst(constID),
+		})
+	}
+	// 1. 汇聚点 err 槽直接构造器的常量（analyzeHit 已提取）。
+	for _, h := range hits {
+		add(h.ErrConstID)
+	}
+	// 2. 正向可达函数体内 `return NewXxxError(code.X)`（errgroup 协程返回的错误）。
+	for _, c := range s.scanErrorReturns(handlerID) {
+		add(c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}
+
+// scanErrorReturns 扫描 handler 正向可达函数的函数体，收集 `return NewXxxError(code.X)`
+// 模式里的错误码常量。覆盖 errgroup 协程内 `return code.NewDefaultError(code.ErrDatabase)`
+// 这类不经过 sink err 槽、直接由 g.Wait() 汇总的错误路径。
+func (s *Slicer) scanErrorReturns(handlerID string) []string {
+	roots := []string{handlerID}
+	if s.g.FuncDeclOf(handlerID) == nil {
+		roots = append(roots, s.g.ConcreteImplsOf(handlerID)...)
+	}
+	scanned := map[string]bool{}
+	var out []string
+	for _, root := range roots {
+		reach := s.g.ForwardReach(root, MaxDepth)
+		for fn := range reach {
+			if scanned[fn] {
+				continue
+			}
+			scanned[fn] = true
+			fd := s.g.FuncDeclOf(fn)
+			if fd == nil || fd.Body == nil {
+				continue
+			}
+			info := s.g.TypeInfoOfFunc(fn)
+			if info == nil {
+				continue
+			}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				ret, ok := n.(*ast.ReturnStmt)
+				if !ok {
+					return true
+				}
+				for _, expr := range ret.Results {
+					call, ok := ast.Unparen(expr).(*ast.CallExpr)
+					if !ok || !isErrCtorCall(call) {
+						continue
+					}
+					if constID, ok := codegraph.ConstArgOfCall(call, info, 0); ok {
+						out = append(out, constID)
+					}
+				}
+				return true
+			})
+		}
+	}
+	return out
+}
+
+// isErrCtorCall 判定调用是否为错误码构造器（NewXxxError 系）。
+// 约定画像 error_codes_source 指定错误码包；构造器命名统一为 New*Error* 前缀，
+// 首个实参是码常量（code int）。以此命名启发式识别，误收由 applyGapResolution
+// 的 catalog 命中校验兜底（非码常量不会命中目录，不会写回）。
+func isErrCtorCall(call *ast.CallExpr) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	name := sel.Sel.Name
+	return strings.HasPrefix(name, "New") && strings.Contains(name, "Error")
+}
+
+// ErrCandidate err 兜底的候选错误码（切片内已出现的具体码）。
+type ErrCandidate struct {
+	Symbol string // 全限定常量符号
+	Name   string // 末段常量名（跨包匹配键）
+	Code   int    // 码值（-1 表示未解析）
+}
+
+// codeOfConst 从常量值解析码值（复用目录同款解析）。
+func (s *Slicer) codeOfConst(constID string) int {
+	if v, ok := s.g.ConstValueOf(constID); ok {
+		return parseCodeValue(v)
+	}
+	return -1
 }

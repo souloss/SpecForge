@@ -116,6 +116,10 @@ func (b *ContractPayloadBuilder) Build() (*facts.Fact, []*facts.Fact, []*facts.F
 		conf = 0.4
 	}
 
+	// 切片内错误码候选（证据注入）：err 变量兜底时把切片里已出现的具体码
+	// 收集起来，作为 LLM 的候选目录——LLM 据此缩小到几个候选而非空猜。
+	cp.ErrCandidates = errCandidatesOf(b.slicer, b.route.Handler, hits)
+
 	// 静态缺口固化到 contract 事实，供档位判定（LLM 兜底的前置输入）。
 	cp.Gaps = unknowns
 
@@ -316,8 +320,9 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 		}
 		rows = append(rows, facts.ResponseFact{
 			Status: hits[0].Status, HasBody: false,
-			Envelope: &facts.Envelope{Code: -1, CodeRef: "unresolved", Msg: msg},
-			Sink:     "(multiple)",
+			Envelope:  &facts.Envelope{Code: -1, CodeRef: "unresolved", Msg: msg},
+			Sink:      "(multiple)",
+			ErrSource: strings.Join(errSources, ", "),
 		})
 		unknowns = append(unknowns, "error envelope: err variable not statically resolved")
 		conf = minConf(conf, 0.75)
@@ -588,6 +593,19 @@ func minConf(a, b float64) float64 {
 		return a
 	}
 	return b
+}
+
+// errCandidatesOf 把切片内错误码候选转成 fact 载荷（证据注入）。
+// CollectErrCandidates 已按常量名去重排序，这里直接映射为可序列化形态。
+func errCandidatesOf(slicer *slicing.Slicer, handlerID string, hits []slicing.SinkHit) []facts.ErrCandidateFact {
+	cands := slicer.CollectErrCandidates(handlerID, hits)
+	out := make([]facts.ErrCandidateFact, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, facts.ErrCandidateFact{
+			Symbol: c.Symbol, Name: c.Name, Code: c.Code,
+		})
+	}
+	return out
 }
 
 func schemaConfidence(sc *typeschema.Schema) float64 {

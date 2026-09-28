@@ -58,6 +58,16 @@ type ContractPayload struct {
 	// Gaps 静态分析未能定型、需 LLM 兜底采集的缺口清单（档位判定输入）。
 	// 空 = 全静态可定型（档位1，0 token）；非空 = 候选兜底对象。
 	Gaps []string `yaml:"gaps,omitempty"`
+	// ErrCandidates 切片内已出现的具体错误码候选（证据注入）：err 变量兜底时
+	// 作为 LLM 的候选目录，帮助其缩小选码范围而非在全量目录里空猜。
+	ErrCandidates []ErrCandidateFact `yaml:"errCandidates,omitempty"`
+}
+
+// ErrCandidateFact 切片内错误码候选（供 LLM 兜底选码）。
+type ErrCandidateFact struct {
+	Symbol string `yaml:"symbol"` // 全限定常量符号
+	Name   string `yaml:"name"`   // 末段常量名（跨包匹配键）
+	Code   int    `yaml:"code"`   // 码值（-1 表示未解析）
 }
 
 // ParamFact 参数事实。
@@ -85,6 +95,9 @@ type ResponseFact struct {
 	Sink       string    `yaml:"sink"`
 	// Source 该行的事实来源：空 = static；"llm" = 由 LLM 兜底采集补齐。
 	Source string `yaml:"source,omitempty"`
+	// ErrSource 错误码未静态解析时，err 变量的来源证据（如
+	// "errgroup.Wait@ipoServer.go:233"），供 LLM 兜底定位码归因依据。
+	ErrSource string `yaml:"errSource,omitempty"`
 }
 
 // Envelope 业务错误码信封。

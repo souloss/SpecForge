@@ -632,7 +632,7 @@ func resolveGaps(factList []*facts.Fact, g *codegraph.Graph, prof *profile.Profi
 			break // 预算耗尽：其余缺口留待下次，不阻塞全量
 		}
 		method, path := opMethodPath(f.ID)
-		task := buildGapTask(method, path, cp.Gaps, g, prof, catalog)
+		task := buildGapTask(method, path, cp.Gaps, g, prof, catalog, cp.ErrCandidates)
 
 		// 档位3 优先：provider 支持工具时走多轮工具循环；否则退回档位2 模板化。
 		var resolution *infer.GapResolution
@@ -745,9 +745,13 @@ func buildTools(g *codegraph.Graph) []infer.ToolSpec {
 	}
 }
 
-// buildGapTask 组装一次兜底采集的输入（证据切片 + 错误码目录）。
+// buildGapTask 组装一次兜底采集的输入（证据切片 + 错误码目录 + 切片候选）。
+//
+// errCandidates 是证据注入的关键：err 变量兜底时，切片内已出现过的具体错误码
+// 作为 LLM 候选目录，它据此缩小选码范围（而非在 241 条全量目录里空猜）。
 func buildGapTask(method, path string, gaps []string, g *codegraph.Graph,
-	prof *profile.Profile, catalog map[string]slicing.ErrorCodeEntry) infer.GapTask {
+	prof *profile.Profile, catalog map[string]slicing.ErrorCodeEntry,
+	errCandidates []facts.ErrCandidateFact) infer.GapTask {
 
 	task := infer.GapTask{
 		Method:   method,
@@ -758,6 +762,11 @@ func buildGapTask(method, path string, gaps []string, g *codegraph.Graph,
 	for id, e := range catalog {
 		task.ErrorCatalog = append(task.ErrorCatalog, infer.ErrorCodeItem{
 			Symbol: id, Code: e.Code, Msg: e.Msg,
+		})
+	}
+	for _, c := range errCandidates {
+		task.ErrCandidates = append(task.ErrCandidates, infer.ErrCandidateItem{
+			Symbol: c.Symbol, Name: c.Name, Code: c.Code,
 		})
 	}
 	return task
