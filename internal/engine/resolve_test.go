@@ -1,247 +1,342 @@
 package engine
 
 import (
+	"context"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/specforge/specforge/internal/codegraph"
 	"github.com/specforge/specforge/internal/facts"
+	"github.com/specforge/specforge/internal/frontend"
+	"github.com/specforge/specforge/internal/frontend/golang"
 	"github.com/specforge/specforge/internal/infer"
 	"github.com/specforge/specforge/internal/loader"
-	"github.com/specforge/specforge/internal/profile"
-	"github.com/specforge/specforge/internal/slicing"
-	"github.com/specforge/specforge/internal/typeschema"
+	"github.com/specforge/specforge/internal/schema"
+	"github.com/specforge/specforge/internal/verify"
 )
 
-// mockProvider 返回预设 JSON 的 Provider，用于离线测试 resolveGaps。
-type mockProvider struct{ out string }
+// mockProvider 返回预设 JSON 的 Provider，记录调用次数（离线测试 LLM 阶段）。
+type mockProvider struct {
+	out   string
+	calls int
+}
 
 func (m *mockProvider) Name() string { return "mock" }
-func (m *mockProvider) Complete(system, prompt string, schema []byte) ([]byte, error) {
-	return []byte(m.out), nil
+func (m *mockProvider) Complete(_ context.Context, _ infer.Request) (infer.Response, error) {
+	m.calls++
+	return infer.Response{Text: []byte(m.out), Usage: infer.Usage{Calls: 1, InputTokens: 10, OutputTokens: 5}}, nil
 }
 
-// TestApplyGapResolutionRejectsHallucinatedCode 幻觉 codeRef 被丢弃。
-func TestApplyGapResolutionRejectsHallucinatedCode(t *testing.T) {
-	catalog := map[string]slicing.ErrorCodeEntry{
-		"trade/pkg/code.ErrDatabase": {Code: 100011, Msg: "数据库错误"},
+// fixtureSrc 测试夹具模块：Handler 返回 ErrA（ErrB 从不出现），Data 返回带字面量键的 map。
+const fixtureSrc = `package svc
+
+import "errors"
+
+const ErrA = 1001
+const ErrB = 1002
+
+func NewError(code int) error { return errors.New("x") }
+
+func Handler() error { return NewError(ErrA) }
+
+func Data() map[string]any { return map[string]any{"total": 1, "items": nil} }
+`
+
+// fixturePhase 在临时目录构造夹具模块并返回 LLM 阶段上下文。
+func fixturePhase(t *testing.T) *llmPhase {
+	t.Helper()
+	dir := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module m\n\ngo 1.21\n"), 0o644))
+	must(t, os.MkdirAll(filepath.Join(dir, "svc"), 0o755))
+	must(t, os.WriteFile(filepath.Join(dir, "svc", "svc.go"), []byte(fixtureSrc), 0o644))
+	l, err := loader.LoadRepo(dir)
+	must(t, err)
+	g, err := codegraph.Build(l.Pkgs, l.Fset)
+	must(t, err)
+	g.SetRoot(l.Root)
+	catalog := map[string]frontend.ErrorCode{
+		"m/svc.ErrA": {Symbol: "m/svc.ErrA", Code: 1001, Msg: "a"},
+		"m/svc.ErrB": {Symbol: "m/svc.ErrB", Code: 1002, Msg: "b"},
 	}
-	cp := &facts.ContractPayload{
-		Responses: []facts.ResponseFact{
-			{Status: 200, Envelope: &facts.Envelope{Code: -1, CodeRef: "unresolved"}},
-		},
-	}
-	r := &infer.GapResolution{
-		ErrorCodes: []infer.ResolvedError{{Status: 200, Code: 999999, CodeRef: "trade/pkg/code.ErrFake"}},
-	}
-	applyGapResolution(cp, r, catalog, nil, 0)
-	if cp.Responses[0].Envelope.Code != -1 {
-		t.Fatalf("hallucinated codeRef should be dropped, got code=%d", cp.Responses[0].Envelope.Code)
-	}
+	return newLLMPhase(golang.NewProgram(g), catalog, 0, &mockProvider{}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 }
 
-// TestApplyGapResolutionWritesBackValidCode 命中目录的 codeRef 写回。
-func TestApplyGapResolutionWritesBackValidCode(t *testing.T) {
-	catalog := map[string]slicing.ErrorCodeEntry{
-		"trade/pkg/code.ErrDatabase": {Code: 100011, Msg: "数据库错误"},
-	}
-	cp := &facts.ContractPayload{
-		Responses: []facts.ResponseFact{
-			{Status: 200, Envelope: &facts.Envelope{Code: -1, CodeRef: "unresolved"}},
-		},
-	}
-	r := &infer.GapResolution{
-		ErrorCodes: []infer.ResolvedError{{Status: 200, Code: 100011, CodeRef: "ErrDatabase"}},
-	}
-	applyGapResolution(cp, r, catalog, nil, 0)
-	row := cp.Responses[0]
-	if row.Envelope.Code != 100011 {
-		t.Fatalf("want code=100011, got %d", row.Envelope.Code)
-	}
-	if row.Source != "llm" {
-		t.Fatalf("want Source=llm, got %q", row.Source)
-	}
-}
-
-// TestResolveGapsOffline 无 provider 时返回 ErrNoProvider。
-func TestResolveGapsOffline(t *testing.T) {
-	if _, err := infer.ResolveGaps(nil, infer.GapTask{}); err != infer.ErrNoProvider {
-		t.Fatalf("want ErrNoProvider, got %v", err)
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
-// TestApplyResponseSchemaWritesBackFieldInWhitelist 命中代码图字段白名单的 any
-// 响应 schema 被写回：成功行指向新 schema，新增 KindSchema 事实。
-func TestApplyResponseSchemaWritesBackFieldInWhitelist(t *testing.T) {
-	g := &codegraph.Graph{Types: map[string]*codegraph.TypeInfo{
-		"repo/pkg/mapping.Resp": {
-			IsStruct: true,
-			Fields: []codegraph.Field{
-				{Name: "OrderID", JSONName: "order_id", TypeStr: "string"},
-				{Name: "Amount", JSONName: "amount", TypeStr: "float64"},
-			},
-		},
-	}}
-	cp := &facts.ContractPayload{
-		OperationID: "orderCheck",
-		Responses: []facts.ResponseFact{
-			{Status: 200, Envelope: &facts.Envelope{Code: 0}},
-		},
-		DataCandidates: []facts.DataCandidateFact{
-			{Name: "order_id"}, {Name: "amount"},
-		},
-	}
-	rs := &infer.ResolvedSchema{Properties: []infer.ResolvedProp{
-		{Name: "order_id", Type: "string", Required: true},
-		{Name: "amount", Type: "number"},
-	}}
-	f := applyResponseSchema(cp, rs, g, 0)
-	if f == nil {
-		t.Fatal("want schema fact, got nil")
-	}
-	if cp.Responses[0].SchemaType != "llm:any:orderCheck" {
-		t.Fatalf("SchemaType = %q, want llm:any:orderCheck", cp.Responses[0].SchemaType)
-	}
-	if cp.Responses[0].Source != "llm" {
-		t.Fatalf("Source = %q, want llm", cp.Responses[0].Source)
-	}
-	sc, ok := f.Value.(*typeschema.Schema)
-	if !ok {
-		t.Fatalf("fact value = %T, want *typeschema.Schema", f.Value)
-	}
-	if len(sc.Props) != 2 || sc.Props[0].Name != "order_id" {
-		t.Fatalf("props = %+v", sc.Props)
-	}
-	// 类型从代码图反查（float64 → number），而非信任 LLM 报的 "number"。
-	if sc.Props[1].Schema.Type != "number" {
-		t.Fatalf("amount type = %q, want number", sc.Props[1].Schema.Type)
+// unresolvedPayload 只有一个未解析错误行的载荷。
+func unresolvedPayload() facts.ContractPayload {
+	return facts.ContractPayload{
+		OperationID: "handler",
+		Gaps:        []string{"error envelope: err variable not statically resolved"},
+		Responses:   []facts.ResponseFact{{Status: 200, Envelope: &facts.Envelope{Code: facts.UnresolvedCode, CodeRef: "unresolved"}}},
 	}
 }
 
-// TestApplyResponseSchemaRejectsHallucinatedField 字段名不在代码图白名单内，
-// 整条 responseSchema 丢弃（防幻觉）。
-func TestApplyResponseSchemaRejectsHallucinatedField(t *testing.T) {
-	g := &codegraph.Graph{Types: map[string]*codegraph.TypeInfo{
-		"repo/pkg/mapping.Resp": {
-			IsStruct: true,
-			Fields:   []codegraph.Field{{Name: "OrderID", JSONName: "order_id", TypeStr: "string"}},
-		},
-	}}
-	cp := &facts.ContractPayload{
-		OperationID: "orderCheck",
-		Responses: []facts.ResponseFact{
-			{Status: 200, Envelope: &facts.Envelope{Code: 0}},
-		},
-		DataCandidates: []facts.DataCandidateFact{
-			{Name: "order_id"},
-		},
+// TestApplyErrorCodesVerifiesAgainstSlice 目录外码与切片中不出现的码都被拒绝；出现的码带行级证据写回。
+func TestApplyErrorCodesVerifiesAgainstSlice(t *testing.T) {
+	lp := fixturePhase(t)
+	sl := lp.slice("m/svc.Handler", nil)
+	out := gapOutcome{cp: unresolvedPayload()}
+	lp.applyErrorCodes(&out, &infer.GapResolution{ErrorCodes: []infer.ResolvedError{
+		{CodeRef: "m/svc.ErrFake"}, // 目录外：幻觉
+		{CodeRef: "ErrB"},          // 目录内但切片中未出现：无证据
+		{CodeRef: "ErrA"},          // 通过
+	}}, sl)
+	if out.accepted != 1 || out.rejected != 2 {
+		t.Fatalf("accepted=%d rejected=%d, want 1/2", out.accepted, out.rejected)
 	}
-	rs := &infer.ResolvedSchema{Properties: []infer.ResolvedProp{
-		{Name: "phantom_field", Type: "string"},
-	}}
-	if f := applyResponseSchema(cp, rs, g, 0); f != nil {
-		t.Fatal("want nil (hallucinated field dropped), got fact")
-	}
-	if cp.Responses[0].SchemaType != "" {
-		t.Fatalf("SchemaType should stay empty, got %q", cp.Responses[0].SchemaType)
-	}
-}
-
-// TestBuildToolsReadSymbol 工具闭包能读符号。
-func TestBuildToolsReadSymbol(t *testing.T) {
-	l, _ := loader.LoadRepo("/home/whj/projects/sample-ipo-rebase")
-	pkgs := l.ServiceFilter("service-ipo")
-	g, _ := codegraph.Build(pkgs, l.Fset)
-	tools := buildTools(g)
-	if len(tools) != 3 {
-		t.Fatalf("want 3 tools, got %d", len(tools))
-	}
-	// read_symbol 对已知符号应返回 JSON。
-	var readSym, calleesT, readType infer.ToolSpec
-	for _, t := range tools {
-		switch t.Name {
-		case "read_symbol":
-			readSym = t
-		case "callees":
-			calleesT = t
-		case "read_type":
-			readType = t
+	var got *facts.ResponseFact
+	for i := range out.cp.Responses {
+		if out.cp.Responses[i].Envelope.Code == 1001 {
+			got = &out.cp.Responses[i]
 		}
 	}
-	_ = readType
-	if readSym.Call == nil || calleesT.Call == nil {
-		t.Fatal("read_symbol / callees tools missing Call")
+	if got == nil || got.Source != "llm" || got.Envelope.CodeRef != "m/svc.ErrA" {
+		t.Fatalf("ErrA row not written back correctly: %+v", out.cp.Responses)
 	}
-	out, err := readSym.Call(map[string]any{"id": "trade/internal/common/app.ping"})
-	if err != nil {
-		t.Fatalf("read_symbol call: %v", err)
+	if len(out.evidence) != 1 || !strings.Contains(out.evidence[0].Quote, "NewError(ErrA)") {
+		t.Fatalf("evidence should quote the source line, got %+v", out.evidence)
 	}
-	if len(out) == 0 || out[0] != '{' {
-		t.Fatalf("read_symbol should return JSON, got %q", out)
-	}
-	out2, err := calleesT.Call(map[string]any{"id": "trade/internal/common/app.ping"})
-	if err != nil {
-		t.Fatalf("callees call: %v", err)
-	}
-	if len(out2) == 0 {
-		t.Fatal("callees should return JSON")
+	// 有拒绝项：即使声明 exhaustive 也保留未解析行（本例未声明）。
+	if out.cp.Responses[len(out.cp.Responses)-1].Envelope.Code != facts.UnresolvedCode {
+		t.Fatal("unresolved row must be kept")
 	}
 }
 
-// TestMergeProfileCandidateFillsMissing 画像候选填补缺失（framework / sinks）。
-func TestMergeProfileCandidateFillsMissing(t *testing.T) {
-	prof := profile.Default()
-	cand := &infer.ProfileCandidate{
-		Framework: "gofiber/v2",
-		ResponseSinks: []infer.SinkCandidate{
-			{Symbol: "code.WriteResponse", Signature: "(c,err,data)", DataSlot: 2, ErrSlot: 1, Status: 200},
-		},
+// TestApplyErrorCodesExhaustiveRemovesUnresolved 全部码通过复核且声明 exhaustive 时移除未解析行与缺口。
+func TestApplyErrorCodesExhaustiveRemovesUnresolved(t *testing.T) {
+	lp := fixturePhase(t)
+	out := gapOutcome{cp: unresolvedPayload()}
+	lp.applyErrorCodes(&out, &infer.GapResolution{Exhaustive: true, ErrorCodes: []infer.ResolvedError{{CodeRef: "m/svc.ErrA"}}},
+		lp.slice("m/svc.Handler", nil))
+	for _, r := range out.cp.Responses {
+		if r.Envelope.Code == facts.UnresolvedCode {
+			t.Fatal("unresolved row should be removed")
+		}
 	}
-	merged := mergeProfileCandidate(prof, cand)
-	if merged.Framework != "gofiber/v2" {
-		t.Fatalf("framework = %q, want gofiber/v2", merged.Framework)
-	}
-	if len(merged.ResponseSinks) != 1 || merged.ResponseSinks[0].Symbol != "code.WriteResponse" {
-		t.Fatalf("sinks = %+v", merged.ResponseSinks)
+	if len(out.cp.Gaps) != 0 {
+		t.Fatalf("error gap should be closed, got %v", out.cp.Gaps)
 	}
 }
 
-// TestMergeProfileCandidateDoesNotOverride 画像候选不覆盖既有约定。
-func TestMergeProfileCandidateDoesNotOverride(t *testing.T) {
-	prof := &profile.Profile{
-		Framework: "gofiber/v2",
-		ResponseSinks: []profile.SinkPattern{
-			{Symbol: "existing.Sink", DataSlot: 2, ErrSlot: 1, Status: 200},
-		},
-		AuthMiddleware: map[string]profile.SecurityMapping{},
-	}
-	cand := &infer.ProfileCandidate{
-		Framework: "gin",
-		ResponseSinks: []infer.SinkCandidate{
-			{Symbol: "llm.Sink", DataSlot: 1},
-		},
-	}
-	merged := mergeProfileCandidate(prof, cand)
-	if merged.Framework != "gofiber/v2" {
-		t.Fatalf("framework should not be overridden, got %q", merged.Framework)
-	}
-	if len(merged.ResponseSinks) != 1 || merged.ResponseSinks[0].Symbol != "existing.Sink" {
-		t.Fatalf("sinks should not be overridden, got %+v", merged.ResponseSinks)
+// anyPayload any 响应缺口载荷（成功行无 schema，带字段候选）。
+func anyPayload() facts.ContractPayload {
+	return facts.ContractPayload{
+		OperationID:    "data",
+		Gaps:           []string{"success data: any/interface{} cannot be typed"},
+		Responses:      []facts.ResponseFact{{Status: 200, Envelope: &facts.Envelope{Code: 0}}},
+		DataCandidates: []facts.DataCandidateFact{{Name: "items"}, {Name: "total"}},
 	}
 }
 
-// TestLLMKeyOfOfflineVsLLM 离线与 LLM 运行的指纹键必须不同（防脏缓存）。
-func TestLLMKeyOfOfflineVsLLM(t *testing.T) {
+// shapeItem 组装形状缺口的 gapItem（切片取 handler 的可达源码）。
+func shapeItem(lp *llmPhase, cp facts.ContractPayload, handler string) gapItem {
+	it := gapItem{cp: cp, handler: handler, sl: lp.slice(handler, nil)}
+	it.targets = lp.shapeTargets(cp)
+	return it
+}
+
+// obj / scalar 形状树构造辅助。
+func obj(props ...infer.ShapeProp) *infer.ShapeNode {
+	return &infer.ShapeNode{Type: "object", Properties: props}
+}
+func scalar(t string) *infer.ShapeNode { return &infer.ShapeNode{Type: t} }
+
+// TestApplyShapesVerified 根形状（成功 data 为 any）：字段名在源码中出现、类型封闭 → 写回专属 schema，核对强度 text。
+func TestApplyShapesVerified(t *testing.T) {
+	lp := fixturePhase(t)
+	lp.schemas = map[string]*schema.Schema{}
+	it := shapeItem(lp, anyPayload(), "m/svc.Data")
+	if len(it.targets) != 1 {
+		t.Fatalf("targets = %+v", it.targets)
+	}
+	out := gapOutcome{cp: cloneContract(it.cp), minConf: 1}
+	lp.applyShapes(&out, []infer.ResolvedShape{{Gap: "s0", Shape: obj(
+		infer.ShapeProp{Name: "total", Required: true, Shape: scalar("integer")},
+		infer.ShapeProp{Name: "items", Shape: &infer.ShapeNode{Type: "array", Items: scalar("string")}},
+	)}}, it)
+	if out.accepted != 1 || len(out.schemas) != 1 || len(out.cp.Gaps) != 0 {
+		t.Fatalf("outcome = %+v", out)
+	}
+	if !strings.HasPrefix(out.cp.Responses[0].SchemaType, llmShapePrefix) || out.minConf != facts.VerificationCap(facts.VerifyText) {
+		t.Fatalf("row/conf not updated: %+v conf=%v", out.cp.Responses[0], out.minConf)
+	}
+	f := out.schemas[0]
+	sc, _ := f.Schema()
+	if f.Verification != facts.VerifyText || len(sc.Props) != 2 || len(f.Evidence) == 0 {
+		t.Fatalf("fact = %+v schema = %+v", f, sc)
+	}
+}
+
+// TestApplyShapesRejects 源码中不存在的字段名、集外类型、超深嵌套：整棵拒绝，缺口保留。
+func TestApplyShapesRejects(t *testing.T) {
+	lp := fixturePhase(t)
+	lp.schemas = map[string]*schema.Schema{}
+	deep := scalar("string")
+	for i := 0; i <= verify.MaxShapeDepth+1; i++ {
+		deep = obj(infer.ShapeProp{Name: "total", Shape: deep})
+	}
+	for _, shape := range []*infer.ShapeNode{
+		obj(infer.ShapeProp{Name: "phantom", Shape: scalar("string")}),
+		obj(infer.ShapeProp{Name: "total", Shape: scalar("decimal")}),
+		deep,
+	} {
+		it := shapeItem(lp, anyPayload(), "m/svc.Data")
+		out := gapOutcome{cp: cloneContract(it.cp), minConf: 1}
+		lp.applyShapes(&out, []infer.ResolvedShape{{Gap: "s0", Shape: shape}}, it)
+		if out.accepted != 0 || out.rejected != 1 || len(out.cp.Gaps) != 1 {
+			t.Fatalf("shape %+v should be rejected, outcome=%+v", shape, out)
+		}
+	}
+}
+
+// TestApplyShapesNestedPath 嵌套路径（PageResult.list 为 any）：只替换该路径，其它字段保持，原 schema 不被修改。
+func TestApplyShapesNestedPath(t *testing.T) {
+	lp := fixturePhase(t)
+	base := &schema.Schema{Type: "object", Props: []schema.Prop{
+		{Name: "count", Schema: &schema.Schema{Type: "integer"}},
+		{Name: "list", Schema: &schema.Schema{Unknown: true}},
+	}}
+	lp.schemas = map[string]*schema.Schema{"m/svc.Page": base}
+	cp := facts.ContractPayload{
+		OperationID: "data",
+		Gaps:        []string{facts.GapSchemaAny("m/svc.Page", "list")},
+		Responses:   []facts.ResponseFact{{Status: 200, Envelope: &facts.Envelope{Code: 0}, SchemaType: "m/svc.Page"}},
+	}
+	it := shapeItem(lp, cp, "m/svc.Data")
+	out := gapOutcome{cp: cloneContract(it.cp), minConf: 1}
+	lp.applyShapes(&out, []infer.ResolvedShape{{Gap: "s0", Shape: &infer.ShapeNode{Type: "array",
+		Items: obj(infer.ShapeProp{Name: "total", Shape: scalar("integer")})}}}, it)
+	if out.accepted != 1 || len(out.schemas) != 1 {
+		t.Fatalf("outcome = %+v", out)
+	}
+	sc, _ := out.schemas[0].Schema()
+	if sc.Props[0].Name != "count" || sc.Props[1].Schema.Type != "array" || sc.Props[1].Schema.Items.Props[0].Name != "total" {
+		t.Fatalf("replaced schema = %+v", sc)
+	}
+	if !base.Props[1].Schema.Unknown {
+		t.Fatal("base schema must not be mutated")
+	}
+}
+
+// TestResolveGapsWritesBackInOrder 端到端：mock provider → 复核 → 写回 contract 事实（并发下结果不变）。
+func TestResolveGapsWritesBackInOrder(t *testing.T) {
+	lp := fixturePhase(t)
+	lp.p = &mockProvider{out: "```json\n{\"errorCodes\":[{\"codeRef\":\"ErrA\"}],\"exhaustive\":true}\n```"}
+	f := &facts.Fact{ID: "contract:op:GET:/h", Kind: facts.KindContract, Value: unresolvedPayload(), Confidence: 0.75}
+	routes := map[string]string{"op:GET:/h": "m/svc.Handler"}
+	_, st := lp.resolveGaps(context.Background(), []*facts.Fact{f}, routes, 0, 4)
+	if st.Attempted != 1 || st.Accepted != 1 || st.Failed != 0 {
+		t.Fatalf("stats = %+v", st)
+	}
+	cp := f.Value.(facts.ContractPayload)
+	if len(cp.Gaps) != 0 || f.Confidence != facts.VerificationCap(facts.VerifyTyped) || len(f.Evidence) != 1 {
+		t.Fatalf("fact not updated: conf=%v gaps=%v ev=%v", f.Confidence, cp.Gaps, f.Evidence)
+	}
+}
+
+// TestResolveGapsBudget 预算只处理收益最高的缺口，其余计入 BudgetSkipped。
+func TestResolveGapsBudget(t *testing.T) {
+	lp := fixturePhase(t)
+	lp.p = &mockProvider{out: `{}`}
+	var fl []*facts.Fact
+	routes := map[string]string{}
+	for _, p := range []string{"/a", "/b", "/c"} {
+		fl = append(fl, &facts.Fact{ID: "contract:op:GET:" + p, Kind: facts.KindContract, Value: unresolvedPayload()})
+		routes["op:GET:"+p] = "m/svc.Handler"
+	}
+	_, st := lp.resolveGaps(context.Background(), fl, routes, 2, 1)
+	if st.Attempted != 2 || st.BudgetSkipped != 1 {
+		t.Fatalf("stats = %+v", st)
+	}
+}
+
+// TestBuildToolsDeterministicAndSandboxed 工具输出确定（缓存读集校验的前提），read_source 不越出仓库。
+func TestBuildToolsDeterministicAndSandboxed(t *testing.T) {
+	lp := fixturePhase(t)
+	tools := map[string]infer.ToolSpec{}
+	for _, tl := range lp.tools {
+		tools[tl.Name] = tl
+	}
+	ctx := context.Background()
+	a, _ := tools["read_symbol"].Call(ctx, map[string]any{"id": "m/svc.Handler"})
+	b, _ := tools["read_symbol"].Call(ctx, map[string]any{"id": "m/svc.Handler"})
+	if a != b || !strings.Contains(a, "NewError(ErrA)") {
+		t.Fatalf("read_symbol not deterministic or missing source: %s", a)
+	}
+	out, _ := tools["read_source"].Call(ctx, map[string]any{"file": "../../etc/passwd.go", "from": 1.0, "to": 5.0})
+	if !strings.Contains(out, "error") {
+		t.Fatalf("read_source must refuse paths outside the repo, got %s", out)
+	}
+	out, _ = tools["read_source"].Call(ctx, map[string]any{"file": "svc/svc.go", "from": 1.0, "to": 1.0})
+	if !strings.Contains(out, "package svc") {
+		t.Fatalf("read_source = %s", out)
+	}
+	found, _ := tools["find_symbol"].Call(ctx, map[string]any{"query": "handler"})
+	if !strings.Contains(found, "m/svc.Handler") {
+		t.Fatalf("find_symbol = %s", found)
+	}
+}
+
+// TestLLMKeyOf 离线/LLM、不同预算的键不同；并发数不影响产物，不改变键。
+func TestLLMKeyOf(t *testing.T) {
+	p := &mockProvider{}
 	off := llmKeyOf(Config{})
-	if off != "offline" {
-		t.Fatalf("offline llmKey = %q, want offline", off)
+	a := llmKeyOf(Config{Provider: p, LLMBudget: 6, LLMConcurrency: 1})
+	b := llmKeyOf(Config{Provider: p, LLMBudget: 6, LLMConcurrency: 8})
+	c := llmKeyOf(Config{Provider: p, LLMBudget: 2})
+	if off != "offline" || a == off || a != b || a == c {
+		t.Fatalf("keys: off=%q a=%q b=%q c=%q", off, a, b, c)
 	}
-	p := &mockProvider{out: "{}"}
-	llm := llmKeyOf(Config{Provider: p, LLMBudget: 6, LLMConcurrency: 4, LearnProfile: true})
-	if llm == off {
-		t.Fatalf("llm key should differ from offline, both %q", llm)
+}
+
+// TestBudgetOnlyCountsPaidCalls 预算只约束未缓存的调用：第二次运行缓存项免费，再推进一个新缺口。
+func TestBudgetOnlyCountsPaidCalls(t *testing.T) {
+	lp := fixturePhase(t)
+	inner := &mockProvider{out: `{}`}
+	lp.p = infer.NewCachedProvider(inner, t.TempDir())
+	mk := func() ([]*facts.Fact, map[string]string) {
+		var fl []*facts.Fact
+		routes := map[string]string{}
+		for _, p := range []string{"/a", "/b", "/c"} {
+			fl = append(fl, &facts.Fact{ID: "contract:op:GET:" + p, Kind: facts.KindContract, Value: unresolvedPayload()})
+			routes["op:GET:"+p] = "m/svc.Handler"
+		}
+		return fl, routes
 	}
-	llm2 := llmKeyOf(Config{Provider: p, LLMBudget: 2, LLMConcurrency: 4})
-	if llm2 == llm {
-		t.Fatalf("different budget should produce different key: %q", llm)
+	fl, routes := mk()
+	if _, st := lp.resolveGaps(context.Background(), fl, routes, 1, 1); st.Attempted != 1 || st.BudgetSkipped != 2 {
+		t.Fatalf("run1 stats = %+v", st)
+	}
+	fl, routes = mk()
+	if _, st := lp.resolveGaps(context.Background(), fl, routes, 1, 1); st.Attempted != 2 || st.BudgetSkipped != 1 || inner.calls != 2 {
+		t.Fatalf("run2 stats = %+v, model calls = %d", st, inner.calls)
+	}
+}
+
+// TestEnrichOperationsEvidence 语义增强产出带 handler 源码证据的事实，且能通过证据闸门。
+func TestEnrichOperationsEvidence(t *testing.T) {
+	lp := fixturePhase(t)
+	lp.p = &mockProvider{out: `{"summary":"Returns error A","description":"demo"}`}
+	routes := map[string]string{"op:GET:/h": "m/svc.Handler"}
+	got := lp.enrichOperations(context.Background(), nil, routes, 2)
+	if len(got) != 1 {
+		t.Fatalf("want 1 enrichment fact, got %d", len(got))
+	}
+	kept, dropped := verifyEvidence(lp.prog, got)
+	if len(kept) != 1 || len(dropped) != 0 || kept[0].Evidence[0].File != "svc/svc.go" {
+		t.Fatalf("evidence gate: kept=%v dropped=%v", kept, dropped)
+	}
+	if p := kept[0].Value.(facts.EnrichmentPayload); p.Summary != "Returns error A" {
+		t.Fatalf("payload = %+v", p)
 	}
 }

@@ -8,11 +8,11 @@ package loader
 
 import (
 	"fmt"
-	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/tools/go/packages"
@@ -43,10 +43,12 @@ func LoadRepo(dir string) (*Loaded, error) {
 	if _, err := os.Stat(filepath.Join(abs, "go.mod")); err != nil {
 		return nil, fmt.Errorf("no go.mod under %s: %w", abs, err)
 	}
+	// 不开 NeedDeps：分析只需仓库内包的语法与类型信息，依赖包走编译器导出数据即可。
+	// 开 NeedDeps 会把全部三方依赖从源码解析+类型检查（实测内存 ×6、耗时 ×2~5），产物不变。
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedTypesSizes |
-			packages.NeedImports | packages.NeedDeps | packages.NeedModule,
+			packages.NeedImports | packages.NeedModule,
 		Dir:   abs,
 		Env:   os.Environ(),
 		Tests: false,
@@ -157,16 +159,41 @@ func pkgByPath(pkgs []*packages.Package, path string) *packages.Package {
 	return nil
 }
 
-// ParseFile 单文件解析（指纹计算用，不依赖类型信息）。
-func ParseFile(path string) (*ast.File, *token.FileSet, error) {
-	fset := token.NewFileSet()
-	src, err := os.ReadFile(path)
-	if err != nil {
-		return nil, nil, err
-	}
-	f, err := parser.ParseFile(fset, path, src, parser.ParseComments)
-	if err != nil {
-		return nil, nil, err
-	}
-	return f, fset, nil
+// scanSkipDirs 轻量服务扫描跳过的目录（与分析无关的依赖、产物、测试数据）。
+var scanSkipDirs = map[string]bool{".git": true, ".specforge": true, "vendor": true, "node_modules": true, "testdata": true}
+
+// ListServices 不做类型加载地扫描仓库内的 main 包（只解析 package 子句），返回按名排序的服务清单。
+// 服务名口径与 LoadRepo 一致：main 包目录末段，去掉 "cmd-" 前缀。供 doctor 等快速命令使用。
+func ListServices(root string) ([]Service, error) {
+	seen := map[string]bool{}
+	var out []Service
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if path != root && (scanSkipDirs[d.Name()] || strings.HasPrefix(d.Name(), ".")) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		dir := filepath.Dir(path)
+		if seen[dir] {
+			return nil
+		}
+		f, perr := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly)
+		if perr != nil || f.Name.Name != "main" {
+			return nil
+		}
+		seen[dir] = true
+		rel, _ := filepath.Rel(root, dir)
+		name := strings.TrimPrefix(filepath.Base(dir), "cmd-")
+		out = append(out, Service{Name: name, Dir: filepath.ToSlash(rel)})
+		return nil
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out, err
 }

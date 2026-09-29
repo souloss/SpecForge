@@ -4,22 +4,22 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/specforge/specforge/internal/typeschema"
+	"github.com/specforge/specforge/internal/schema"
 )
 
 func TestCanonicalShapeDedup(t *testing.T) {
 	// 同形状不同名的类型 → 同一分组键（$ref 去重依据，设计文档 §8.3）
-	a := &typeschema.Schema{Type: "object", Props: []typeschema.Prop{
-		{Name: "x", Schema: &typeschema.Schema{Type: "string"}},
+	a := &schema.Schema{Type: "object", Props: []schema.Prop{
+		{Name: "x", Schema: &schema.Schema{Type: "string"}},
 	}}
-	b := &typeschema.Schema{Type: "object", Props: []typeschema.Prop{
-		{Name: "x", Schema: &typeschema.Schema{Type: "string"}},
+	b := &schema.Schema{Type: "object", Props: []schema.Prop{
+		{Name: "x", Schema: &schema.Schema{Type: "string"}},
 	}}
 	if canonicalShape(a) != canonicalShape(b) {
 		t.Error("same-shape schemas must hash identically")
 	}
-	c := &typeschema.Schema{Type: "object", Props: []typeschema.Prop{
-		{Name: "y", Schema: &typeschema.Schema{Type: "string"}},
+	c := &schema.Schema{Type: "object", Props: []schema.Prop{
+		{Name: "y", Schema: &schema.Schema{Type: "string"}},
 	}}
 	if canonicalShape(a) == canonicalShape(c) {
 		t.Error("different fields must hash differently")
@@ -93,8 +93,8 @@ func TestRenderDeterminism(t *testing.T) {
 		}},
 		Schemas: []NamedSchema{{
 			Name: "X", TypeID: "pkg.X",
-			Schema: &typeschema.Schema{Type: "object", Props: []typeschema.Prop{
-				{Name: "a", Schema: &typeschema.Schema{Type: "string"}},
+			Schema: &schema.Schema{Type: "object", Props: []schema.Prop{
+				{Name: "a", Schema: &schema.Schema{Type: "string"}},
 			}, Required: []string{"a"}},
 		}},
 	}

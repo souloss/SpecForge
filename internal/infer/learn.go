@@ -2,17 +2,17 @@
 package infer
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 )
 
 // LearnProfile 对抽样接口深读，产出仓库约定画像（设计文档 §3.3 约定画像 Agent）。
 //
-// 输入 sampleOps 是「method path + 证据摘要」的抽样集（engine 侧由 gap 或
-// 路由抽样给出）；输出结构化的画像候选。LLM 只负责从证据里**归纳**约定
-// （响应汇聚点符号、鉴权中间件、信封结构），不发明任何不存在的符号。
-// 离线（p == nil）返回 ErrNoProvider。
-func LearnProfile(p Provider, sampleOps []SampleOp) (*ProfileCandidate, error) {
+// 输入 sampleOps 是「method path + handler 源码」的抽样集；输出结构化的画像候选。
+// LLM 只负责从证据里**归纳**约定（响应汇聚点符号、鉴权中间件、信封结构），
+// 候选符号由 engine 在代码图上复核（不存在的符号丢弃）。离线（p == nil）返回 ErrNoProvider。
+func LearnProfile(ctx context.Context, p Provider, sampleOps []SampleOp) (*ProfileCandidate, error) {
 	if p == nil {
 		return nil, ErrNoProvider
 	}
@@ -20,20 +20,20 @@ func LearnProfile(p Provider, sampleOps []SampleOp) (*ProfileCandidate, error) {
 		"Given sample operations and code evidence, identify the RESPONSE SINK symbols " +
 		"(functions that write the HTTP response, e.g. code.WriteResponse), the AUTH " +
 		"MIDDLEWARE (functions wrapping routes for auth), and the response ENVELOPE " +
-		"(the wrapper object around business data). Only report symbols that appear " +
-		"in the evidence. Respond as JSON matching the output schema."
+		"(the wrapper object around business data). Use fully-qualified symbol IDs exactly as they " +
+		"appear in the evidence symbols. Only report symbols that appear in the evidence. " +
+		"Respond with a single JSON object matching this schema:"
 
 	ev, err := json.Marshal(sampleOps)
 	if err != nil {
 		return nil, fmt.Errorf("infer: marshal sample ops: %w", err)
 	}
-	schema := []byte(learnProfileSchema)
-	raw, err := p.Complete(system, string(ev), schema)
+	resp, err := p.Complete(ctx, Request{System: system + "\n" + learnProfileSchema, Prompt: string(ev)})
 	if err != nil {
 		return nil, err
 	}
 	var out ProfileCandidate
-	if err := json.Unmarshal(raw, &out); err != nil {
+	if err := json.Unmarshal(extractJSON(resp.Text), &out); err != nil {
 		return nil, fmt.Errorf("infer: profile output invalid: %w", err)
 	}
 	return &out, nil
@@ -41,9 +41,10 @@ func LearnProfile(p Provider, sampleOps []SampleOp) (*ProfileCandidate, error) {
 
 // SampleOp 画像学习的抽样接口（method + path + 证据摘要）。
 type SampleOp struct {
-	Method   string `json:"method"`
-	Path     string `json:"path"`
-	Evidence string `json:"evidence"`
+	Method   string          `json:"method"`   // HTTP 方法
+	Path     string          `json:"path"`     // OpenAPI 路径
+	Evidence string          `json:"evidence"` // 证据摘要（handler 注释等）
+	Sources  []SourceSnippet `json:"sources"`  // handler 及其直接被调函数源码
 }
 
 // ProfileCandidate 画像候选（与 profile.Profile 结构对齐的可序列化子集）。

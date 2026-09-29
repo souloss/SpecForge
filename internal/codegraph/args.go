@@ -73,20 +73,22 @@ func ConstArgOfCall(call ast.Expr, info *types.Info, argIdx int) (string, bool) 
 	if !ok || argIdx >= len(ce.Args) {
 		return "", false
 	}
-	arg := ast.Unparen(ce.Args[argIdx])
-	switch x := arg.(type) {
+	return ConstOf(ce.Args[argIdx], info)
+}
+
+// ConstOf 表达式若是指向常量的标识符（`ErrX` / `code.ErrX`），返回常量符号 ID。
+func ConstOf(e ast.Expr, info *types.Info) (string, bool) {
+	var id *ast.Ident
+	switch x := ast.Unparen(e).(type) {
 	case *ast.Ident:
-		if obj := info.Uses[x]; obj != nil {
-			if c, ok := obj.(*types.Const); ok {
-				return constID(c), true
-			}
-		}
+		id = x
 	case *ast.SelectorExpr:
-		if obj := info.Uses[x.Sel]; obj != nil {
-			if c, ok := obj.(*types.Const); ok {
-				return constID(c), true
-			}
-		}
+		id = x.Sel
+	default:
+		return "", false
+	}
+	if c, ok := info.Uses[id].(*types.Const); ok {
+		return constID(c), true
 	}
 	return "", false
 }

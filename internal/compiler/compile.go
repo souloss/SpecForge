@@ -6,12 +6,12 @@ package compiler
 
 import (
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
-	"github.com/specforge/specforge/internal/codegraph"
 	"github.com/specforge/specforge/internal/facts"
-	"github.com/specforge/specforge/internal/typeschema"
+	"github.com/specforge/specforge/internal/schema"
 )
 
 // Input 编译输入。
@@ -19,8 +19,7 @@ type Input struct {
 	ServiceName string
 	Framework   string
 	Facts       []*facts.Fact
-	Schemas     map[string]*typeschema.Schema
-	Graph       *codegraph.Graph
+	Schemas     map[string]*schema.Schema
 }
 
 // Document 编译产物（结构化中间形态，供渲染器消费）。
@@ -34,58 +33,111 @@ type Document struct {
 	SecSchemes  []SecScheme
 }
 
-// Operation 一个 operation 的最终形态。
+// Operation 一个 operation 的最终形态（渲染器输入，也是 operations.json / explain --json 的机器契约）。
 type Operation struct {
-	Method      string
-	Path        string
-	OperationID string
-	Summary     string
-	Description string
-	Tags        []string
-	Params      []ParamOut
-	Body        *BodyOut
-	Responses   []ResponseOut
-	Security    []string
-	Confidence  float64
-	Unknowns    []string
-	Evidence    []string
-	Stale       bool
+	Method      string        `json:"method"`       // HTTP 方法（大写）
+	Path        string        `json:"path"`         // OpenAPI 路径模板
+	OperationID string        `json:"operation_id"` // operationId
+	Summary     string        `json:"summary"`      // 一行摘要（godoc 或 LLM 增强）
+	Description string        `json:"description"`  // 补充描述
+	Tags        []string      `json:"tags"`         // 分组标签
+	Params      []ParamOut    `json:"params"`       // 参数（稳定排序）
+	Body        *BodyOut      `json:"body"`         // 请求体；nil = 无
+	Responses   []ResponseOut `json:"responses"`    // 响应（按状态码排序）
+	Security    []string      `json:"security"`     // 安全方案名
+	Confidence  float64       `json:"confidence"`   // 置信度 0~1
+	Unknowns    []string      `json:"unknowns"`     // 未解析项（缺口）
+	Evidence    []string      `json:"evidence"`     // 证据「标签 file:line」
+	Stale       bool          `json:"stale"`        // 证据已过期（保留字段）
 }
 
 // ParamOut 输出参数。
 type ParamOut struct {
-	Name     string
-	In       string
-	Required bool
-	Type     string
-	Format   string
-	Origin   string
+	Name        string   `json:"name"`        // 参数名
+	In          string   `json:"in"`          // query/path/header/cookie
+	Required    bool     `json:"required"`    // 是否必填
+	Type        string   `json:"type"`        // OAS 基础类型
+	Format      string   `json:"format"`      // OAS format
+	Items       string   `json:"items"`       // type=array 时的元素基础类型
+	Enum        []string `json:"enum"`        // 枚举取值
+	Description string   `json:"description"` // 字段 doc 注释
+	Origin      string   `json:"origin"`      // 来源证据（如 fiber:Query、route-template）
 }
 
 // BodyOut 请求体。
 type BodyOut struct {
-	ContentType string
-	SchemaName  string // $ref 名
+	ContentType  string `json:"content_type"` // 媒体类型
+	SchemaName   string `json:"schema"`       // 业务体 $ref 名
+	EnvelopeName string `json:"envelope"`     // 请求信封 $ref 名（空 = 无信封）
+	DataField    string `json:"data_field"`   // 信封中承载业务体的字段 JSON 名
 }
 
-// ResponseOut 响应行。
+// ResponseOut 响应行（同状态码的多条信封码合并为一行）。
 type ResponseOut struct {
-	Status        string
-	Codes         []int  // 信封码集合（enum）
-	HasUnresolved bool   // 是否存在未解析的错误行
-	Description   string // 聚合描述
-	SchemaName    string // 信封 data 槽的 $ref 名（空 = 无 body）
-	ArrayElem     string // 切片响应: data 为 array，元素 $ref 名
-	HasBody       bool
-	MapValueType  string // map[K]V 响应: data 为 additionalProperties map，值类型
-	Sinks         []string
+	Status        string   `json:"status"`         // HTTP 状态码
+	Codes         []int    `json:"codes"`          // 信封码集合（enum）
+	HasUnresolved bool     `json:"has_unresolved"` // 是否存在未解析的错误行
+	Description   string   `json:"description"`    // 聚合描述
+	SchemaName    string   `json:"schema"`         // 信封 data 槽的 $ref 名（空 = 无 body）
+	ArrayElem     string   `json:"array_elem"`     // 切片响应: data 为 array，元素 $ref 名
+	HasBody       bool     `json:"has_body"`       // 是否有响应体
+	MapValueType  string   `json:"map_value_type"` // map[K]V 响应: data 为 additionalProperties map，值类型
+	Sinks         []string `json:"sinks"`          // 写出点 file:line
+	EnvelopeName  string   `json:"envelope"`       // 真实信封结构体的 $ref 名（空 = profile 信封 code/msg/data）
+	DataField     string   `json:"data_field"`     // 真实信封中承载业务体的字段 JSON 名（成功行 allOf 收窄）
+	Raw           bool     `json:"raw"`            // 原生写出：业务体即响应体，无信封
+	// Variants 同一状态码下互不相同的响应体（>1 时渲染为 oneOf；上面的单值字段取第一个变体）。
+	Variants []BodyVariant `json:"variants,omitempty"`
+}
+
+// BodyVariant 一种响应体形态（信封 + 业务体，或原生业务体）。
+type BodyVariant struct {
+	SchemaName   string `json:"schema"`         // 业务体 $ref 名
+	ArrayElem    string `json:"array_elem"`     // 数组业务体的元素 $ref 名
+	MapValueType string `json:"map_value_type"` // map 业务体的值类型
+	EnvelopeName string `json:"envelope"`       // 信封 $ref 名
+	DataField    string `json:"data_field"`     // 信封中承载业务体的字段
+	Raw          bool   `json:"raw"`            // 原生写出（无信封）
+}
+
+// addVariant 记录一种响应体形态（去重；既无信封也无业务体的行不产生变体）。
+func (g *ResponseOut) addVariant(v BodyVariant) {
+	if !v.hasData() && v.EnvelopeName == "" {
+		g.Raw = g.Raw || v.Raw
+		return
+	}
+	for _, x := range g.Variants {
+		if x == v {
+			return
+		}
+	}
+	g.Variants = append(g.Variants, v)
+}
+
+// settlePrimary 单值字段取第一个变体（成功行排在前）；只有一个变体时不保留 Variants，渲染与旧口径一致。
+func (g *ResponseOut) settlePrimary() {
+	if len(g.Variants) == 0 {
+		return
+	}
+	v := g.Variants[0]
+	g.SchemaName, g.ArrayElem, g.MapValueType = v.SchemaName, v.ArrayElem, v.MapValueType
+	g.EnvelopeName, g.DataField, g.Raw = v.EnvelopeName, v.DataField, g.Raw || v.Raw
+	g.HasBody = g.HasBody || v.hasData()
+	if len(g.Variants) == 1 {
+		g.Variants = nil
+	}
+}
+
+// hasData 变体是否带业务体。
+func (v BodyVariant) hasData() bool {
+	return v.SchemaName != "" || v.ArrayElem != "" || v.MapValueType != ""
 }
 
 // NamedSchema 命名 schema。
 type NamedSchema struct {
 	Name   string
 	TypeID string
-	Schema *typeschema.Schema
+	Schema *schema.Schema
 	Shape  string // shapeHash（去重分组键）
 }
 
@@ -113,28 +165,26 @@ func Compile(in Input) (*Document, error) {
 	contractByOp := map[string]*facts.ContractPayload{}
 	enrichByOp := map[string]facts.EnrichmentPayload{}
 	var secFacts []*facts.SecurityPayload
-	var schemaFacts map[string]*typeschema.Schema = in.Schemas
+	var schemaFacts map[string]*schema.Schema = in.Schemas
 	for _, f := range in.Facts {
 		switch f.Kind {
 		case facts.KindContract:
-			if cp, ok := f.Value.(facts.ContractPayload); ok {
+			if cp, ok := f.Contract(); ok {
 				contractByOp[f.ID] = &cp
-			} else if cpp, ok := f.Value.(*facts.ContractPayload); ok {
-				contractByOp[f.ID] = cpp
 			}
 		case facts.KindEnrichment:
-			if ep, ok := f.Value.(facts.EnrichmentPayload); ok {
+			if ep, ok := f.Enrichment(); ok {
 				enrichByOp[strings.TrimSuffix(f.ID, ":enrich")] = ep
 			}
 		case facts.KindSecurity:
-			if sp, ok := f.Value.(facts.SecurityPayload); ok {
+			if sp, ok := f.Security(); ok {
 				spc := sp
 				secFacts = append(secFacts, &spc)
 			}
 		case facts.KindSchema:
-			if s, ok := f.Value.(*typeschema.Schema); ok {
+			if s, ok := f.Schema(); ok {
 				if schemaFacts == nil {
-					schemaFacts = map[string]*typeschema.Schema{}
+					schemaFacts = map[string]*schema.Schema{}
 				}
 				schemaFacts[strings.TrimPrefix(f.ID, "schema:")] = s
 			}
@@ -146,12 +196,19 @@ func Compile(in Input) (*Document, error) {
 	d.Schemas, refOf = nameAndDedupe(in, schemaFacts)
 
 	// ---- Stage 5: operation 组装 ----
+	factByID := make(map[string]*facts.Fact, len(in.Facts)) // 按 ID 索引（避免逐 operation 扫描全部事实）
+	for _, f := range in.Facts {
+		if _, dup := factByID[f.ID]; !dup {
+			factByID[f.ID] = f
+		}
+	}
 	for opKey, cp := range contractByOp {
 		method, path := splitOpKey(opKey)
 		op := Operation{
 			Method: method, Path: path,
 			OperationID: cp.OperationID,
 			Tags:        cp.Tags,
+			Unknowns:    append([]string(nil), cp.Gaps...), // 静态缺口（报告逐 operation 展示）
 		}
 		if ep, ok := enrichByOp[strings.TrimPrefix(opKey, "contract:")]; ok {
 			op.Summary = ep.Summary
@@ -161,7 +218,8 @@ func Compile(in Input) (*Document, error) {
 		for _, p := range cp.Params {
 			op.Params = append(op.Params, ParamOut{
 				Name: p.Name, In: p.In, Required: p.Required,
-				Type: p.Type, Format: p.Format, Origin: p.Origin,
+				Type: p.Type, Format: p.Format, Items: p.Items, Enum: p.Enum,
+				Description: p.Description, Origin: p.Origin,
 			})
 		}
 		sortParams(op.Params)
@@ -169,6 +227,9 @@ func Compile(in Input) (*Document, error) {
 		if cp.RequestBody != nil {
 			if ref, ok := refOf[cp.RequestBody.SchemaType]; ok {
 				op.Body = &BodyOut{ContentType: cp.RequestBody.ContentType, SchemaName: ref}
+				if envRef, ok := refOf[cp.RequestBody.EnvelopeType]; ok && cp.RequestBody.EnvelopeType != "" {
+					op.Body.EnvelopeName, op.Body.DataField = envRef, cp.RequestBody.DataField
+				}
 			} else {
 				op.Unknowns = append(op.Unknowns, "request schema not synthesized: "+cp.RequestBody.SchemaType)
 			}
@@ -189,7 +250,15 @@ func Compile(in Input) (*Document, error) {
 			if r.Envelope != nil {
 				code, msg = r.Envelope.Code, r.Envelope.Msg
 			}
-			if code == 0 {
+			if r.Raw {
+				// 原生写出（无业务信封）：信封码无意义，描述取 HTTP 状态文本（错误分支注明）。
+				desc := statusText(r.Status)
+				if r.Failure {
+					desc += errorBranchSuffix
+				}
+				g.Description = appendDesc(g.Description, desc)
+				code = rawRowCode
+			} else if code == 0 {
 				g.Description = appendDesc(g.Description, "Success (code=0)")
 			} else if code > 0 {
 				g.Description = appendDesc(g.Description,
@@ -202,30 +271,31 @@ func Compile(in Input) (*Document, error) {
 				}
 				g.Description = appendDesc(g.Description, desc)
 			}
-			if code >= 0 {
+			if code >= 0 && !r.Raw {
 				g.Codes = appendUniq(g.Codes, code)
 			}
+			var v BodyVariant
 			if r.SchemaType != "" {
 				if strings.HasPrefix(r.SchemaType, "[]") {
 					// 切片响应: data = array + items $ref
 					elem := strings.TrimPrefix(r.SchemaType, "[]")
 					if ref, ok := refOf[elem]; ok {
-						g.ArrayElem = ref
-						g.HasBody = true
+						v.ArrayElem = ref
 					} else {
 						op.Unknowns = append(op.Unknowns, "response schema not synthesized: "+r.SchemaType)
 					}
 				} else if ref, ok := refOf[r.SchemaType]; ok {
-					g.SchemaName = ref
-					g.HasBody = true
+					v.SchemaName = ref
 				} else {
 					op.Unknowns = append(op.Unknowns, "response schema not synthesized: "+r.SchemaType)
 				}
 			}
-			if r.MapValueType != "" {
-				g.MapValueType = r.MapValueType
-				g.HasBody = true
+			v.MapValueType = r.MapValueType
+			if ref, ok := refOf[r.EnvelopeType]; ok && r.EnvelopeType != "" {
+				v.EnvelopeName = ref
 			}
+			v.DataField, v.Raw = r.DataField, r.Raw
+			g.addVariant(v)
 			if r.Sink != "" && r.Sink != "(multiple)" {
 				g.Sinks = appendUniqStr(g.Sinks, r.Sink)
 			}
@@ -233,15 +303,17 @@ func Compile(in Input) (*Document, error) {
 		sort.Strings(respOrder)
 		for _, st := range respOrder {
 			g := respGroups[st]
+			g.settlePrimary()
 			sort.Ints(g.Codes)
 			op.Responses = append(op.Responses, *g)
 		}
 		// security（来自该 operation 的中间件链，设计文档 F7）
 		op.Security = cp.Security
 		// 置信度: contract 事实的 confidence（由 engine 计算）
-		for _, f := range in.Facts {
-			if f.ID == opKey {
-				op.Confidence = f.Confidence
+		if f := factByID[opKey]; f != nil {
+			op.Confidence = f.Confidence
+			for _, ev := range f.Evidence {
+				op.Evidence = appendUniqStr(op.Evidence, fmt.Sprintf("%s %s:%d", evidenceLabel(ev), ev.File, ev.StartLine))
 			}
 		}
 		d.Operations = append(d.Operations, op)
@@ -281,59 +353,87 @@ func Compile(in Input) (*Document, error) {
 	return d, nil
 }
 
-// nameAndDedupe §8.3 $ref 命名与去重（shapeHash 分组）。
-//
-// 分组策略：完全同 shape 的多个 typeID 归入同一组，组内选一个最简名作为 $ref 名，
-// 其余 typeID 全部映射到该 $ref 名。这与「结构去重」的初衷一致——
-// 完全同构的类型只 emit 一份 schema。纯启发式（描述字段从 shape 剔除，仅比较结构）。
+// nameAndDedupe §8.3 $ref 命名：按类型身份（typeID）一一对应 schema，不做结构去重——
+// 结构同形但名字/语义不同的类型（如 CreateXxxParams 与 UpdateXxxParams）必须各自保留，
+// 否则 operation 会引用到另一个接口的 DTO（错误事实）。
+// 命名按 typeID 排序后分配（确定性）：短名 → 包名.短名 → 短名-shapeHash。
 // 返回 (NamedSchema 列表, typeID→$ref 名映射)。
-func nameAndDedupe(in Input, schemas map[string]*typeschema.Schema) ([]NamedSchema, map[string]string) {
-	type group struct {
-		typeIDs []string
-		shape   string
+func nameAndDedupe(in Input, schemas map[string]*schema.Schema) ([]NamedSchema, map[string]string) {
+	ids := make([]string, 0, len(schemas))
+	for id := range schemas {
+		ids = append(ids, id)
 	}
-	groups := map[string]*group{}
-	for id, sc := range schemas {
-		shape := canonicalShape(sc)
-		g := groups[shape]
-		if g == nil {
-			g = &group{shape: shape}
-			groups[shape] = g
-		}
-		g.typeIDs = append(g.typeIDs, id)
-	}
-	// 组内选「最简类型名」，组间冲突加包名，仍冲突加 shapeHash 前缀
+	sort.Strings(ids)
 	byName := map[string]bool{}
 	refOf := map[string]string{}
-	var out []NamedSchema
-	for _, g := range groups {
-		sort.Strings(g.typeIDs)
-		primary := g.typeIDs[0]
-		name := lastSeg(primary)
+	out := make([]NamedSchema, 0, len(ids))
+	for _, id := range ids {
+		shape := canonicalShape(schemas[id])
+		name := componentName(lastSeg(id))
 		if byName[name] {
-			name = pkgShort(primary) + "." + lastSeg(primary)
+			name = componentName(pkgShort(id) + "." + lastSeg(id))
 		}
 		if byName[name] {
-			name = lastSeg(primary) + "-" + shortHash(g.shape)
+			name = componentName(lastSeg(id) + "-" + shortHash(id))
 		}
 		byName[name] = true
-		out = append(out, NamedSchema{Name: name, TypeID: primary, Schema: schemas[primary], Shape: g.shape})
-		// 组内全部 typeID 映射到同一 $ref 名（含非 primary 的 typeID）。
-		for _, id := range g.typeIDs {
-			refOf[id] = name
-		}
+		out = append(out, NamedSchema{Name: name, TypeID: id, Schema: schemas[id], Shape: shape})
+		refOf[id] = name
 	}
 	return out, refOf
 }
 
+// errorBranchSuffix 错误分支原生写出的描述后缀。
+const errorBranchSuffix = " (error branch)"
+
+// rawRowCode 原生写出行的占位码（非负以免被当作「未解析」，且不进 code 枚举）。
+const rawRowCode = 0
+
+// defaultResponseText 未知 HTTP 状态码的响应描述。
+const defaultResponseText = "Response"
+
+// statusText HTTP 状态码的标准文本（如 201 → Created）。
+func statusText(status int) string {
+	if t := http.StatusText(status); t != "" {
+		return t
+	}
+	return defaultResponseText
+}
+
+// llmEvidencePrefix LLM 事实证据引文的前缀（engine 写入，形如 "llm:error-code ErrX ← 源码行"）。
+const llmEvidencePrefix = "llm:"
+
+// llmEvidenceSep LLM 证据引文中「标签 ← 源码行」的分隔符。
+const llmEvidenceSep = " ← "
+
+// evidenceLabel 证据的展示标签：LLM 事实取其引文标签（如 "llm:error-code ErrX"），其余为路由注册点。
+func evidenceLabel(ev facts.Evidence) string {
+	if strings.HasPrefix(ev.Quote, llmEvidencePrefix) {
+		label, _, _ := strings.Cut(ev.Quote, llmEvidenceSep)
+		return label
+	}
+	return "route"
+}
+
+// componentName 把类型名规整为合法的 OpenAPI components 键（仅 [A-Za-z0-9._-]，其余替换为 _）。
+func componentName(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '.' || c == '_' || c == '-') {
+			b[i] = '_'
+		}
+	}
+	return string(b)
+}
+
 // canonicalShape schema 的规范化结构签名（去重键，不含描述性字段）。
-func canonicalShape(sc *typeschema.Schema) string {
+func canonicalShape(sc *schema.Schema) string {
 	var b strings.Builder
 	writeShape(&b, sc, 0)
 	return b.String()
 }
 
-func writeShape(b *strings.Builder, sc *typeschema.Schema, depth int) {
+func writeShape(b *strings.Builder, sc *schema.Schema, depth int) {
 	if sc == nil || depth > 24 {
 		b.WriteString("#")
 		return
@@ -358,16 +458,13 @@ func writeShape(b *strings.Builder, sc *typeschema.Schema, depth int) {
 	if sc.MaxLen != nil {
 		fmt.Fprintf(b, "xl:%v;", *sc.MaxLen)
 	}
+	if sc.Items != nil {
+		b.WriteString("i:")
+		writeShape(b, sc.Items, depth+1)
+	}
 	for _, p := range sc.Props {
 		fmt.Fprintf(b, "p:%s;req:%v;", p.Name, p.Required)
 		writeShape(b, p.Schema, depth+1)
-		if sc.Items != nil {
-			writeShape(b, sc.Items, depth+1)
-		}
-		for _, p := range sc.Props {
-			fmt.Fprintf(b, "p:%s;req:%v;", p.Name, p.Required)
-			writeShape(b, p.Schema, depth+1)
-		}
 	}
 }
 
@@ -474,11 +571,16 @@ func lastSeg(s string) string {
 	return s
 }
 
+// pkgShort 类型 ID 的包名末段（sample-app/internal/trade.TsResp → trade），用于同名 schema 消歧。
 func pkgShort(typeID string) string {
-	if i := strings.LastIndex(typeID, "/"); i >= 0 {
-		return typeID[i+1:]
+	seg := typeID
+	if i := strings.LastIndex(seg, "/"); i >= 0 {
+		seg = seg[i+1:]
 	}
-	return typeID
+	if i := strings.Index(seg, "."); i >= 0 {
+		seg = seg[:i]
+	}
+	return seg
 }
 
 func schemeTypeOf(sp *facts.SecurityPayload) string {
@@ -491,15 +593,6 @@ func schemeTypeOf(sp *facts.SecurityPayload) string {
 		return "http"
 	}
 	return "apiKey"
-}
-
-func containsStr(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
 }
 
 func appendDesc(base, add string) string {

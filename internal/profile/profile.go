@@ -26,10 +26,27 @@ type Profile struct {
 type SinkPattern struct {
 	Symbol    string `yaml:"symbol"`    // 全限定函数 ID
 	Signature string `yaml:"signature"` // 形参签名（data 槽位判定）
-	DataSlot  int    `yaml:"data_slot"` // data 实参下标（0 起，不含接收者）
-	ErrSlot   int    `yaml:"err_slot"`  // error 实参下标
+	DataSlot  int    `yaml:"data_slot"` // data 实参下标（0 起，不含接收者）；NoSlot 表示无 data 实参
+	ErrSlot   int    `yaml:"err_slot"`  // error 实参下标；NoSlot 表示无 err 实参（恒为成功写出）
 	Status    int    `yaml:"status"`    // 写出的 HTTP 状态码
+
+	// 以下由包装器自动发现（函数摘要）填充，手写 profile 可省略
+	EnvelopeType string `yaml:"envelope_type,omitempty"` // 真实信封结构体类型 ID；空 = 走 response_envelope 或无信封
+	DataField    string `yaml:"data_field,omitempty"`    // 信封中承载 data 的字段 JSON 名
+	ErrField     string `yaml:"err_field,omitempty"`     // 信封中承载错误对象的字段 JSON 名
+	BranchOnErr  bool   `yaml:"branch_on_err,omitempty"` // 同一调用点按 err 是否为 nil 分流成功/失败信封
+	Raw          bool   `yaml:"raw,omitempty"`           // 框架原生写出器：data 即响应体本身，无业务信封
+	Auto         bool   `yaml:"-"`                       // 自动发现（非手写），报告中标注来源
+	SuccessCode  *int   `yaml:"-"`                       // 成功分支信封里的固定业务码（包装器摘要得出）；nil = 用画像默认
+	FailureCode  *int   `yaml:"-"`                       // 失败分支信封里的固定业务码（如 "code": 500）；nil = 由 err 值决定
+	// Learned LLM 包装器摘要得出（经复核）：由它产生的响应行置信度按 symbol 级核对封顶。
+	Learned bool `yaml:"-"`
+	// ErrEnvelopeType 失败分支写出的信封类型（与成功分支不同时，如 BaseResp / ErrResponse）；空 = 同 EnvelopeType。
+	ErrEnvelopeType string `yaml:"err_envelope_type,omitempty"`
 }
+
+// NoSlot 槽位不存在（SinkPattern.DataSlot/ErrSlot 取值）。
+const NoSlot = -1
 
 // EnvelopeSpec 响应信封结构。
 type EnvelopeSpec struct {

@@ -8,11 +8,13 @@ package slicing
 import (
 	"fmt"
 	"go/ast"
+	"go/constant"
 	"go/token"
 	"go/types"
 	"sort"
 	"strings"
 
+	"github.com/specforge/specforge/internal/adapter"
 	"github.com/specforge/specforge/internal/codegraph"
 	"github.com/specforge/specforge/internal/profile"
 )
@@ -32,21 +34,32 @@ type SinkHit struct {
 	DataMapValue  string             // data 槽为 map[K]V 且 V 为基础类型时，V 的 JSON schema 类型（integer/string/...）；空 = 非 map 或值不可定型
 	HasBody       bool
 	ErrConstID    string   // 错误码常量符号（可解析时）
+	ErrConstIDs   []string // err 变量经值流反推到的全部错误码常量（analyzeHits 据此展开为逐码行）
 	ErrCallCallee string   // 错误构造器调用（如 code.NewDefaultError）
 	ErrUnresolved bool     // err 为变量: 信封码不可静态解析
 	ErrSource     string   // err 变量的来源证据（定义点的调用符号 + file:line）
 	HandlerPath   []string // 从 handler 到 sink 的调用路径（证据链）
+	EnvelopeType  string   // 真实信封结构体类型 ID（自动发现的包装器）；空 = profile 信封或无信封
+	DataField     string   // 信封中承载 data 的字段 JSON 名
+	ErrField      string   // 信封中承载错误对象的字段 JSON 名
+	Raw           bool     // 原生写出：data 即响应体，无信封
+	FixedCode     *int     // 信封中的固定业务码（包装器分支常量，如失败分支 "code": 500）；nil = 按常规推导
+	ErrIsVar      bool     // err 槽是变量（同一调用点可能分流成功/失败）
+	ErrorBranch   bool     // 原生写出位于 `if err != nil {}` 错误分支内（无 err 槽时据此判定为失败行）
+	ParamFed      bool     // 原生写出的响应体直接取自所在函数的形参：该函数是未被识别的响应包装器
+	Learned       bool     // 汇聚点模式来自 LLM 包装器摘要（行置信度按 symbol 级封顶）
 }
 
 // Slicer 响应追踪器。
 type Slicer struct {
-	g    *codegraph.Graph
-	prof *profile.Profile
+	g       *codegraph.Graph
+	prof    *profile.Profile
+	writers map[string]adapter.Writer // 框架原生写出器（原语表），按符号索引
 }
 
-// New 创建追踪器。
-func New(g *codegraph.Graph, prof *profile.Profile) *Slicer {
-	return &Slicer{g: g, prof: prof}
+// New 创建追踪器；writers 为框架原生写出器原语（状态码实参、值流中的写出结果语义）。
+func New(g *codegraph.Graph, prof *profile.Profile, writers []adapter.Writer) *Slicer {
+	return &Slicer{g: g, prof: prof, writers: writerIndex(writers)}
 }
 
 // Trace 对一个 handler 做正向可达闭包内的汇聚点扫描。
@@ -87,25 +100,92 @@ func (s *Slicer) traceFrom(root, handlerID string) []SinkHit {
 				if site.Caller != fn {
 					continue
 				}
-				hits = append(hits, s.analyzeHit(site, reach, handlerID))
+				// 包装器内部的写出由包装器调用点按摘要解析，不重复计入
+				if _, inWrapper := s.prof.IsSink(site.Caller); inWrapper {
+					continue
+				}
+				hits = append(hits, s.analyzeHits(site, reach, handlerID)...)
 			}
 		}
 	}
 	return hits
 }
 
+// analyzeHits 解析单个汇聚点调用；包装器按 err 分流且 err 为变量、data 非 nil 时，
+// 同一调用点同时承载成功与失败两条路径（如 `return WriteRes(c, e, result)`），拆成两行。
+// err 变量经值流反推出的每个错误码再展开为独立的失败行。
+func (s *Slicer) analyzeHits(site codegraph.CallSite, reach map[string]int, handler string) []SinkHit {
+	hit := s.analyzeHit(site, reach, handler)
+	if !hit.ErrUnresolved && len(hit.ErrConstIDs) == 0 && !(hit.ErrIsVar && hit.FixedCode != nil) {
+		return []SinkHit{hit}
+	}
+	pat, _ := s.prof.IsSink(site.Callee)
+	var out []SinkHit
+	failure := hit
+	if pat.BranchOnErr && slotPresent(pat.DataSlot, site.ArgSyms) && site.ArgSyms[pat.DataSlot] != "nil" {
+		success := hit
+		success.Success, success.ErrUnresolved, success.ErrSource, success.ErrConstIDs = true, false, "", nil
+		success.FixedCode, success.EnvelopeType = pat.SuccessCode, pat.EnvelopeType
+		out = append(out, success)
+		failure.DataTypeID, failure.DataUnknown, failure.DataMapValue, failure.HasBody = "", false, "", false
+	}
+	return append(out, expandErrCodes(failure)...)
+}
+
+// expandErrCodes 失败行按反推到的错误码逐个展开；存在不可反推路径时额外保留一条未解析行。
+func expandErrCodes(h SinkHit) []SinkHit {
+	if len(h.ErrConstIDs) == 0 {
+		return []SinkHit{h}
+	}
+	var out []SinkHit
+	for _, id := range h.ErrConstIDs {
+		c := h
+		c.ErrConstID, c.ErrConstIDs, c.ErrUnresolved = id, nil, false
+		out = append(out, c)
+	}
+	if h.ErrUnresolved {
+		h.ErrConstIDs = nil
+		out = append(out, h)
+	}
+	return out
+}
+
+// isAnyType 静态类型串是否为空接口（any/interface{}）。
+func isAnyType(t string) bool {
+	return t == "interface{}" || t == "any" || strings.HasSuffix(t, "any")
+}
+
+// slotPresent 槽位在实参范围内（NoSlot 或越界均为不存在）。
+func slotPresent(slot int, args []string) bool {
+	return slot >= 0 && slot < len(args)
+}
+
 // analyzeHit 解析单个汇聚点调用: data 槽类型 + err 槽语义。
 func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handler string) SinkHit {
 	pat, _ := s.prof.IsSink(site.Callee)
-	hit := SinkHit{Site: site, Status: pat.Status}
+	hit := SinkHit{Site: site, Status: pat.Status,
+		EnvelopeType: pat.EnvelopeType, DataField: pat.DataField, ErrField: pat.ErrField, Raw: pat.Raw}
+	hit.Learned = pat.Learned
+	if st, ok := s.constStatus(site); ok {
+		hit.Status = st
+	}
+	if pat.ErrSlot == profile.NoSlot {
+		hit.Success = true // 无 err 槽：恒为成功写出
+	}
 
 	// ---- data 槽 ----
-	if pat.DataSlot < len(site.ArgTypes) {
+	if slotPresent(pat.DataSlot, site.ArgTypes) {
 		t := site.ArgTypes[pat.DataSlot]
+		if isAnyType(t) {
+			// any 槽：沿值流反推具体类型（反推失败保持 any → 不可定型）
+			if rt := s.refineAny(site, pat.DataSlot); rt != "" {
+				t = rt
+			}
+		}
 		switch {
-		case t == "untyped nil" || t == "nil":
+		case t == untypedNil || t == "nil":
 			hit.HasBody = false
-		case t == "interface{}" || t == "any" || strings.HasSuffix(t, "any"):
+		case isAnyType(t):
 			// §7.2.3: any 静态不可定型
 			if sym := site.ArgSyms[pat.DataSlot]; strings.HasPrefix(sym, "call:") {
 				// data 是函数调用: 从返回类型再看一次（实参表达式的类型
@@ -140,8 +220,16 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 		}
 	}
 
+	if hit.Success && pat.SuccessCode != nil {
+		hit.FixedCode = pat.SuccessCode
+	}
+	if pat.Raw {
+		hit.ErrorBranch = s.inErrorBranch(site)
+		hit.ParamFed = s.paramFed(site, pat.DataSlot)
+	}
+
 	// ---- err 槽 ----
-	if pat.ErrSlot < len(site.ArgSyms) {
+	if slotPresent(pat.ErrSlot, site.ArgSyms) {
 		sym := site.ArgSyms[pat.ErrSlot]
 		switch {
 		case sym == "nil":
@@ -159,11 +247,173 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 		default:
 			// err 变量: 错误码无法静态确定，始终标未解析；溯源信息仅供报告展示，
 			// 不改变「未解析」的定性（否则会把 errgroup.Wait 等 sink 静默丢弃）。
+			consts, opaque, opaqueAt := s.errCodesOf(site, pat.ErrSlot)
 			hit.ErrSource = s.traceErrSource(site, pat.ErrSlot)
-			hit.ErrUnresolved = true
+			if len(opaqueAt) > 0 {
+				// 值流给出的不可反推点比局部溯源更精确（跨函数定位到动态错误的构造处）。
+				hit.ErrSource = strings.Join(capStrings(opaqueAt, maxErrSourceSites), ", ")
+			}
+			hit.ErrConstIDs = consts
+			// 仍有不可反推路径（或一个码都没反推到）时保留「未解析」行，不因部分命中而静默丢失
+			hit.ErrUnresolved = opaque || len(consts) == 0
+			hit.ErrIsVar = true
+		}
+		if !hit.Success && pat.ErrEnvelopeType != "" {
+			hit.EnvelopeType = pat.ErrEnvelopeType
+		}
+		if !hit.Success && pat.FailureCode != nil {
+			// 包装器失败分支的信封码是常量（如 gin.H{"code": 500, ...}）：与 err 的具体值无关。
+			hit.FixedCode = pat.FailureCode
+			hit.ErrConstID, hit.ErrConstIDs, hit.ErrUnresolved, hit.ErrSource = "", nil, false, ""
 		}
 	}
 	return hit
+}
+
+// inErrorBranch 写出点是否位于所在函数内 `if <error 值> != nil { ... }` 的 then 分支。
+func (s *Slicer) inErrorBranch(site codegraph.CallSite) bool {
+	fd, info := s.g.FuncDeclOf(site.Caller), s.g.TypeInfoOfFunc(site.Caller)
+	if fd == nil || fd.Body == nil || info == nil || len(site.ArgExprs) == 0 || site.ArgExprs[0] == nil {
+		return false
+	}
+	pos := site.ArgExprs[0].Pos()
+	found := false
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		ifs, ok := n.(*ast.IfStmt)
+		if !ok || found {
+			return !found
+		}
+		if pos < ifs.Body.Pos() || pos >= ifs.Body.End() {
+			return true
+		}
+		if be, ok := ast.Unparen(ifs.Cond).(*ast.BinaryExpr); ok && be.Op == token.NEQ {
+			for _, side := range []ast.Expr{be.X, be.Y} {
+				if t := info.TypeOf(side); t != nil && types.IsInterface(t) && types.Identical(t.Underlying(), errorIface) {
+					found = true
+				}
+			}
+		}
+		return true
+	})
+	return found
+}
+
+// paramFed 写出的响应体是否由所在函数的「值形参」构成（直接透传、放进字面量、经 m["k"]=形参 赋值、
+// 或作为辅助函数实参）——命中说明该函数是没被识别出来的响应包装器，调用点实参类型会丢失。
+// 框架上下文等仓库外命名类型的形参（*gin.Context、*fiber.Ctx）与方法接收者位置不计。
+func (s *Slicer) paramFed(site codegraph.CallSite, slot int) bool {
+	fd, info := s.g.FuncDeclOf(site.Caller), s.g.TypeInfoOfFunc(site.Caller)
+	if fd == nil || fd.Body == nil || info == nil || fd.Type.Params == nil || slot < 0 || slot >= len(site.ArgExprs) {
+		return false
+	}
+	params := paramIndex(fd, info)
+	exprs := []ast.Expr{stripAddr(site.ArgExprs[slot])}
+	if id, ok := exprs[0].(*ast.Ident); ok {
+		obj := info.Uses[id]
+		if init := localInitOf(fd.Body, obj, info); init != nil {
+			exprs = append(exprs, init)
+		}
+		exprs = append(exprs, assignedParts(fd.Body, obj, info)...)
+	}
+	for _, e := range exprs {
+		if s.mentionsValueParam(e, info, params) {
+			return true
+		}
+	}
+	return false
+}
+
+// assignedParts 对局部变量 obj 的成员赋值右值（`m["k"] = v`、`r.F = v`）。
+func assignedParts(body *ast.BlockStmt, obj types.Object, info *types.Info) []ast.Expr {
+	var out []ast.Expr
+	ast.Inspect(body, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != len(as.Rhs) {
+			return true
+		}
+		for i, lhs := range as.Lhs {
+			var base ast.Expr
+			switch l := lhs.(type) {
+			case *ast.IndexExpr:
+				base = l.X
+			case *ast.SelectorExpr:
+				base = l.X
+			}
+			if id, ok := ast.Unparen(base).(*ast.Ident); ok && info.Uses[id] == obj {
+				out = append(out, as.Rhs[i])
+			}
+		}
+		return true
+	})
+	return out
+}
+
+// mentionsValueParam 表达式中是否以「值」身份出现值形参（选择器/方法接收者位置除外）。
+func (s *Slicer) mentionsValueParam(e ast.Expr, info *types.Info, params map[types.Object]int) bool {
+	receivers := map[*ast.Ident]bool{}
+	ast.Inspect(e, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			if id, ok := ast.Unparen(sel.X).(*ast.Ident); ok {
+				receivers[id] = true
+			}
+		}
+		return true
+	})
+	found := false
+	ast.Inspect(e, func(n ast.Node) bool {
+		id, ok := n.(*ast.Ident)
+		if !ok || found || receivers[id] {
+			return !found
+		}
+		obj := info.Uses[id]
+		if _, isParam := params[obj]; isParam && s.isValueParamType(obj.Type()) {
+			found = true
+		}
+		return true
+	})
+	return found
+}
+
+// isValueParamType 形参类型是否承载响应「值」：接口（any/error）、基础类型或仓库内类型；
+// 仓库外的命名类型（框架上下文、http.ResponseWriter 等）不算。
+func (s *Slicer) isValueParamType(t types.Type) bool {
+	if p, ok := t.(*types.Pointer); ok {
+		t = p.Elem()
+	}
+	named, ok := t.(*types.Named)
+	if !ok || named.Obj().Pkg() == nil {
+		return true // 接口字面量、基础类型、universe 的 error
+	}
+	return isModuleType(s.g, named)
+}
+
+// maxErrSourceSites 单个未解析错误行最多列出的不可反推来源点数（控制报告与提示词体积）。
+const maxErrSourceSites = 5
+
+// capStrings 截取前 n 个元素（不足 n 原样返回）。
+func capStrings(ss []string, n int) []string {
+	if len(ss) > n {
+		return ss[:n]
+	}
+	return ss
+}
+
+// constStatus 原生写出器带状态码实参（如 gin c.JSON(http.StatusCreated, x)）且实参为整数常量时返回其值。
+func (s *Slicer) constStatus(site codegraph.CallSite) (int, bool) {
+	w, ok := s.writers[site.Callee]
+	if !ok || w.StatusArg == adapter.NoArg || w.StatusArg >= len(site.ArgExprs) {
+		return 0, false
+	}
+	info := s.g.TypeInfoOfFunc(site.Caller)
+	if info == nil {
+		return 0, false
+	}
+	tv, ok := info.Types[site.ArgExprs[w.StatusArg]]
+	if !ok || tv.Value == nil || tv.Value.Kind() != constant.Int {
+		return 0, false
+	}
+	v, exact := constant.Int64Val(tv.Value)
+	return int(v), exact
 }
 
 // traceErrSource 对 err 变量做保守的局部数据流：定位其在 sink 之前最近一次赋值的来源。
@@ -412,31 +662,6 @@ func sortedCallees(g *codegraph.Graph, fn string) []string {
 	out := append([]string{}, g.Callees[fn]...)
 	sortStrings(out)
 	return out
-}
-
-// constIDOf 取常量符号的全限定 ID（等价 codegraph 内 constID 的包级重写，
-// 避免 slicer 直接依赖 codegraph 未导出符号）。
-func constIDOf(c *types.Const) string {
-	if c.Pkg() != nil {
-		return c.Pkg().Path() + "." + c.Name()
-	}
-	return c.Name()
-}
-
-// methodIDOf 取方法/函数的全限定符号 ID（含接收者，与 codegraph 的 ID 口径一致）。
-func methodIDOf(fn *types.Func) string {
-	sig := fn.Type().(*types.Signature)
-	if sig.Recv() != nil {
-		recv := sig.Recv().Type()
-		if pt, ok := recv.(*types.Pointer); ok {
-			recv = pt.Elem()
-		}
-		return typeIDOf(recv) + "." + fn.Name()
-	}
-	if pkg := fn.Pkg(); pkg != nil {
-		return pkg.Path() + "." + fn.Name()
-	}
-	return fn.Name()
 }
 
 // typeIDOf 取类型的全限定 ID（命名类型取包路径 + 类型名；其余取类型串）。

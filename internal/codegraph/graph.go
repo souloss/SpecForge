@@ -5,15 +5,15 @@
 package codegraph
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"go/ast"
 	"go/token"
 	"go/types"
-	"os"
+	"reflect"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/tools/go/packages"
 )
@@ -62,8 +62,11 @@ type Field struct {
 	TypeStr  string
 	Kind     string // basic|slice|map|ptr|struct|named|any|rawmsg|time
 	Tag      string
-	Required bool // 无 omitempty 即必填（设计文档 §7.2.6）
-	Nullable bool // 指针字段
+	Required bool       // 必填：有 validate/binding 约束时以其 required 为准，否则无 omitempty 即必填（设计文档 §7.2.6）
+	Nullable bool       // 指针字段
+	Embedded bool       // 匿名嵌入字段（无显式 json 名时 JSON 编码展平到外层）
+	Doc      string     // 字段 doc/行尾注释（单行化），作为 schema description 来源
+	Type     types.Type `yaml:"-" json:"-"` // 字段的 go/types 类型（类型驱动合成：切片元素/匿名结构体），不参与序列化
 }
 
 // TypeInfo 命名类型规范化视图。
@@ -107,22 +110,44 @@ type Graph struct {
 	funcDeclPkg map[string]*packages.Package
 	// namedOf 记录「类型 ID → 命名类型」，供接口方法解析到具体实现（ConcreteImplsOf）。
 	namedOf map[string]*types.Named
+	// fieldDoc 记录「字段标识符位置 → 注释文本」，types.Var 不携带注释，需从 AST 预先索引。
+	fieldDoc map[token.Pos]string
+	// ifaceCallees 经接口分发调用的接口方法 ID 集合（expandInterfaceDispatch 的展开对象）。
+	ifaceCallees map[string]bool
+	// implMu 保护 implCache（LLM 兜底并发阶段工具闭包可能并发查询）。
+	implMu sync.Mutex
+	// implCache 接口方法 ID → 具体实现 ID 列表的记忆表（types.Implements 遍历全部命名类型，代价高）。
+	implCache map[string][]string
+	// fileMu 保护 fileHash / fileLines（LLM 兜底并发阶段工具闭包会并发读源码）。
+	fileMu sync.Mutex
+	// fileLines 文件路径 → 按行切分的源码（证据引用与源码切片的读缓存）。
+	fileLines map[string][]string
+	// root 仓库根绝对路径（证据相对化用；空 = 不相对化）。
+	root string
+	// docIndex 包路径 → 「符号键 → doc 首段」索引（buildDocIndex 惰性构建）。
+	docIndex map[string]map[string]string
+	// methodOwners 方法名 → 拥有该方法（值或指针方法集）的非接口命名类型 ID（有序；实现查找的候选预筛）。
+	methodOwners map[string][]string
 }
 
 // NewGraph 创建空图。
 func NewGraph() *Graph {
 	return &Graph{
-		Syms:        map[string]*Symbol{},
-		Types:       map[string]*TypeInfo{},
-		Callees:     map[string][]string{},
-		Callers:     map[string][]CallSite{},
-		constValue:  map[string]string{},
-		constTypeID: map[string]string{},
-		fileHash:    map[string]string{},
-		pkgOf:       map[string]*packages.Package{},
-		funcDecls:   map[string]*ast.FuncDecl{},
-		funcDeclPkg: map[string]*packages.Package{},
-		namedOf:     map[string]*types.Named{},
+		Syms:         map[string]*Symbol{},
+		Types:        map[string]*TypeInfo{},
+		Callees:      map[string][]string{},
+		Callers:      map[string][]CallSite{},
+		constValue:   map[string]string{},
+		constTypeID:  map[string]string{},
+		fileHash:     map[string]string{},
+		pkgOf:        map[string]*packages.Package{},
+		funcDecls:    map[string]*ast.FuncDecl{},
+		funcDeclPkg:  map[string]*packages.Package{},
+		namedOf:      map[string]*types.Named{},
+		fieldDoc:     map[token.Pos]string{},
+		ifaceCallees: map[string]bool{},
+		implCache:    map[string][]string{},
+		fileLines:    map[string][]string{},
 	}
 }
 
@@ -130,6 +155,10 @@ func NewGraph() *Graph {
 func Build(pkgs []*packages.Package, fset *token.FileSet) (*Graph, error) {
 	g := NewGraph()
 	g.Fset = fset
+	// 字段注释先全量索引：类型注册会跨包递归（A 包引用 B 包类型时 B 可能尚未处理）
+	for _, p := range pkgs {
+		g.indexFieldDocs(p)
+	}
 	for _, p := range pkgs {
 		if p.TypesInfo == nil || p.Types == nil || len(p.Syntax) == 0 {
 			continue
@@ -245,6 +274,9 @@ func (g *Graph) walkCalls(caller string, fd *ast.FuncDecl, info *types.Info) {
 			return true
 		}
 		site := CallSite{Caller: caller, Callee: calleeID, ViaIface: viaIface}
+		if viaIface {
+			g.ifaceCallees[calleeID] = true
+		}
 		if pos := g.Fset.Position(call.Lparen); pos.IsValid() {
 			site.File = pos.Filename
 			site.Line = pos.Line
@@ -289,18 +321,28 @@ func resolveCallee(call *ast.CallExpr, info *types.Info) (string, bool) {
 				return fnObj.FullName(), false
 			}
 		}
-	case *ast.IndexExpr, *ast.IndexListExpr: // 泛型实例化调用
-		base := fn.(interface{ X() ast.Expr })
-		_ = base
-		if idx, ok := fn.(*ast.IndexExpr); ok {
-			if id, ok := idx.X.(*ast.Ident); ok {
-				if obj := info.Uses[id]; obj != nil {
-					if fnObj, ok := obj.(*types.Func); ok {
-						return fnObj.FullName(), false
-					}
-				}
-			}
-		}
+	case *ast.IndexExpr: // 泛型单类型实参实例化：F[T](...) / pkg.F[T](...)
+		return resolveGenericCallee(f.X, info)
+	case *ast.IndexListExpr: // 泛型多类型实参实例化：F[K, V](...)
+		return resolveGenericCallee(f.X, info)
+	}
+	return "", false
+}
+
+// resolveGenericCallee 解析泛型实例化调用的被调函数（去掉类型实参后的 F / pkg.F）。
+func resolveGenericCallee(x ast.Expr, info *types.Info) (string, bool) {
+	var id *ast.Ident
+	switch e := ast.Unparen(x).(type) {
+	case *ast.Ident:
+		id = e
+	case *ast.SelectorExpr:
+		id = e.Sel
+	}
+	if id == nil {
+		return "", false
+	}
+	if fnObj, ok := info.Uses[id].(*types.Func); ok {
+		return fnObj.Origin().FullName(), false
 	}
 	return "", false
 }
@@ -312,23 +354,24 @@ func (g *Graph) addCall(caller, callee string, site CallSite) {
 	g.Callers[callee] = append(g.Callers[callee], site)
 }
 
-// expandInterfaceDispatch 把接口方法调用边展开到全部同名方法实现
-// （调用图过近似；置信度由使用方降级——设计文档 §7.2.3 原则）。
+// expandInterfaceDispatch 把接口方法调用边展开到该接口的全部具体实现。
+//
+// 实现集由 types.Implements 精确判定（ConcreteImplsOf），不按方法名近似：
+// 按名近似会把 `srv.Holdings` 连到仓库里所有叫 Holdings 的方法（含其它 controller），
+// 污染响应汇聚点、错误码与值流。接口不在代码图内（外部接口）时不展开。
+// 按调用方排序遍历，保证 Callers 追加顺序确定。
 func (g *Graph) expandInterfaceDispatch() {
-	methodsByName := map[string][]string{}
-	for id, s := range g.Syms {
-		if s.Kind == KindMethod {
-			name := id[strings.LastIndex(id, ".")+1:]
-			methodsByName[name] = append(methodsByName[name], id)
-		}
+	callers := make([]string, 0, len(g.Callees))
+	for caller := range g.Callees {
+		callers = append(callers, caller)
 	}
-	for caller, callees := range g.Callees {
-		for _, c := range callees {
-			if !isIfaceMethodID(c) {
+	sort.Strings(callers)
+	for _, caller := range callers {
+		for _, c := range append([]string(nil), g.Callees[caller]...) {
+			if !g.ifaceCallees[c] {
 				continue
 			}
-			name := c[strings.LastIndex(c, ".")+1:]
-			for _, impl := range methodsByName[name] {
+			for _, impl := range g.ConcreteImplsOf(c) {
 				if impl == c || contains(g.Callees[caller], impl) {
 					continue
 				}
@@ -408,7 +451,8 @@ func (g *Graph) fillTypeInfo(ti *TypeInfo, u types.Type) {
 	case *types.Struct:
 		ti.IsStruct = true
 		for i := 0; i < ut.NumFields(); i++ {
-			ti.Fields = append(ti.Fields, fieldOf(ut.Field(i), ut.Tag(i)))
+			fv := ut.Field(i)
+			ti.Fields = append(ti.Fields, fieldOf(fv, ut.Tag(i), g.fieldDoc[fv.Pos()]))
 		}
 	case *types.Basic:
 		ti.Underlying = ut.String()
@@ -423,17 +467,120 @@ func (g *Graph) fillTypeInfo(ti *TypeInfo, u types.Type) {
 	}
 }
 
-func fieldOf(f *types.Var, tag string) Field {
+// fieldOf 结构体字段 → 规范化视图；doc 为 AST 预索引的字段注释。
+func fieldOf(f *types.Var, tag, doc string) Field {
 	fl := Field{
 		Name: f.Name(), Tag: tag,
 		JSONName: jsonNameOf(f.Name(), tag),
-		Required: !hasOmitempty(tag),
+		Required: requiredOf(tag),
 		Nullable: isPointer(f.Type()),
+		Embedded: f.Embedded(),
+		Doc:      doc,
+		Type:     f.Type(),
 		TypeStr:  f.Type().String(),
 		TypeID:   typeID(f.Type()),
 		Kind:     kindOf(f.Type()),
 	}
 	return fl
+}
+
+// requiredOf 字段必填判定（JSON 体字段）：有校验约束时以约束为准，
+// 无约束时回落序列化语义（无 omitempty 即总会出现）。
+func requiredOf(tag string) bool {
+	if req, ok := ConstraintRequired(tag); ok {
+		return req
+	}
+	return !hasOmitempty(tag)
+}
+
+// ConstraintRequired 按 validator 语义从校验约束（validate/binding）判定必填：
+// 显式 required，或无 omitempty 且存在拒绝零值的下界规则（如 min=1：缺省零值必然校验失败）。
+// 第二返回值表示是否存在约束 tag；查询/路径等非 JSON 参数无约束即为可选。
+func ConstraintRequired(tag string) (required, hasConstraint bool) {
+	for _, key := range constraintTagKeys {
+		v, ok := reflect.StructTag(tag).Lookup(key)
+		if !ok {
+			continue
+		}
+		rejectsZero, omitEmpty := false, false
+		for _, rule := range strings.Split(v, ",") {
+			name, arg, _ := strings.Cut(strings.TrimSpace(rule), "=")
+			switch name {
+			case ruleRequired:
+				return true, true
+			case ruleOmitEmpty:
+				omitEmpty = true
+			case "min", "gte", "gt", "len":
+				if n, err := strconv.ParseFloat(arg, 64); err == nil && (n > 0 || name == "gt") {
+					rejectsZero = true
+				}
+			}
+		}
+		return rejectsZero && !omitEmpty, true
+	}
+	return false, false
+}
+
+// constraintTagKeys 校验约束 tag 键（gin 用 binding，go-playground/validator 默认 validate）。
+var constraintTagKeys = []string{"binding", "validate"}
+
+// ruleRequired 校验约束中表示必填的规则名。
+const ruleRequired = "required"
+
+// ruleOmitEmpty 校验约束中表示「零值跳过后续校验」的规则名（字段可缺省）。
+const ruleOmitEmpty = "omitempty"
+
+// indexFieldDocs 索引包内全部结构体字段注释（含嵌套匿名结构体），键为字段标识符位置。
+// 嵌入字段无标识符，以其类型表达式位置为键（与 types.Var.Pos() 一致）。
+func (g *Graph) indexFieldDocs(p *packages.Package) {
+	for _, f := range p.Syntax {
+		ast.Inspect(f, func(n ast.Node) bool {
+			st, ok := n.(*ast.StructType)
+			if !ok || st.Fields == nil {
+				return true
+			}
+			for _, fld := range st.Fields.List {
+				doc := commentText(fld.Doc)
+				if doc == "" {
+					doc = commentText(fld.Comment)
+				}
+				if doc == "" {
+					continue
+				}
+				if len(fld.Names) == 0 {
+					g.fieldDoc[embeddedPos(fld.Type)] = doc
+					continue
+				}
+				for _, name := range fld.Names {
+					g.fieldDoc[name.Pos()] = doc
+				}
+			}
+			return true
+		})
+	}
+}
+
+// embeddedPos 嵌入字段的类型名标识符位置（*T / pkg.T / pkg.*T 取末段标识符）。
+func embeddedPos(e ast.Expr) token.Pos {
+	switch t := e.(type) {
+	case *ast.StarExpr:
+		return embeddedPos(t.X)
+	case *ast.SelectorExpr:
+		return t.Sel.Pos()
+	case *ast.IndexExpr:
+		return embeddedPos(t.X)
+	case *ast.IndexListExpr:
+		return embeddedPos(t.X)
+	}
+	return e.Pos()
+}
+
+// commentText 注释组 → 单行文本（多行以空格拼接，便于作为 description）。
+func commentText(cg *ast.CommentGroup) string {
+	if cg == nil {
+		return ""
+	}
+	return strings.Join(strings.Fields(cg.Text()), " ")
 }
 
 // attachEnums 枚举判定: 同类型 const ≥ 2（设计文档 §7.2.12 宁缺勿滥）。
@@ -457,27 +604,48 @@ func (g *Graph) attachEnums(ti *TypeInfo) {
 // ---- 文档注释 ---------------------------------------------------------
 
 func (g *Graph) docForSymbol(p *packages.Package, key string) string {
+	if key == "" {
+		return ""
+	}
+	if g.docIndex == nil {
+		g.docIndex = map[string]map[string]string{}
+	}
+	idx, ok := g.docIndex[p.PkgPath]
+	if !ok {
+		idx = g.buildDocIndex(p)
+		g.docIndex[p.PkgPath] = idx
+	}
+	return idx[key]
+}
+
+// buildDocIndex 一次扫描包内全部声明，建「符号键 → doc 首段」索引（避免逐符号全包扫描的平方开销）。
+func (g *Graph) buildDocIndex(p *packages.Package) map[string]string {
+	idx := map[string]string{}
 	for _, f := range p.Syntax {
 		for _, d := range f.Decls {
 			switch decl := d.(type) {
 			case *ast.FuncDecl:
-				if decl.Doc == nil {
-					continue
-				}
-				if g.funcDeclIDQuiet(p, decl) == key && key != "" {
-					return firstParagraph(decl.Doc.Text())
+				if decl.Doc != nil {
+					if key := g.funcDeclIDQuiet(p, decl); key != "" {
+						if _, dup := idx[key]; !dup {
+							idx[key] = firstParagraph(decl.Doc.Text())
+						}
+					}
 				}
 			case *ast.GenDecl:
 				if decl.Doc == nil || len(decl.Specs) == 0 {
 					continue
 				}
-				if ts, ok := decl.Specs[0].(*ast.TypeSpec); ok && key == "TYPE:"+p.PkgPath+"."+ts.Name.Name {
-					return firstParagraph(decl.Doc.Text())
+				if ts, ok := decl.Specs[0].(*ast.TypeSpec); ok {
+					key := "TYPE:" + p.PkgPath + "." + ts.Name.Name
+					if _, dup := idx[key]; !dup {
+						idx[key] = firstParagraph(decl.Doc.Text())
+					}
 				}
 			}
 		}
 	}
-	return ""
+	return idx
 }
 
 func (g *Graph) docForFuncDecl(p *packages.Package, fd *ast.FuncDecl, info *types.Info) string {
@@ -548,16 +716,6 @@ func (g *Graph) TypeInfoOfFunc(symbolID string) *types.Info {
 // Type 类型查询。
 func (g *Graph) Type(id string) *TypeInfo { return g.Types[id] }
 
-// FileHashOf 文件指纹（懒计算）。
-func (g *Graph) FileHashOf(path string) string {
-	if h, ok := g.fileHash[path]; ok {
-		return h
-	}
-	h := sha256File(path)
-	g.fileHash[path] = h
-	return h
-}
-
 // Pkgs 返回已加载的全部包（按加载序）。
 func (g *Graph) Pkgs() []*packages.Package { return g.pkgs }
 
@@ -571,6 +729,18 @@ func (g *Graph) ConstTypeIDOf(id string) string { return g.constTypeID[id] }
 // 仅当 concrete 或 *concrete 满足接口类型时才视为实现（不按方法名近似）。
 // 返回已排序的符号 ID 列表，保证确定性。
 func (g *Graph) ConcreteImplsOf(ifaceMethod string) []string {
+	g.implMu.Lock()
+	defer g.implMu.Unlock()
+	if impls, ok := g.implCache[ifaceMethod]; ok {
+		return impls
+	}
+	impls := g.concreteImplsOf(ifaceMethod)
+	g.implCache[ifaceMethod] = impls
+	return impls
+}
+
+// concreteImplsOf ConcreteImplsOf 的无记忆实现。
+func (g *Graph) concreteImplsOf(ifaceMethod string) []string {
 	name := methodNameOf(ifaceMethod)
 	recvID := recvTypeIDOf(ifaceMethod)
 	if name == "" || recvID == "" {
@@ -585,12 +755,10 @@ func (g *Graph) ConcreteImplsOf(ifaceMethod string) []string {
 		return nil
 	}
 	var out []string
-	for id, named := range g.namedOf {
+	// 只检查方法集里有同名方法的具体类型（预筛），再用 types.Implements 精确判定。
+	for _, id := range g.ownersOf(name) {
+		named := g.namedOf[id]
 		if id == recvID {
-			continue
-		}
-		// 跳过其它接口类型（Underlying 为 interface 的命名类型不是具体实现）。
-		if _, isIface := named.Underlying().(*types.Interface); isIface {
 			continue
 		}
 		if !types.Implements(named, iface) && !types.Implements(types.NewPointer(named), iface) {
@@ -600,14 +768,101 @@ func (g *Graph) ConcreteImplsOf(ifaceMethod string) []string {
 		out = append(out, implID)
 	}
 	sort.Strings(out)
+	return dropTestDoubles(out, g.namedOf)
+}
+
+// ownersOf 方法集中含 name 方法的非接口命名类型 ID（有序）；索引首次调用时构建（调用方持有 implMu）。
+func (g *Graph) ownersOf(name string) []string {
+	if g.methodOwners == nil {
+		g.methodOwners = map[string][]string{}
+		for id, named := range g.namedOf {
+			if _, isIface := named.Underlying().(*types.Interface); isIface {
+				continue
+			}
+			ms := types.NewMethodSet(types.NewPointer(named)) // 指针方法集 ⊇ 值方法集（含嵌入提升）
+			for i := 0; i < ms.Len(); i++ {
+				m := ms.At(i).Obj().Name()
+				g.methodOwners[m] = append(g.methodOwners[m], id)
+			}
+		}
+		for _, ids := range g.methodOwners {
+			sort.Strings(ids)
+		}
+	}
+	return g.methodOwners[name]
+}
+
+// testDoublePkgSegs 测试替身惯用包名末段（mockery/gomock 生成代码目录）。
+var testDoublePkgSegs = map[string]bool{"mocks": true, "mock": true, "fakes": true, "fake": true}
+
+// testDoubleFieldPkgs 测试替身结构体惯用嵌入/持有的框架包（testify mock、gomock）。
+var testDoubleFieldPkgs = map[string]bool{
+	"github.com/stretchr/testify/mock": true,
+	"github.com/golang/mock/gomock":    true,
+	"go.uber.org/mock/gomock":          true,
+}
+
+// dropTestDoubles 剔除测试替身实现（mock/fake）：只要还有真实实现就不让替身进入调用图，
+// 否则 mock 的「返回 mock.Arguments.Get(0)」会把值流污染成不可反推。全是替身时原样保留。
+func dropTestDoubles(impls []string, namedOf map[string]*types.Named) []string {
+	var real []string
+	for _, id := range impls {
+		if !isTestDouble(namedOf[recvTypeIDOf(id)]) {
+			real = append(real, id)
+		}
+	}
+	if len(real) == 0 {
+		return impls
+	}
+	return real
+}
+
+// isTestDouble 命名类型是否为测试替身：位于 mocks/fakes 包，或字段来自 testify mock / gomock。
+func isTestDouble(named *types.Named) bool {
+	if named == nil || named.Obj().Pkg() == nil {
+		return false
+	}
+	path := named.Obj().Pkg().Path()
+	if testDoublePkgSegs[path[strings.LastIndex(path, "/")+1:]] {
+		return true
+	}
+	st, ok := named.Underlying().(*types.Struct)
+	if !ok {
+		return false
+	}
+	for i := 0; i < st.NumFields(); i++ {
+		ft := stripPtr(st.Field(i).Type())
+		if n, ok := ft.(*types.Named); ok && n.Obj().Pkg() != nil && testDoubleFieldPkgs[n.Obj().Pkg().Path()] {
+			return true
+		}
+	}
+	return false
+}
+
+// StructFields 匿名（内联）结构体的规范化字段视图，口径与命名结构体的 TypeInfo.Fields 一致。
+func (g *Graph) StructFields(st *types.Struct) []Field {
+	out := make([]Field, 0, st.NumFields())
+	for i := 0; i < st.NumFields(); i++ {
+		fv := st.Field(i)
+		out = append(out, fieldOf(fv, st.Tag(i), g.fieldDoc[fv.Pos()]))
+	}
 	return out
 }
 
+// TypeIDOf 类型的规范 ID（命名类型为 包路径.名字，其余为类型串），与 Field.TypeID 同口径。
+func TypeIDOf(t types.Type) string { return typeID(t) }
+
+// KindOf 类型的归类（basic|slice|map|struct|any|iface|time|rawmsg|other），与 Field.Kind 同口径。
+func KindOf(t types.Type) string { return kindOf(t) }
+
 // recvTypeIDOf 从方法符号 ID 提取接收者类型 ID。
-// "pkg.(*pkg.Recv).Method" → "pkg.Recv"。
+// "pkg.(*pkg.Recv).Method" → "pkg.Recv"；接口方法调用 ID "pkg.Iface.Method" → "pkg.Iface"。
 func recvTypeIDOf(methodID string) string {
 	i := strings.Index(methodID, ".(*")
 	if i < 0 {
+		if k := strings.LastIndex(methodID, "."); k > 0 {
+			return methodID[:k]
+		}
 		return ""
 	}
 	rest := methodID[i+3:] // "pkg.Recv).Method"
@@ -628,6 +883,14 @@ func methodNameOf(id string) string {
 }
 
 // ---- 辅助函数 ---------------------------------------------------------
+
+// MethodID 方法符号 ID：pkg.(*pkg.Recv).Method（值/指针接收者同口径）。框架原语表按此格式声明符号。
+func MethodID(pkg, recv, method string) string {
+	return fmt.Sprintf("%s.(*%s.%s).%s", pkg, pkg, recv, method)
+}
+
+// FuncID 函数/方法对象的符号 ID（与调用边、原语表的口径一致）。
+func FuncID(fn *types.Func) string { return methodIDOf(fn) }
 
 func methodIDOf(fn *types.Func) string {
 	sig := fn.Signature()
@@ -713,11 +976,6 @@ func isRawMsgID(id string) bool {
 	return strings.HasSuffix(id, "/encoding/json.RawMessage") || id == "encoding/json.RawMessage"
 }
 
-func isIfaceMethodID(id string) bool {
-	// 接口方法形如 pkg.Iface.Method；具体方法形如 pkg.(*Recv).Method
-	return strings.Contains(id, ".") && !strings.Contains(id, "(*") && strings.Count(id, ".") == 2
-}
-
 func contains(s []string, v string) bool {
 	for _, x := range s {
 		if x == v {
@@ -732,15 +990,6 @@ func firstParagraph(s string) string {
 		return strings.TrimSpace(s[:i])
 	}
 	return strings.TrimSpace(s)
-}
-
-func sha256File(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "missing"
-	}
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
 }
 
 // addLocalTypeSym 注册函数内局部命名类型（ID = pkg.TypeName，冲突加行号）。
@@ -770,4 +1019,19 @@ func (g *Graph) addLocalTypeSym(p *packages.Package, ts *ast.TypeSpec) {
 	g.fillTypeInfo(ti, named.Underlying())
 	g.Types[ti.ID] = ti
 	g.Syms[ti.ID] = &Symbol{ID: ti.ID, Kind: KindType, Pkg: p.PkgPath, File: ti.File, Line: ti.Line}
+}
+
+// FuncIDs 全部带函数体的符号 ID（排序，保证基于它的分析确定性）。
+func (g *Graph) FuncIDs() []string {
+	ids := make([]string, 0, len(g.funcDecls))
+	for id := range g.funcDecls {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// ResolveCallee 调用表达式 → 被调符号 ID；第二返回值为是否经接口分发（需再解析到具体实现）。
+func ResolveCallee(call *ast.CallExpr, info *types.Info) (string, bool) {
+	return resolveCallee(call, info)
 }

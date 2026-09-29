@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/specforge/specforge/internal/typeschema"
+	"github.com/specforge/specforge/internal/schema"
 )
 
 // 确定性 YAML 渲染器（设计文档 §8.5 序列化规范）:
@@ -114,7 +114,9 @@ func writeOperation(w func(string, ...interface{}), b *strings.Builder, op Opera
 			if p.Required {
 				w("%s    required: true\n", p2)
 			}
-			if p.Origin != "" {
+			if p.Description != "" {
+				w("%s    description: %s\n", p2, quoteIfNeeded(p.Description))
+			} else if p.Origin != "" {
 				w("%s    description: %s\n", p2, quoteIfNeeded("origin: "+p.Origin))
 			}
 			w("%s    schema:\n", p2)
@@ -122,6 +124,16 @@ func writeOperation(w func(string, ...interface{}), b *strings.Builder, op Opera
 			w("%stype: %s\n", p3, p.Type)
 			if p.Format != "" {
 				w("%sformat: %s\n", p3, p.Format)
+			}
+			if p.Items != "" {
+				w("%sitems:\n", p3)
+				w("%s  type: %s\n", p3, p.Items)
+			}
+			if len(p.Enum) > 0 {
+				w("%senum:\n", p3)
+				for _, e := range p.Enum {
+					w("%s  - %s\n", p3, quoteIfNeeded(e))
+				}
 			}
 		}
 	}
@@ -131,7 +143,20 @@ func writeOperation(w func(string, ...interface{}), b *strings.Builder, op Opera
 		w("%s  content:\n", p2)
 		w("%s    application/json:\n", p2)
 		w("%s      schema:\n", p2)
-		w("%s        $ref: '#/components/schemas/%s'\n", p2, escapeRef(op.Body.SchemaName))
+		if op.Body.EnvelopeName != "" && op.Body.DataField != "" {
+			// 请求信封：$ref 信封 + allOf 把承载字段收窄为业务体（与响应信封同形）。
+			p6 := p2 + "        "
+			w("%sallOf:\n", p6)
+			w("%s  - $ref: '#/components/schemas/%s'\n", p6, escapeRef(op.Body.EnvelopeName))
+			w("%s  - type: object\n", p6)
+			w("%s    properties:\n", p6)
+			w("%s      %s:\n", p6, quoteIfNeeded(op.Body.DataField))
+			w("%s        $ref: '#/components/schemas/%s'\n", p6, escapeRef(op.Body.SchemaName))
+			w("%s    required:\n", p6)
+			w("%s      - %s\n", p6, quoteIfNeeded(op.Body.DataField))
+		} else {
+			w("%s        $ref: '#/components/schemas/%s'\n", p2, escapeRef(op.Body.SchemaName))
+		}
 	}
 	if len(op.Responses) > 0 {
 		w("%sresponses:\n", p2)
@@ -140,7 +165,9 @@ func writeOperation(w func(string, ...interface{}), b *strings.Builder, op Opera
 			w("%s'%s':\n", p3, r.Status)
 			p4 := p3 + "    "
 			w("%sdescription: %s\n", p4, quoteIfNeeded(r.Description))
-			if r.HasBody && r.SchemaName != "" || len(r.Codes) > 0 {
+			if r.Raw || r.EnvelopeName != "" {
+				writeDiscoveredBody(w, p4, r)
+			} else if r.HasBody && r.SchemaName != "" || len(r.Codes) > 0 {
 				w("%scontent:\n", p4)
 				w("%s  application/json:\n", p4)
 				w("%s    schema:\n", p4)
@@ -207,7 +234,7 @@ func writeOperation(w func(string, ...interface{}), b *strings.Builder, op Opera
 	}
 }
 
-func writeSchema(w func(string, ...interface{}), b *strings.Builder, sc *typeschema.Schema, indent int, pad string) {
+func writeSchema(w func(string, ...interface{}), b *strings.Builder, sc *schema.Schema, indent int, pad string) {
 	if sc == nil {
 		w("%sdescription: 'unresolved schema'\n", pad)
 		return
@@ -252,6 +279,12 @@ func writeSchema(w func(string, ...interface{}), b *strings.Builder, sc *typesch
 	if sc.MaxLen != nil {
 		w("%smaxLength: %d\n", pad, *sc.MaxLen)
 	}
+	if sc.MinItems != nil {
+		w("%sminItems: %d\n", pad, *sc.MinItems)
+	}
+	if sc.MaxItems != nil {
+		w("%smaxItems: %d\n", pad, *sc.MaxItems)
+	}
 	if sc.Items != nil {
 		w("%sitems:\n", pad)
 		writeSchema(w, b, sc.Items, indent+2, pad+"  ")
@@ -277,7 +310,7 @@ func writeSchema(w func(string, ...interface{}), b *strings.Builder, sc *typesch
 	}
 }
 
-// schemaView 别名已移除，直接使用 typeschema.Schema。
+// schemaView 别名已移除，直接使用 schema.Schema。
 
 var _ = fmt.Sprintf
 
@@ -350,4 +383,69 @@ func isNumericLike(s string) bool {
 		return false
 	}
 	return len(s) > 0
+}
+
+// writeDiscoveredBody 渲染自动发现的响应体：原生写出直接引用业务体；真实信封以 $ref 引用，
+// 成功行再用 allOf 把 data 槽收窄为具体类型（与 swag `Envelope{result=T}` 同形）；
+// 同一状态码下有多种响应体时渲染为 oneOf。
+func writeDiscoveredBody(w func(string, ...interface{}), p4 string, r ResponseOut) {
+	variants := r.Variants
+	if len(variants) == 0 {
+		variants = []BodyVariant{{SchemaName: r.SchemaName, ArrayElem: r.ArrayElem, MapValueType: r.MapValueType,
+			EnvelopeName: r.EnvelopeName, DataField: r.DataField, Raw: r.Raw}}
+		if !r.HasBody {
+			variants[0].SchemaName, variants[0].ArrayElem, variants[0].MapValueType = "", "", ""
+		}
+	}
+	if len(variants) == 1 && variants[0].Raw && !variants[0].hasData() {
+		return
+	}
+	w("%scontent:\n", p4)
+	w("%s  application/json:\n", p4)
+	w("%s    schema:\n", p4)
+	p5 := p4 + "      "
+	if len(variants) == 1 {
+		writeVariant(w, p5, variants[0])
+		return
+	}
+	w("%soneOf:\n", p5)
+	item := p5 + "    "
+	for _, v := range variants {
+		var buf strings.Builder
+		writeVariant(func(f string, a ...interface{}) { fmt.Fprintf(&buf, f, a...) }, item, v)
+		w("%s", p5+"  - "+strings.TrimPrefix(buf.String(), item))
+	}
+}
+
+// writeVariant 渲染一种响应体形态的 schema（pad 为 schema 节点的缩进）。
+func writeVariant(w func(string, ...interface{}), p5 string, v BodyVariant) {
+	switch {
+	case v.Raw:
+		writeDataSchema(w, p5, v)
+	case v.hasData() && v.DataField != "":
+		w("%sallOf:\n", p5)
+		w("%s  - $ref: '#/components/schemas/%s'\n", p5, escapeRef(v.EnvelopeName))
+		w("%s  - type: object\n", p5)
+		w("%s    properties:\n", p5)
+		w("%s      %s:\n", p5, quoteIfNeeded(v.DataField))
+		writeDataSchema(w, p5+"        ", v)
+	default:
+		w("%s$ref: '#/components/schemas/%s'\n", p5, escapeRef(v.EnvelopeName))
+	}
+}
+
+// writeDataSchema 业务体 schema：切片 → array+items，map → additionalProperties，其余 → $ref。
+func writeDataSchema(w func(string, ...interface{}), p string, r BodyVariant) {
+	switch {
+	case r.ArrayElem != "":
+		w("%stype: array\n", p)
+		w("%sitems:\n", p)
+		w("%s  $ref: '#/components/schemas/%s'\n", p, escapeRef(r.ArrayElem))
+	case r.SchemaName != "":
+		w("%s$ref: '#/components/schemas/%s'\n", p, escapeRef(r.SchemaName))
+	case r.MapValueType != "":
+		w("%stype: object\n", p)
+		w("%sadditionalProperties:\n", p)
+		w("%s  type: %s\n", p, r.MapValueType)
+	}
 }

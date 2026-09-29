@@ -1,63 +1,52 @@
-// Package memo 实现运行级 memo 缓存：输入指纹未变 → 复用上次生成的
-// openapi.yaml / report.md 字节，跳过 packages.Load 与全量分析。
+// Package memo 实现运行级 memo 缓存：输入指纹未变 → 复用上次生成的全部产物，
+// 跳过 packages.Load 与全量分析。
 //
-// 这是设计文档 §5「增量查询引擎」在静态流水线阶段的 80/20 落地：
-// 静态管线总耗时 ~1.5s，其中 ~90% 是 go/packages 的带类型加载——它按包
-// 工作、无法对「单文件变更」做增量类型检查，符号级缓存救不了它。真正
-// 可省的是「输入完全未变」的整段重算。指纹覆盖：引擎版本 + 服务名 +
-// 画像内容 + 仓库内全部 .go/go.mod/go.sum 的内容哈希。
+// 这是设计文档 §5「增量查询引擎」的第 1 层（整次运行粒度）；LLM 调用级缓存见 infer.CachedProvider。
+// go/packages 按包做带类型加载、无法对「单文件变更」增量类型检查，真正可省的是「输入完全未变」
+// 的整段重算。指纹覆盖：引擎构建身份 + 服务名 + 画像内容 + LLM 配置 + 仓库内全部 .go/go.mod/go.sum。
 //
-// 缓存是「内容寻址」的（指纹为键），天然支持并发、天然避免脏读；
-// 命中与否都保守——宁可多算（指纹外的输入变化没被覆盖时重算），绝不
-// 复用旧输出（不会把陈旧 spec 当新鲜结果返回）。
+// 缓存是内容寻址的（指纹为键），每个指纹一个目录，整目录原子落盘（临时目录 + rename），
+// 天然并发安全、不会读到半截产物；命中与否都保守——宁可多算，绝不把陈旧产物当新鲜结果。
 package memo
 
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 )
 
-// Summary 一次运行的统计摘要（缓存命中时回填 Result 用）。
-type Summary struct {
-	Service          string `json:"service"`
-	Operations       int    `json:"operations"`
-	Routes           int    `json:"routes"`
-	RoutesUnresolved int    `json:"routes_unresolved"`
-	SchemaTypes      int    `json:"schema_types"`
-	Facts            int    `json:"facts"`
-	LowConfidence    int    `json:"low_confidence"`
-	ElapsedMs        int64  `json:"elapsed_ms"`
-	Cached           bool   `json:"cached"`
-}
+// formatVersion memo 条目格式版本：目录结构或指纹算法变化时递增。
+const formatVersion = "specforge-memo-v3"
+
+// MaxEntries 保留的 memo 条目上限：写入新条目后按最近使用时间淘汰更旧的条目。
+const MaxEntries = 16
+
+// skipDirs 指纹计算跳过的目录（VCS 元数据、工具产物、三方依赖）。
+var skipDirs = map[string]bool{".git": true, ".specforge": true, "vendor": true, "node_modules": true}
 
 // Fingerprint 计算一次运行的输入指纹。
 //
-// 覆盖：引擎版本 + 服务过滤名 + 画像内容（显式画像文件字节，无画像则
-// 记 "default-profile"）+ LLM 运行模式（llmKey）+ 仓库内全部 .go / go.mod /
-// go.sum 的内容哈希（按相对路径排序）。跳过 .git / .specforge / vendor / node_modules。
-//
-// llmKey 是本次运行的 LLM 配置指纹（离线传 "offline"）：LLM 兜底结果不来自
-// 仓库文件，若不计入指纹，离线/LLM 两次运行会互相命中脏缓存——离线产物会被
-// LLM 运行复用（漏掉兜底），或 LLM 产物被不同模型/预算的运行复用（陈旧）。
-func Fingerprint(repoDir, service, profilePath, engineVersion, llmKey string) (string, error) {
+// 覆盖：格式版本 + 引擎构建身份 + 服务过滤名 + 画像内容（显式画像文件字节；未显式指定时
+// 取 <repo>/.specforge/profile.yaml，不存在记 "default-profile"）+ LLM 运行模式（llmKey）+
+// 仓库内全部源码文件（isSource 由语言前端判定）的内容哈希（按相对路径排序）。
+func Fingerprint(repoDir, service, profilePath, engineVersion, llmKey string, isSource func(name string) bool) (string, error) {
 	h := sha256.New()
-	io.WriteString(h, "specforge-memo-v2\x00")
-	io.WriteString(h, engineVersion+"\x00")
-	io.WriteString(h, service+"\x00")
-	if profilePath != "" {
-		if b, err := os.ReadFile(profilePath); err == nil {
-			h.Write(b)
-		}
+	for _, part := range []string{formatVersion, engineVersion, service, llmKey} {
+		io.WriteString(h, part+"\x00")
+	}
+	if profilePath == "" {
+		profilePath = filepath.Join(repoDir, ".specforge", "profile.yaml")
+	}
+	if b, err := os.ReadFile(profilePath); err == nil {
+		h.Write(b)
 	} else {
 		io.WriteString(h, "default-profile")
 	}
-	io.WriteString(h, "\x00"+llmKey+"\x00")
 	h.Write([]byte{0})
 
 	type fh struct {
@@ -65,19 +54,17 @@ func Fingerprint(repoDir, service, profilePath, engineVersion, llmKey string) (s
 		hash string
 	}
 	var files []fh
-	_ = filepath.Walk(repoDir, func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(repoDir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
 		}
-		if info.IsDir() {
-			switch info.Name() {
-			case ".git", ".specforge", "vendor", "node_modules":
+		if d.IsDir() {
+			if skipDirs[d.Name()] {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		name := info.Name()
-		if !strings.HasSuffix(name, ".go") && name != "go.mod" && name != "go.sum" {
+		if !isSource(d.Name()) {
 			return nil
 		}
 		b, err := os.ReadFile(path)
@@ -86,9 +73,12 @@ func Fingerprint(repoDir, service, profilePath, engineVersion, llmKey string) (s
 		}
 		sum := sha256.Sum256(b)
 		rel, _ := filepath.Rel(repoDir, path)
-		files = append(files, fh{rel, hex.EncodeToString(sum[:])})
+		files = append(files, fh{filepath.ToSlash(rel), hex.EncodeToString(sum[:])})
 		return nil
 	})
+	if err != nil {
+		return "", err
+	}
 	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
 	for _, f := range files {
 		io.WriteString(h, f.rel+"\x00"+f.hash+"\x00")
@@ -96,48 +86,83 @@ func Fingerprint(repoDir, service, profilePath, engineVersion, llmKey string) (s
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// Store 磁盘 memo 缓存（目录下按指纹存 spec.yaml / report.md / summary.json）。
+// Store 磁盘 memo 缓存：<dir>/<指纹>/<产物名>。
 type Store struct {
-	dir string
+	dir string // 缓存根目录；空 = 禁用
 }
 
-// New 创建（惰性，首次 Save 时建目录）。
+// New 创建 Store（惰性，首次 Save 时建目录）；dir 为空时 Load 恒未命中、Save 为空操作。
 func New(dir string) *Store { return &Store{dir: dir} }
 
-// Load 命中返回三个产物的字节与摘要；未命中返回 ok=false。
-func (s *Store) Load(fp string) (spec, report []byte, summary Summary, ok bool) {
+// Load 命中时返回指纹下全部产物（文件名 → 内容）；names 中任一缺失视为未命中。
+// 命中会刷新条目的修改时间（LRU 淘汰依据）。
+func (s *Store) Load(fp string, names ...string) (map[string][]byte, bool) {
 	if s.dir == "" {
-		return nil, nil, summary, false
+		return nil, false
 	}
-	spec, err1 := os.ReadFile(filepath.Join(s.dir, fp+".yaml"))
-	report, err2 := os.ReadFile(filepath.Join(s.dir, fp+".report.md"))
-	sb, err3 := os.ReadFile(filepath.Join(s.dir, fp+".summary.json"))
-	if err1 != nil || err2 != nil || err3 != nil {
-		return nil, nil, summary, false
+	entry := filepath.Join(s.dir, fp)
+	out := make(map[string][]byte, len(names))
+	for _, n := range names {
+		b, err := os.ReadFile(filepath.Join(entry, n))
+		if err != nil {
+			return nil, false
+		}
+		out[n] = b
 	}
-	if json.Unmarshal(sb, &summary) != nil {
-		return nil, nil, Summary{}, false
-	}
-	return spec, report, summary, true
+	now := time.Now()
+	_ = os.Chtimes(entry, now, now)
+	return out, true
 }
 
-// Save 写入一次运行的全部产物。
-func (s *Store) Save(fp string, spec, report []byte, summary Summary) error {
+// Save 原子写入一个指纹的全部产物，并淘汰超出 MaxEntries 的最旧条目。
+func (s *Store) Save(fp string, files map[string][]byte) error {
 	if s.dir == "" {
 		return nil
 	}
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(s.dir, fp+".yaml"), spec, 0o644); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(s.dir, fp+".report.md"), report, 0o644); err != nil {
-		return err
-	}
-	sb, err := json.Marshal(summary)
+	tmp, err := os.MkdirTemp(s.dir, ".tmp-")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(s.dir, fp+".summary.json"), sb, 0o644)
+	for name, b := range files {
+		if err := os.WriteFile(filepath.Join(tmp, name), b, 0o644); err != nil {
+			os.RemoveAll(tmp)
+			return err
+		}
+	}
+	final := filepath.Join(s.dir, fp)
+	os.RemoveAll(final) // 同指纹并发写：后到者覆盖，内容相同
+	if err := os.Rename(tmp, final); err != nil {
+		os.RemoveAll(tmp)
+		return err
+	}
+	return s.prune(MaxEntries)
+}
+
+// prune 保留最近使用的 keep 个条目，删除其余条目与残留临时目录。
+func (s *Store) prune(keep int) error {
+	ents, err := os.ReadDir(s.dir)
+	if err != nil {
+		return err
+	}
+	type ent struct {
+		name string
+		mod  time.Time
+	}
+	var list []ent
+	for _, e := range ents {
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".tmp-") {
+			continue
+		}
+		if info, err := e.Info(); err == nil {
+			list = append(list, ent{e.Name(), info.ModTime()})
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].mod.After(list[j].mod) })
+	for i := keep; i < len(list); i++ {
+		os.RemoveAll(filepath.Join(s.dir, list[i].name))
+	}
+	return nil
 }

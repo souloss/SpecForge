@@ -18,7 +18,7 @@ func TestNormalizePath(t *testing.T) {
 		{"/a/:x/*", "/a/{x}/*", true},
 	}
 	for _, c := range cases {
-		got, wc := normalizePath(c.in)
+		got, wc := NormalizePath(c.in)
 		if got != c.want || wc != c.wildcard {
 			t.Errorf("normalizePath(%q) = (%q, %v), want (%q, %v)", c.in, got, wc, c.want, c.wildcard)
 		}

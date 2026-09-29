@@ -7,46 +7,29 @@ package typeschema
 
 import (
 	"fmt"
+	"go/token"
+	"go/types"
 	"sort"
 	"strings"
 
 	"github.com/specforge/specforge/internal/codegraph"
+	"github.com/specforge/specforge/internal/schema"
 )
 
-// Schema JSON Schema 节点（有序输出由编译器保证）。
-type Schema struct {
-	Type           string // object|array|string|integer|number|boolean|null
-	Format         string // int64|int32|double|date-time
-	Ref            string // $ref 名（命名类型引用）
-	Items          *Schema
-	Props          []Prop // object 属性（有序）
-	Required       []string
-	Enum           []string // 枚举值（字符串化）
-	Additional     bool     // additionalProperties: true
-	Nullable       bool     // 3.1: type 数组含 null
-	Description    string
-	Unknown        bool // x-specforge-unknown
-	UnknownWhy     string
-	EnumSource     string // 枚举证据符号
-	Min, Max       *float64
-	MinLen, MaxLen *int
-	Pattern        string
-	NoBody         bool // RawMessage 透传: 无 schema
-}
-
-// Prop object 的一个属性。
-type Prop struct {
-	Name      string
-	Schema    *Schema
-	Required  bool
-	OmitEmpty bool
-}
+// Schema / Prop 语言无关的 schema IR（定义在 schema 包），Go 前端在此合成。
+type (
+	Schema = schema.Schema
+	Prop   = schema.Prop
+)
 
 // Synthesizer 类型合成器（带缓存防递归）。
 type Synthesizer struct {
 	g       *codegraph.Graph
 	cache   map[string]*Schema
 	inStack map[string]bool
+	// request 请求方向：必填只认校验约束（解码容忍缺省字段）；
+	// 响应方向无 omitempty 的字段总会序列化输出，故视为必填。
+	request bool
 }
 
 // New 创建合成器。
@@ -56,6 +39,13 @@ func New(g *codegraph.Graph) *Synthesizer {
 		cache:   map[string]*Schema{},
 		inStack: map[string]bool{},
 	}
+}
+
+// NewRequest 创建请求方向合成器（独立缓存，必填语义见 Synthesizer.request）。
+func NewRequest(g *codegraph.Graph) *Synthesizer {
+	s := New(g)
+	s.request = true
+	return s
 }
 
 // Synthesize 按类型 ID 合成 schema。
@@ -99,21 +89,72 @@ func (s *Synthesizer) synthType(ti *codegraph.TypeInfo, typeID string) *Schema {
 	// struct → object（嵌入字段展平，设计文档 §7.2.8）
 	sc := &Schema{Type: "object"}
 	var required []string
+	seen := map[string]bool{}
+	var embedded []*Schema
 	for _, f := range ti.Fields {
-		if f.JSONName == "-" {
+		// encoding/json 忽略 `json:"-"` 与非嵌入的未导出字段（如 oapi-codegen union 的 `union json.RawMessage`）
+		if f.JSONName == "-" || (!f.Embedded && !token.IsExported(f.Name)) {
 			continue
 		}
+		if f.Embedded && !hasExplicitJSONName(f.Tag) {
+			if inner := s.embeddedSchema(f); inner != nil {
+				embedded = append(embedded, inner)
+				continue
+			}
+		}
 		fsc := s.synthField(f)
+		if f.Doc != "" && fsc.Ref == "" {
+			fsc.Description = f.Doc
+		}
+		seen[f.JSONName] = true
+		req := f.Required
+		if s.request {
+			req, _ = codegraph.ConstraintRequired(f.Tag)
+		}
 		sc.Props = append(sc.Props, Prop{
-			Name: f.JSONName, Schema: fsc, Required: f.Required, OmitEmpty: hasOmitempty(f.Tag),
+			Name: f.JSONName, Schema: fsc, Required: req, OmitEmpty: hasOmitempty(f.Tag),
 		})
-		if f.Required {
+		if req {
 			required = append(required, f.JSONName)
+		}
+	}
+	// encoding/json 语义：外层（浅层）同名字段遮蔽嵌入结构体的字段
+	for _, inner := range embedded {
+		for _, p := range inner.Props {
+			if seen[p.Name] {
+				continue
+			}
+			seen[p.Name] = true
+			sc.Props = append(sc.Props, Prop{
+				Name: p.Name, Schema: cloneSchema(p.Schema), Required: p.Required, OmitEmpty: p.OmitEmpty,
+			})
+			if p.Required {
+				required = append(required, p.Name)
+			}
 		}
 	}
 	sort.Strings(required)
 	sc.Required = required
 	return sc
+}
+
+// embeddedSchema 嵌入字段指向的结构体 schema（供外层展平）；非结构体嵌入返回 nil，按普通字段处理。
+func (s *Synthesizer) embeddedSchema(f codegraph.Field) *Schema {
+	ti := s.g.Type(f.TypeID)
+	if ti == nil || !ti.IsStruct || ti.IsTime {
+		return nil
+	}
+	inner := s.Synthesize(f.TypeID)
+	if inner == nil || inner.Type != "object" {
+		return nil
+	}
+	return inner
+}
+
+// hasExplicitJSONName json tag 是否显式命名（显式命名的嵌入字段按普通嵌套字段编码，不展平）。
+func hasExplicitJSONName(tag string) bool {
+	name, _, _ := strings.Cut(tagValue(tag, "json"), ",")
+	return name != ""
 }
 
 // synthField 单字段合成（§7.2.6 指针/omitempty、§7.2.3 any）。
@@ -150,17 +191,19 @@ func (s *Synthesizer) synthField(f codegraph.Field) *Schema {
 		}
 	case "any":
 		// §7.2.3: 静态不可定型 → 显式 unknown，禁止编造
-		sc = &Schema{Type: "object", Additional: true, Unknown: true,
-			UnknownWhy: "interface{}/any: cannot be statically resolved"}
+		// 不声明 type：any 可为任意 JSON 值（与 swag 的 `{}` 同义），声明 object 即是编造
+		sc = &Schema{Unknown: true, UnknownWhy: "interface{}/any: cannot be statically resolved"}
 	case "struct":
 		if ti := s.g.Type(f.TypeID); ti != nil {
-			sc = s.Synthesize(f.TypeID)
+			sc = cloneSchema(s.Synthesize(f.TypeID))
+		} else if f.Type != nil {
+			sc = s.synthGoType(f.Type, 0) // 匿名内联结构体：按字段类型直接合成
 		} else {
 			sc = &Schema{Unknown: true, UnknownWhy: "inline struct"}
 		}
 	default:
 		if ti := s.g.Type(f.TypeID); ti != nil {
-			sc = s.Synthesize(f.TypeID)
+			sc = cloneSchema(s.Synthesize(f.TypeID))
 		} else {
 			sc = &Schema{Unknown: true, UnknownWhy: "unresolved: " + f.TypeStr}
 		}
@@ -173,8 +216,64 @@ func (s *Synthesizer) synthField(f codegraph.Field) *Schema {
 	return sc
 }
 
+// maxInlineDepth 匿名类型（内联结构体/多层切片）递归合成的深度上限，防病态嵌套。
+const maxInlineDepth = 8
+
+// synthGoType 按 go/types 类型合成 schema（切片元素、匿名结构体、指针包装）；
+// 命名类型走 Synthesize，保留类型身份与枚举语义，不做名字后缀匹配。
+func (s *Synthesizer) synthGoType(t types.Type, depth int) *Schema {
+	if depth > maxInlineDepth {
+		return &Schema{Unknown: true, UnknownWhy: "inline type nesting too deep: " + t.String()}
+	}
+	t = types.Unalias(t)
+	if p, ok := t.(*types.Pointer); ok {
+		return s.synthGoType(p.Elem(), depth+1)
+	}
+	switch codegraph.KindOf(t) {
+	case "time":
+		return &Schema{Type: "string", Format: "date-time"}
+	case "rawmsg":
+		return &Schema{NoBody: true}
+	case "any", "iface":
+		return &Schema{Unknown: true, UnknownWhy: "interface{}/any: cannot be statically resolved"}
+	}
+	if _, ok := t.(*types.Named); ok {
+		if id := codegraph.TypeIDOf(t); s.g.Type(id) != nil {
+			return cloneSchema(s.Synthesize(id))
+		}
+	}
+	switch u := t.Underlying().(type) {
+	case *types.Basic:
+		return basicSchema(u.Name())
+	case *types.Slice:
+		if b, ok := u.Elem().Underlying().(*types.Basic); ok && b.Kind() == types.Uint8 {
+			return &Schema{Type: "string", Format: "byte"}
+		}
+		return &Schema{Type: "array", Items: s.synthGoType(u.Elem(), depth+1)}
+	case *types.Array:
+		return &Schema{Type: "array", Items: s.synthGoType(u.Elem(), depth+1)}
+	case *types.Map:
+		return &Schema{Type: "object", Additional: true, Description: "map with value type " + u.Elem().String()}
+	case *types.Struct:
+		return s.synthType(&codegraph.TypeInfo{IsStruct: true, Fields: s.g.StructFields(u)}, "")
+	}
+	return &Schema{Unknown: true, UnknownWhy: "unresolved: " + t.String()}
+}
+
 // synthElem 数组元素类型。
 func (s *Synthesizer) synthElem(f codegraph.Field) *Schema {
+	if f.Type != nil {
+		t := types.Unalias(f.Type)
+		if p, ok := t.(*types.Pointer); ok {
+			t = p.Elem()
+		}
+		switch u := t.Underlying().(type) {
+		case *types.Slice:
+			return s.synthGoType(u.Elem(), 0)
+		case *types.Array:
+			return s.synthGoType(u.Elem(), 0)
+		}
+	}
 	// 从类型串解析元素命名类型
 	elem := strings.TrimSuffix(strings.TrimPrefix(f.TypeStr, "[]"), "*")
 	if elem == "" {
@@ -260,6 +359,8 @@ func hasOmitempty(tag string) bool {
 	return parseTag(tag, "json", "omitempty")
 }
 
+// applyConstraints 合并校验约束（binding/validate tag，go-playground/validator 语义）：
+// min/max/len 对 string/array 是长度约束，对数值是取值约束（gte/lte 同义；gt/lt 为开区间，OAS3.1 需 exclusive*，暂不映射）；oneof 为枚举。
 func applyConstraints(sc *Schema, tag string) {
 	val := tagValue(tag, "binding")
 	if val == "" {
@@ -268,45 +369,51 @@ func applyConstraints(sc *Schema, tag string) {
 	if val == "" {
 		return
 	}
+	isLength := sc.Type == "string" || sc.Type == "array"
+	isArray := sc.Type == "array"
 	for _, part := range strings.Split(val, ",") {
 		kv := strings.SplitN(part, "=", 2)
-		switch kv[0] {
-		case "required":
-			// required 由字段存在性决定（omitempty 反向）——binding required 强化必填
-		case "min":
-			if len(kv) == 2 {
-				if n, ok := parseFloat(kv[1]); ok {
-					x := n
-					sc.Min = &x
+		if len(kv) != 2 {
+			// required 在 codegraph.requiredOf 中判定；无参规则不影响 schema
+			continue
+		}
+		rule, arg := kv[0], kv[1]
+		if rule == "oneof" {
+			sc.Enum = append(sc.Enum, strings.Fields(arg)...)
+			continue
+		}
+		n, ok := parseFloat(arg)
+		if !ok {
+			continue
+		}
+		switch {
+		case isLength && (rule == "min" || rule == "len" || rule == "minlength"):
+			lo, hi := int(n), int(n)
+			if isArray {
+				sc.MinItems = &lo
+			} else {
+				sc.MinLen = &lo
+			}
+			if rule == "len" {
+				if isArray {
+					sc.MaxItems = &hi
+				} else {
+					sc.MaxLen = &hi
 				}
 			}
-		case "max":
-			if len(kv) == 2 {
-				if n, ok := parseFloat(kv[1]); ok {
-					x := n
-					sc.Max = &x
-				}
+		case isLength && (rule == "max" || rule == "maxlength"):
+			hi := int(n)
+			if isArray {
+				sc.MaxItems = &hi
+			} else {
+				sc.MaxLen = &hi
 			}
-		case "minlength":
-			if len(kv) == 2 {
-				if n, ok := parseFloat(kv[1]); ok {
-					x := int(n)
-					sc.MinLen = &x
-				}
-			}
-		case "maxlength":
-			if len(kv) == 2 {
-				if n, ok := parseFloat(kv[1]); ok {
-					x := int(n)
-					sc.MaxLen = &x
-				}
-			}
-		case "oneof":
-			if len(kv) == 2 {
-				for _, v := range strings.Fields(kv[1]) {
-					sc.Enum = append(sc.Enum, v)
-				}
-			}
+		case !isLength && (rule == "min" || rule == "gte"):
+			x := n
+			sc.Min = &x
+		case !isLength && (rule == "max" || rule == "lte"):
+			x := n
+			sc.Max = &x
 		}
 	}
 }
@@ -375,10 +482,23 @@ func parseTag(tag, key, want string) bool {
 
 // cloneSchema 浅克隆 schema 节点（防止字段级修饰污染共享缓存;
 // 嵌套 Props/Items 保持共享——它们自身不被字段级修饰触碰）。
+// cloneSchema 浅拷贝节点供字段级修改（nullable/约束/描述）；会被 append 的 Enum 单独复制，
+// 避免与缓存中的共享底层数组互相污染。
 func cloneSchema(sc *Schema) *Schema {
 	if sc == nil {
 		return nil
 	}
 	c := *sc
+	c.Enum = append([]string(nil), sc.Enum...)
 	return &c
+}
+
+// FieldSchema 单个结构体字段的独立 schema（含约束与 nullable），供请求参数绑定展开复用字段定型规则。
+func (s *Synthesizer) FieldSchema(f codegraph.Field) *Schema {
+	return s.synthField(f)
+}
+
+// SchemaOf 按 go/types 类型合成 schema（值级收窄用：字面量值、字段赋值右值的静态类型）。
+func (s *Synthesizer) SchemaOf(t types.Type) *Schema {
+	return s.synthGoType(t, 0)
 }

@@ -14,32 +14,33 @@ import (
 	"os"
 	"sort"
 	"strings"
-
-	"gopkg.in/yaml.v3"
 )
 
 // Metrics 评测结果。
 type Metrics struct {
-	ParamMisses    []string
-	ParamSpurious  []string
-	RouteRecall    float64
-	RoutePrecision float64
-	ParamF1        float64
-	ParamPrec      float64
-	ParamRec       float64
-	ReqFieldF1     float64
-	ReqFieldPrec   float64
-	ReqFieldRec    float64
-	RespFieldF1    float64
-	RespFieldPrec  float64
-	RespFieldRec   float64
-	EnvelopeRecall float64
-	HallucRate     float64
-	MissingRoutes  []string
-	ExtraRoutes    []string
-	FieldMisses    []string
-	FieldSpurious  []string
-	EnvelopMisses  []string
+	ParamMisses    []string `json:"param_misses"`    // 参数漏报（in:name）
+	ParamSpurious  []string `json:"param_spurious"`  // 参数误报
+	RouteRecall    float64  `json:"route_recall"`    // 路由召回
+	RoutePrecision float64  `json:"route_precision"` // 路由精确率
+	ParamF1        float64  `json:"param_f1"`        // 参数四元组 F1
+	ParamPrec      float64  `json:"param_precision"` // 参数精确率
+	ParamRec       float64  `json:"param_recall"`    // 参数召回
+	ReqFieldF1     float64  `json:"req_field_f1"`    // 请求体字段 F1
+	ReqFieldPrec   float64  `json:"req_field_precision"`
+	ReqFieldRec    float64  `json:"req_field_recall"`
+	RespFieldF1    float64  `json:"resp_field_f1"` // 响应字段 F1（含 required）
+	RespFieldPrec  float64  `json:"resp_field_precision"`
+	RespFieldRec   float64  `json:"resp_field_recall"`
+	RespShapeF1    float64  `json:"resp_shape_f1"`   // 响应字段 F1（仅 path+type，不比 required：swag 仅凭校验 tag 标 required，与序列化语义口径不同）
+	EnvelopeRecall float64  `json:"envelope_recall"` // 信封码/状态码召回
+	HallucRate     float64  `json:"hallucination"`   // 幻觉率：spec 中无真值对应的字段占比
+	MissingRoutes  []string `json:"missing_routes"`  // 漏报路由
+	ExtraRoutes    []string `json:"extra_routes"`    // 多报路由
+	FieldMisses    []string `json:"field_misses"`    // 响应字段漏报（label: path|type|required）
+	FieldSpurious  []string `json:"field_spurious"`  // 响应字段误报
+	ReqMisses      []string `json:"req_misses"`      // 请求体字段漏报
+	ReqSpurious    []string `json:"req_spurious"`    // 请求体字段误报
+	EnvelopMisses  []string `json:"envelope_misses"` // 信封码漏报
 }
 
 // ---- 解析（truth 与 spec 共用同一 OpenAPI 结构） ------------------------
@@ -89,18 +90,22 @@ type oasSchema struct {
 	Required []string             `yaml:"required"`
 	Items    *oasSchema           `yaml:"items"`
 	Nullable bool                 `yaml:"nullable"`
+	AllOf    []oasSchema          `yaml:"allOf"` // 组合 schema（swag 信封收窄 `Envelope{result=T}` 的产出形态）
 }
+
+// maxFlattenDepth schema 展平的递归深度上限（防自引用类型无限展开）。
+const maxFlattenDepth = 8
 
 func loadDoc(path string) (*oasDoc, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	var d oasDoc
-	if err := yaml.Unmarshal(data, &d); err != nil {
+	d, err := parseDoc(data)
+	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	return &d, nil
+	return d, nil
 }
 
 // Evaluate 对比 truth 与生成 spec。
@@ -127,6 +132,7 @@ func Evaluate(truthPath, specPath string) (*Metrics, error) {
 	var paramTP, paramFP, paramFN int
 	var reqTP, reqFP, reqFN int
 	var respTP, respFP, respFN int
+	var shapeTP, shapeFP, shapeFN int
 	var envTP, envFN int
 	var spuriousFields int
 	var totalFields int
@@ -162,11 +168,18 @@ func Evaluate(truthPath, specPath string) (*Metrics, error) {
 			tf := flattenBody(truthOp.RequestBody, truth.Components.Schemas)
 			reqTP, reqFP, reqFN = accumulate(reqTP, reqFP, reqFN, sf, tf)
 			totalFields += len(tf)
+			for _, f := range setDiffStr(tf, sf) {
+				m.ReqMisses = append(m.ReqMisses, label+": "+f)
+			}
+			for _, f := range setDiffStr(sf, tf) {
+				m.ReqSpurious = append(m.ReqSpurious, label+": "+f)
+			}
 
-			// 响应字段（200 信封 data 槽展平）
+			// 响应字段（200 响应体整体展平，含信封字段）
 			sr := flattenRespData(specOp.Responses, spec.Components.Schemas)
 			tr := flattenRespData(truthOp.Responses, truth.Components.Schemas)
 			respTP, respFP, respFN = accumulate(respTP, respFP, respFN, sr, tr)
+			shapeTP, shapeFP, shapeFN = accumulate(shapeTP, shapeFP, shapeFN, dropRequired(sr), dropRequired(tr))
 			totalFields += len(tr)
 			for _, f := range setDiffStr(sr, tr) {
 				m.FieldSpurious = append(m.FieldSpurious, label+": "+f)
@@ -190,6 +203,7 @@ func Evaluate(truthPath, specPath string) (*Metrics, error) {
 	m.ParamPrec, m.ParamRec, m.ParamF1 = prf1(paramTP, paramFP, paramFN)
 	m.ReqFieldPrec, m.ReqFieldRec, m.ReqFieldF1 = prf1(reqTP, reqFP, reqFN)
 	m.RespFieldPrec, m.RespFieldRec, m.RespFieldF1 = prf1(respTP, respFP, respFN)
+	_, _, m.RespShapeF1 = prf1(shapeTP, shapeFP, shapeFN)
 	envTotal := envTP + envFN
 	if envTotal > 0 {
 		m.EnvelopeRecall = float64(envTP) / float64(envTotal)
@@ -215,43 +229,48 @@ func flattenBody(b *oasBody, comps map[string]oasSchema) []string {
 
 // flattenResolve $ref → components 解析后再展平（嵌套任意层）。
 func flattenResolve(s *oasSchema, prefix string, withRequired bool, comps map[string]oasSchema, depth int) []string {
-	if s == nil || depth > 8 {
+	if s == nil || depth > maxFlattenDepth {
 		return nil
 	}
 	if s.Ref != "" {
 		name := refName(s.Ref)
 		if sc, ok := comps[name]; ok {
+			// 深度只按嵌套层级计：$ref 与内联是同一结构的两种表达，不应让引用多截断一层
 			local := sc
-			return flattenSchema(&local, prefix, withRequired, comps, depth+1)
+			return flattenSchema(&local, prefix, withRequired, comps, depth)
 		}
 		return []string{prefix + ":$ref:" + name}
 	}
 	return flattenSchema(s, prefix, withRequired, comps, depth)
 }
 
-// flattenRespData 200 响应信封的 data 槽展平。
+// flattenRespData 200 响应体整体展平（信封字段 + 业务体字段）。
+//
+// 不假设信封形态（code/msg/data、jsonrpc/result/error 等均可）：信封本身就是
+// 契约的一部分，按真实响应体结构比较才能暴露「信封形态写错」这类缺陷。
 func flattenRespData(rs map[string]oasResp, comps map[string]oasSchema) []string {
-	r, ok := rs["200"]
+	r, ok := rs[statusOK]
 	if !ok {
 		return nil
 	}
 	for _, mt := range r.Content {
-		data, ok := mt.Schema.Props["data"]
-		if !ok {
-			return nil
-		}
-		if data.Ref != "" || (data.Type != nil && data.Items != nil) {
-			return flattenResolve(&data, "data", true, comps, 0)
-		}
-		return flattenSchema(&data, "data", true, comps, 0)
+		body := mt.Schema
+		return flattenResolve(&body, "", true, comps, 0)
 	}
 	return nil
 }
 
+// statusOK 成功响应的状态码键。
+const statusOK = "200"
+
 // flattenSchema 递归展平（设计文档 §11.1: 嵌套展平后比较; 嵌套 $ref 经 comps 解析）。
 func flattenSchema(s *oasSchema, prefix string, withRequired bool, comps map[string]oasSchema, depth int) []string {
-	if s == nil || depth > 8 {
+	if s == nil || depth > maxFlattenDepth {
 		return nil
+	}
+	if len(s.AllOf) > 0 {
+		merged := mergeAllOf(s, comps, depth)
+		s = &merged
 	}
 	var out []string
 	// required 集合
@@ -271,9 +290,9 @@ func flattenSchema(s *oasSchema, prefix string, withRequired bool, comps map[str
 		if prefix != "" {
 			path = prefix + "." + k
 		}
-		t := typeStr(p)
+		t := resolvedTypeStr(p, comps)
 		out = append(out, fmt.Sprintf("%s|%s|%v", path, t, reqSet[k] || !withRequired))
-		if p.Props != nil {
+		if p.Props != nil || p.Ref != "" || len(p.AllOf) > 0 {
 			out = append(out, flattenResolve(p, path, withRequired, comps, depth+1)...)
 		}
 		if p.Items != nil {
@@ -283,27 +302,63 @@ func flattenSchema(s *oasSchema, prefix string, withRequired bool, comps map[str
 	return out
 }
 
+// resolvedTypeStr 字段类型串；$ref 解析到目标 schema 的类型再比较——
+// 命名类型以 $ref 引用还是内联展开只是表达差异，不应判为类型不一致。
+func resolvedTypeStr(s *oasSchema, comps map[string]oasSchema) string {
+	for depth := 0; s.Ref != "" && depth <= maxFlattenDepth; depth++ {
+		target, ok := comps[refName(s.Ref)]
+		if !ok {
+			return typeStr(s)
+		}
+		s = &target
+	}
+	if s.Type == nil && (len(s.Props) > 0 || len(s.AllOf) > 0) {
+		return "object"
+	}
+	return typeStr(s)
+}
+
+// nullType OAS 3.1 type 数组中表示可空的类型名。
+const nullType = "null"
+
 func typeStr(s *oasSchema) string {
 	if s.Ref != "" {
 		return "$ref"
 	}
+	if len(s.AllOf) > 0 {
+		return "object"
+	}
 	switch t := s.Type.(type) {
 	case string:
-		if s.Format != "" {
+		// 数值位宽格式（int32/int64/float/double）是实现细节，swag 等工具不输出，不参与比较。
+		if s.Format != "" && t != "integer" && t != "number" {
 			return t + "/" + s.Format
 		}
 		return t
 	case []interface{}:
-		// 3.1 type 数组（可空）
+		// 3.1 type 数组（可空）：可空性不参与比较——swagger 2.0 真值无法表达 null，
+		// 否则同一字段会因版本表达差异被判为不一致
 		var parts []string
 		for _, v := range t {
-			if s, ok := v.(string); ok {
+			if s, ok := v.(string); ok && s != nullType {
 				parts = append(parts, s)
 			}
 		}
 		return strings.Join(parts, "|")
 	}
 	return "?"
+}
+
+// dropRequired 去掉展平三元组的 required 分量（path|type|required → path|type）。
+func dropRequired(fields []string) []string {
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if i := strings.LastIndex(f, "|"); i >= 0 {
+			f = f[:i]
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 // ---- 参数四元组 --------------------------------------------------------
@@ -490,14 +545,6 @@ func prf1(tp, fp, fn int) (p, r, f float64) {
 	return
 }
 
-func splitKey(k string) (method, path string) {
-	i := strings.Index(k, " ")
-	if i > 0 {
-		return strings.ToUpper(k[:i]), k[i+1:]
-	}
-	return "", k
-}
-
 func lastSeg(s string) string {
 	if i := strings.LastIndex(s, "/"); i >= 0 {
 		return s[i+1:]
@@ -515,11 +562,11 @@ Route Recall      : %.3f   (missing %d)
 Route Precision   : %.3f   (extra %d)
 Param F1          : %.3f
 Request Field F1  : %.3f
-Response Field F1 : %.3f
+Response Field F1 : %.3f   (shape-only, ignoring required: %.3f)
 Envelope Recall   : %.3f
 Hallucination     : %.3f
 `, m.RouteRecall, len(m.MissingRoutes), m.RoutePrecision, len(m.ExtraRoutes),
-		m.ParamF1, m.ReqFieldF1, m.RespFieldF1, m.EnvelopeRecall, m.HallucRate)
+		m.ParamF1, m.ReqFieldF1, m.RespFieldF1, m.RespShapeF1, m.EnvelopeRecall, m.HallucRate)
 
 	if len(m.MissingRoutes) > 0 {
 		fmt.Fprintf(w, "\nMissing routes:\n")
@@ -545,6 +592,8 @@ Hallucination     : %.3f
 			fmt.Fprintf(w, "  - %s\n", q)
 		}
 	}
+	printList(w, "Missing request fields", m.ReqMisses)
+	printList(w, "Spurious request fields", m.ReqSpurious)
 	if len(m.FieldMisses) > 0 {
 		fmt.Fprintf(w, "\nMissing fields (%d):\n", len(m.FieldMisses))
 		for _, f := range m.FieldMisses {
@@ -566,9 +615,13 @@ Hallucination     : %.3f
 	return nil
 }
 
-// WriteJSON 机器可读输出。
-func WriteJSON(m *Metrics, w io.Writer) error {
-	fmt.Fprintf(w, `{"route_recall":%.4f,"route_precision":%.4f,"param_f1":%.4f,"req_field_f1":%.4f,"resp_field_f1":%.4f,"envelope_recall":%.4f,"hallucination":%.4f}`+"\n",
-		m.RouteRecall, m.RoutePrecision, m.ParamF1, m.ReqFieldF1, m.RespFieldF1, m.EnvelopeRecall, m.HallucRate)
-	return nil
+// printList 输出一个带计数标题的明细列表（空列表不输出）。
+func printList(w io.Writer, title string, items []string) {
+	if len(items) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "\n%s (%d):\n", title, len(items))
+	for _, it := range items {
+		fmt.Fprintf(w, "  - %s\n", it)
+	}
 }
