@@ -411,7 +411,12 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 		switch {
 		case h.Success:
 			// 值级收窄：data 由字面量构造且 any 部分可由字面量/字段赋值定型时，换成 operation 专属 schema。
-			if (h.DataUnknown || h.DataTypeID != "") && !strings.HasPrefix(h.DataTypeID, "[]") {
+			if h.DataInline != nil {
+				nf := b.inlineDataFact(h)
+				h.DataTypeID = strings.TrimPrefix(nf.ID, "schema:")
+				h.DataUnknown, h.HasBody = false, true
+				narrowed[h.DataTypeID] = nf
+			} else if !h.DataUnion && (h.DataUnknown || h.DataTypeID != "") && !strings.HasPrefix(h.DataTypeID, "[]") {
 				if nf, ok := b.narrowData(h); ok {
 					h.DataTypeID = strings.TrimPrefix(nf.ID, "schema:")
 					h.DataUnknown, h.DataMapValue, h.HasBody = false, "", true
@@ -515,6 +520,25 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 				EnvelopeType: h.EnvelopeType,
 			})
 			schemaFacts = append(schemaFacts, b.envelopeFact(h.EnvelopeType)...)
+		case h.ErrUncoded || h.ErrDynamic:
+			// 静态定性的错误行（不带业务码 / 动态码）：每类一行，写出点与来源证据合并。
+			code, ref, msg := facts.UncodedCode, facts.CodeRefUncoded, uncodedErrMsg
+			if h.ErrDynamic {
+				code, ref, msg = facts.DynamicCode, facts.CodeRefDynamic, dynamicCodeMsg
+			}
+			if i := rowWithCode(rows, code); i >= 0 {
+				rows[i].Sink = rows[i].Sink + "," + sinkLoc
+				rows[i].ErrSource = mergeSites(rows[i].ErrSource, h.ErrSource)
+				continue
+			}
+			rows = append(rows, facts.ResponseFact{
+				Status: h.Status, HasBody: false,
+				Envelope:     &facts.Envelope{Code: code, CodeRef: ref, Msg: msg},
+				Sink:         sinkLoc,
+				ErrSource:    h.ErrSource,
+				EnvelopeType: h.EnvelopeType,
+			})
+			schemaFacts = append(schemaFacts, b.envelopeFact(h.EnvelopeType)...)
 		case h.ErrUnresolved:
 			hasUnresolvedErr = true
 			if unresolvedEnv == "" {
@@ -547,6 +571,42 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 	facts.SortResponses(rows)
 	return rows, schemaFacts, conf, unknowns
 }
+
+// 静态定性错误行的信封描述（编译进响应描述）。
+const (
+	uncodedErrMsg  = "error without business code, serialized as-is"
+	dynamicCodeMsg = "business code taken from a runtime value"
+)
+
+// rowWithCode 响应行中首个信封码为 code 的下标；没有返回 -1。
+func rowWithCode(rows []facts.ResponseFact, code int) int {
+	for i := range rows {
+		if rows[i].Envelope != nil && rows[i].Envelope.Code == code {
+			return i
+		}
+	}
+	return -1
+}
+
+// mergeSites 合并两个逗号分隔的来源点串（去重、有序，截断到 maxMergedSites）。
+func mergeSites(a, b string) string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range append(facts.SplitSites(a), facts.SplitSites(b)...) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	sort.Strings(out)
+	if len(out) > maxMergedSites {
+		out = out[:maxMergedSites]
+	}
+	return facts.JoinSites(out)
+}
+
+// maxMergedSites 一个静态定性错误行合并后最多保留的来源点数（控制产物体积）。
+const maxMergedSites = 8
 
 // noteLearned 响应行来自 LLM 包装器摘要时：置信度按 symbol 级核对封顶，并记录包装器声明为证据。
 func (b *ContractPayloadBuilder) noteLearned(h slicing.SinkHit, conf *float64) {

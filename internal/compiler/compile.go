@@ -77,6 +77,8 @@ type ResponseOut struct {
 	Status        string   `json:"status"`         // HTTP 状态码
 	Codes         []int    `json:"codes"`          // 信封码集合（enum）
 	HasUnresolved bool     `json:"has_unresolved"` // 是否存在未解析的错误行
+	HasDynamic    bool     `json:"has_dynamic"`    // 是否存在业务码取自运行时值的错误行（码集合不封闭）
+	HasUncoded    bool     `json:"has_uncoded"`    // 是否存在不带业务码的错误行（错误对象原样序列化）
 	Description   string   `json:"description"`    // 聚合描述
 	SchemaName    string   `json:"schema"`         // 信封 data 槽的 $ref 名（空 = 无 body）
 	ArrayElem     string   `json:"array_elem"`     // 切片响应: data 为 array，元素 $ref 名
@@ -263,6 +265,12 @@ func Compile(in Input) (*Document, error) {
 			} else if code > 0 {
 				g.Description = appendDesc(g.Description,
 					fmt.Sprintf("Business error (code=%d): %s", code, msg))
+			} else if code == facts.DynamicCode {
+				g.HasDynamic = true
+				g.Description = appendDesc(g.Description, "Business error (code passed through at runtime from "+sitesOf(r)+")")
+			} else if code == facts.UncodedCode {
+				g.HasUncoded = true
+				g.Description = appendDesc(g.Description, "Error without business code (raised by "+sitesOf(r)+")")
 			} else {
 				g.HasUnresolved = true
 				desc := "Business error (code unresolved from source)"
@@ -595,11 +603,20 @@ func schemeTypeOf(sp *facts.SecurityPayload) string {
 	return "apiKey"
 }
 
+// descSep 响应描述中各分支说明的分隔符。
+const descSep = "; "
+
+// appendDesc 追加一条分支说明；已存在的相同说明不重复（同码多变体的成功行只说明一次）。
 func appendDesc(base, add string) string {
 	if base == "" {
 		return add
 	}
-	return base + "; " + add
+	for _, part := range strings.Split(base, descSep) {
+		if part == add {
+			return base
+		}
+	}
+	return base + descSep + add
 }
 
 func appendUniq(nums []int, v int) []int {
@@ -618,4 +635,34 @@ func appendUniqStr(arr []string, v string) []string {
 		}
 	}
 	return append(arr, v)
+}
+
+// sitesOf 静态定性错误行的来源点摘要（只取表达式、去掉位置；最多 maxDescSites 个）。
+func sitesOf(r facts.ResponseFact) string {
+	var out []string
+	for _, site := range facts.SplitSites(r.ErrSource) {
+		if site = facts.SiteExpr(site); site != "" && !containsString(out, site) {
+			out = append(out, site)
+		}
+	}
+	if len(out) == 0 {
+		return "source"
+	}
+	if len(out) > maxDescSites {
+		out = append(out[:maxDescSites], "…")
+	}
+	return strings.Join(out, ", ")
+}
+
+// maxDescSites 响应描述中列出的来源表达式上限（完整来源见 operations.json / report）。
+const maxDescSites = 3
+
+// containsString 切片是否含 s。
+func containsString(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }

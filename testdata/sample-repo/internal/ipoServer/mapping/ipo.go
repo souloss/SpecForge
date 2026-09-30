@@ -108,7 +108,7 @@ type OrderCancelResp struct {
         Timestamp time.Time `json:"timestamp"`
 }
 
-// RiskAssessResp 风险评估响应（含 any 字段: 静态不可定型）。
+// RiskAssessResp 风险评估响应（RiskInfo 类型层为 any；本 operation 由 map 字面量构造，值级收窄可定型）。
 type RiskAssessResp struct {
         OrderID string         `json:"orderId"`
         Score   int            `json:"score"`

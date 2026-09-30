@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -97,16 +98,17 @@ func writeOpOverview(b *strings.Builder, doc *compiler.Document) {
 		op := &doc.Operations[i]
 		body, codes := "-", []string{}
 		for _, r := range op.Responses {
-			switch {
-			case r.ArrayElem != "":
-				body = "[]" + r.ArrayElem
-			case r.SchemaName != "":
-				body = r.SchemaName
-			case r.MapValueType != "":
-				body = "map[string]" + r.MapValueType
+			if names := variantBodies(r); len(names) > 0 {
+				body = strings.Join(names, variantSep)
 			}
 			for _, c := range r.Codes {
 				codes = append(codes, strconv.Itoa(c))
+			}
+			if r.HasDynamic {
+				codes = append(codes, dynamicCodeMark)
+			}
+			if r.HasUncoded {
+				codes = append(codes, uncodedCodeMark)
 			}
 			if r.HasUnresolved {
 				codes = append(codes, "?")
@@ -115,6 +117,12 @@ func writeOpOverview(b *strings.Builder, doc *compiler.Document) {
 		fmt.Fprintf(b, "| %s | %s | %.2f | %s | %s |\n", op.Method, op.Path, op.Confidence, body, strings.Join(codes, ","))
 	}
 }
+
+// 报告信封码列中静态定性错误行的记号：动态码（取自运行时值）/ 不带业务码。
+const (
+	dynamicCodeMark = "dyn"
+	uncodedCodeMark = "none"
+)
 
 // SchemaVersion 机器契约版本：operations.json 与 CLI --json 信封共用；字段语义不兼容变更时递增。
 const SchemaVersion = "1"
@@ -180,4 +188,34 @@ func saveMemo(store *memo.Store, fp string, artifacts map[string][]byte, res *Re
 		files[k] = v
 	}
 	return store.Save(fp, files)
+}
+
+// variantSep 报告中同一状态码多个响应体变体（oneOf）的分隔符。
+const variantSep = " \\| "
+
+// variantBodies 响应的业务体展示名：多变体（oneOf）逐个列出，单变体取主字段；无业务体为空。
+func variantBodies(r compiler.ResponseOut) []string {
+	name := func(schemaName, arrayElem, mapValue string) string {
+		switch {
+		case arrayElem != "":
+			return "[]" + arrayElem
+		case schemaName != "":
+			return schemaName
+		case mapValue != "":
+			return "map[string]" + mapValue
+		}
+		return ""
+	}
+	var out []string
+	for _, v := range r.Variants {
+		if n := name(v.SchemaName, v.ArrayElem, v.MapValueType); n != "" && !slices.Contains(out, n) {
+			out = append(out, n)
+		}
+	}
+	if len(out) == 0 {
+		if n := name(r.SchemaName, r.ArrayElem, r.MapValueType); n != "" {
+			out = append(out, n)
+		}
+	}
+	return out
 }

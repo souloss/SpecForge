@@ -161,8 +161,8 @@ type ResponseFact struct {
 	Sink       string    `yaml:"sink"`
 	// Source 该行的事实来源：空 = static；"llm" = 由 LLM 兜底采集补齐。
 	Source string `yaml:"source,omitempty"`
-	// ErrSource 错误码未静态解析时，err 变量的来源证据（如
-	// "errgroup.Wait@ipoServer.go:233"），供 LLM 兜底定位码归因依据。
+	// ErrSource 错误行的来源证据（「表达式@file:line」逗号分隔）：未解析行为不可反推点（供 LLM 兜底定位），
+	// 不带业务码 / 动态码行为错误构造点 / 码取值点。
 	ErrSource string `yaml:"errSource,omitempty"`
 	// MapValueType data 槽为 map[K]V 且 V 为基础类型时，V 的 JSON schema 类型
 	// （integer/string/...）；空 = 非 map 或值不可定型。用于编译 additionalProperties map。

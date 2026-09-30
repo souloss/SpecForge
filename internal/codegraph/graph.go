@@ -307,6 +307,10 @@ func resolveCallee(call *ast.CallExpr, info *types.Info) (string, bool) {
 				return fmt.Sprintf("%s.%s", ifaceID, sel.Obj().Name()), true
 			}
 			if fnObj, ok := sel.Obj().(*types.Func); ok {
+				if r := fnObj.Signature().Recv(); r != nil && types.IsInterface(r.Type()) {
+					// 结构体嵌入接口后提升的方法：实际是接口分派，按接口方法解析到具体实现。
+					return fmt.Sprintf("%s.%s", typeID(stripPtr(r.Type())), fnObj.Name()), true
+				}
 				return methodIDOf(fnObj), false
 			}
 		}
@@ -754,7 +758,8 @@ func (g *Graph) concreteImplsOf(ifaceMethod string) []string {
 	if !ok {
 		return nil
 	}
-	var out []string
+	var real, doubles []string
+	seen := map[string]bool{}
 	// 只检查方法集里有同名方法的具体类型（预筛），再用 types.Implements 精确判定。
 	for _, id := range g.ownersOf(name) {
 		named := g.namedOf[id]
@@ -764,11 +769,47 @@ func (g *Graph) concreteImplsOf(ifaceMethod string) []string {
 		if !types.Implements(named, iface) && !types.Implements(types.NewPointer(named), iface) {
 			continue
 		}
-		implID := named.Obj().Pkg().Path() + ".(*" + id + ")." + name
-		out = append(out, implID)
+		implID, ok := declaredMethodID(named, id, name, ifaceNamed.Obj().Pkg())
+		if !ok {
+			continue // 经嵌入接口转发：只是再次分派，真实实现已由其它具体类型覆盖
+		}
+		if seen[implID] {
+			continue // 多个类型嵌入同一实现：提升方法归并到其声明处
+		}
+		seen[implID] = true
+		if isTestDouble(named) {
+			doubles = append(doubles, implID)
+		} else {
+			real = append(real, implID)
+		}
+	}
+	// 剔除测试替身实现（mock/fake）：只要还有真实实现就不让替身进入调用图，
+	// 否则 mock 的「返回 mock.Arguments.Get(0)」会把值流污染成不可反推。全是替身时原样保留。
+	out := real
+	if len(out) == 0 {
+		out = doubles
 	}
 	sort.Strings(out)
-	return dropTestDoubles(out, g.namedOf)
+	return out
+}
+
+// declaredMethodID 具体类型方法集中名为 name 的方法的声明处符号 ID：经嵌入提升的方法归到被嵌入类型
+// 的声明（有函数体可回溯），而非不存在声明的「外层类型.方法」。方法经嵌入的接口字段提升时返回 false。
+// id 为 named 的类型 ID，pkg 用于未导出方法名的查找。
+func declaredMethodID(named *types.Named, id, name string, pkg *types.Package) (string, bool) {
+	fallback := named.Obj().Pkg().Path() + ".(*" + id + ")." + name
+	sel := types.NewMethodSet(types.NewPointer(named)).Lookup(pkg, name)
+	if sel == nil {
+		return fallback, true
+	}
+	fn, ok := sel.Obj().(*types.Func)
+	if !ok || fn.Signature().Recv() == nil {
+		return fallback, true
+	}
+	if types.IsInterface(fn.Signature().Recv().Type()) {
+		return "", false
+	}
+	return FuncID(fn), true
 }
 
 // ownersOf 方法集中含 name 方法的非接口命名类型 ID（有序）；索引首次调用时构建（调用方持有 implMu）。
@@ -800,21 +841,6 @@ var testDoubleFieldPkgs = map[string]bool{
 	"github.com/stretchr/testify/mock": true,
 	"github.com/golang/mock/gomock":    true,
 	"go.uber.org/mock/gomock":          true,
-}
-
-// dropTestDoubles 剔除测试替身实现（mock/fake）：只要还有真实实现就不让替身进入调用图，
-// 否则 mock 的「返回 mock.Arguments.Get(0)」会把值流污染成不可反推。全是替身时原样保留。
-func dropTestDoubles(impls []string, namedOf map[string]*types.Named) []string {
-	var real []string
-	for _, id := range impls {
-		if !isTestDouble(namedOf[recvTypeIDOf(id)]) {
-			real = append(real, id)
-		}
-	}
-	if len(real) == 0 {
-		return impls
-	}
-	return real
 }
 
 // isTestDouble 命名类型是否为测试替身：位于 mocks/fakes 包，或字段来自 testify mock / gomock。

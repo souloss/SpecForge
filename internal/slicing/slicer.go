@@ -13,6 +13,7 @@ import (
 	"go/types"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/specforge/specforge/internal/adapter"
 	"github.com/specforge/specforge/internal/codegraph"
@@ -32,11 +33,18 @@ type SinkHit struct {
 	DataTypeID    string             // data 槽静态类型 ID（nil/unknown 时为空）
 	DataUnknown   bool               // any/interface{}: 无法定型
 	DataMapValue  string             // data 槽为 map[K]V 且 V 为基础类型时，V 的 JSON schema 类型（integer/string/...）；空 = 非 map 或值不可定型
+	DataInline    types.Type         // data 槽经值流收窄到的匿名结构体类型（无类型 ID，由合成器直接出 schema）；nil = 无
+	DataAlts      []string           // data 槽的闭合并集（全部路径可反推、候选均为命名类型）；analyzeHits 展开为逐变体行
+	DataUnion     bool               // 本行是闭合并集中的一个变体（不再做值级收窄）
 	HasBody       bool
 	ErrConstID    string   // 错误码常量符号（可解析时）
 	ErrConstIDs   []string // err 变量经值流反推到的全部错误码常量（analyzeHits 据此展开为逐码行）
 	ErrCallCallee string   // 错误构造器调用（如 code.NewDefaultError）
 	ErrUnresolved bool     // err 为变量: 信封码不可静态解析
+	ErrUncoded    bool     // 错误行：错误值由仓库外构造（errors.New、三方库 error），不带业务码，包装器原样序列化
+	ErrDynamic    bool     // 错误行：业务码取自运行时值（上游响应字段等），取值集合不可静态枚举
+	uncodedAt     string   // err 变量中不带业务码路径的构造点（逗号分隔；展开为 ErrUncoded 行的来源证据）
+	dynamicAt     string   // err 变量中动态码路径的取值点（逗号分隔；展开为 ErrDynamic 行的来源证据）
 	ErrSource     string   // err 变量的来源证据（定义点的调用符号 + file:line）
 	HandlerPath   []string // 从 handler 到 sink 的调用路径（证据链）
 	EnvelopeType  string   // 真实信封结构体类型 ID（自动发现的包装器）；空 = profile 信封或无信封
@@ -55,11 +63,15 @@ type Slicer struct {
 	g       *codegraph.Graph
 	prof    *profile.Profile
 	writers map[string]adapter.Writer // 框架原生写出器（原语表），按符号索引
+	modPkgs map[string]bool           // 仓库内包路径（区分仓库内外的函数与类型）
+
+	fieldMu    sync.Mutex                   // 保护 fieldCache（handler 可并发切片）
+	fieldCache map[*types.Var]fieldWriteSet // 未导出字段 → 声明包内的写入点（惰性扫描）
 }
 
 // New 创建追踪器；writers 为框架原生写出器原语（状态码实参、值流中的写出结果语义）。
 func New(g *codegraph.Graph, prof *profile.Profile, writers []adapter.Writer) *Slicer {
-	return &Slicer{g: g, prof: prof, writers: writerIndex(writers)}
+	return &Slicer{g: g, prof: prof, writers: writerIndex(writers), modPkgs: modulePkgs(g)}
 }
 
 // Trace 对一个 handler 做正向可达闭包内的汇聚点扫描。
@@ -116,8 +128,9 @@ func (s *Slicer) traceFrom(root, handlerID string) []SinkHit {
 // err 变量经值流反推出的每个错误码再展开为独立的失败行。
 func (s *Slicer) analyzeHits(site codegraph.CallSite, reach map[string]int, handler string) []SinkHit {
 	hit := s.analyzeHit(site, reach, handler)
-	if !hit.ErrUnresolved && len(hit.ErrConstIDs) == 0 && !(hit.ErrIsVar && hit.FixedCode != nil) {
-		return []SinkHit{hit}
+	if !hit.ErrUnresolved && len(hit.ErrConstIDs) == 0 && hit.uncodedAt == "" && hit.dynamicAt == "" &&
+		!(hit.ErrIsVar && hit.FixedCode != nil) {
+		return expandDataAlts([]SinkHit{hit})
 	}
 	pat, _ := s.prof.IsSink(site.Callee)
 	var out []SinkHit
@@ -128,19 +141,51 @@ func (s *Slicer) analyzeHits(site codegraph.CallSite, reach map[string]int, hand
 		success.FixedCode, success.EnvelopeType = pat.SuccessCode, pat.EnvelopeType
 		out = append(out, success)
 		failure.DataTypeID, failure.DataUnknown, failure.DataMapValue, failure.HasBody = "", false, "", false
+		failure.DataAlts, failure.DataInline = nil, nil
 	}
-	return append(out, expandErrCodes(failure)...)
+	return expandDataAlts(append(out, expandErrCodes(failure)...))
 }
 
-// expandErrCodes 失败行按反推到的错误码逐个展开；存在不可反推路径时额外保留一条未解析行。
+// expandDataAlts 闭合并集的 data 展开为逐变体的写出行（同状态码多变体由编译器渲染为 oneOf）。
+func expandDataAlts(hits []SinkHit) []SinkHit {
+	out := make([]SinkHit, 0, len(hits))
+	for _, h := range hits {
+		if len(h.DataAlts) == 0 {
+			out = append(out, h)
+			continue
+		}
+		for _, alt := range h.DataAlts {
+			v := h
+			v.DataAlts, v.DataUnion = nil, true
+			v.DataTypeID, v.DataUnknown, v.HasBody = alt, false, true
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// expandErrCodes 失败行按反推到的错误码逐个展开，不带业务码 / 动态码路径各展开为一行；
+// 存在不可反推路径时额外保留一条未解析行。
 func expandErrCodes(h SinkHit) []SinkHit {
-	if len(h.ErrConstIDs) == 0 {
+	if len(h.ErrConstIDs) == 0 && h.uncodedAt == "" && h.dynamicAt == "" {
 		return []SinkHit{h}
 	}
 	var out []SinkHit
+	base := h
+	base.ErrConstIDs, base.ErrUnresolved, base.uncodedAt, base.dynamicAt = nil, false, "", ""
 	for _, id := range h.ErrConstIDs {
-		c := h
-		c.ErrConstID, c.ErrConstIDs, c.ErrUnresolved = id, nil, false
+		c := base
+		c.ErrConstID = id
+		out = append(out, c)
+	}
+	if h.uncodedAt != "" {
+		c := base
+		c.ErrUncoded, c.ErrSource = true, h.uncodedAt
+		out = append(out, c)
+	}
+	if h.dynamicAt != "" {
+		c := base
+		c.ErrDynamic, c.ErrSource = true, h.dynamicAt
 		out = append(out, c)
 	}
 	if h.ErrUnresolved {
@@ -176,11 +221,14 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 	// ---- data 槽 ----
 	if slotPresent(pat.DataSlot, site.ArgTypes) {
 		t := site.ArgTypes[pat.DataSlot]
+		var refined types.Type
 		if isAnyType(t) {
 			// any 槽：沿值流反推具体类型（反推失败保持 any → 不可定型）
-			if rt := s.refineAny(site, pat.DataSlot); rt != "" {
-				t = rt
+			rt, rtT, alts := s.refineAny(site, pat.DataSlot)
+			if rt != "" {
+				t, refined = rt, rtT
 			}
+			hit.DataAlts = alts
 		}
 		switch {
 		case t == untypedNil || t == "nil":
@@ -205,6 +253,9 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 				if mv, ok := mapValueType(t); ok {
 					hit.DataMapValue = mv
 					hit.HasBody = true
+				} else if isAnonStruct(refined) {
+					hit.DataInline = refined // 匿名结构体（如上游响应的 `Result struct{…}`）：结构静态确定
+					hit.HasBody = true
 				} else {
 					hit.DataUnknown = true
 				}
@@ -220,6 +271,9 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 		}
 	}
 
+	if len(hit.DataAlts) > 0 {
+		hit.DataUnknown, hit.HasBody = false, true // 闭合并集：结构静态确定（oneOf）
+	}
 	if hit.Success && pat.SuccessCode != nil {
 		hit.FixedCode = pat.SuccessCode
 	}
@@ -236,27 +290,16 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 			hit.Success = true
 		case strings.HasPrefix(sym, "call:"):
 			hit.ErrCallCallee = strings.TrimPrefix(sym, "call:")
-			// 从调用表达式中提取常量参数（错误码目录联动）
-			if pat.ErrSlot < len(site.ArgExprs) {
-				if expr := site.ArgExprs[pat.ErrSlot]; expr != nil {
-					if constID, ok := s.constFromErrCall(expr); ok {
-						hit.ErrConstID = constID
-					}
-				}
+			// 从调用表达式中提取常量参数（错误码目录联动）；非常量构造（`g.Wait()`、`errors.New(..)`、
+			// `NewError(res.Code, ..)`）与变量同样交给值流定性，不因缺常量而丢失失败行。
+			if constID, ok := s.constFromErrCall(site.ArgExprs[pat.ErrSlot]); ok {
+				hit.ErrConstID = constID
+			} else {
+				s.classifyErr(&hit, site, pat)
 			}
 		default:
-			// err 变量: 错误码无法静态确定，始终标未解析；溯源信息仅供报告展示，
-			// 不改变「未解析」的定性（否则会把 errgroup.Wait 等 sink 静默丢弃）。
-			consts, opaque, opaqueAt := s.errCodesOf(site, pat.ErrSlot)
-			hit.ErrSource = s.traceErrSource(site, pat.ErrSlot)
-			if len(opaqueAt) > 0 {
-				// 值流给出的不可反推点比局部溯源更精确（跨函数定位到动态错误的构造处）。
-				hit.ErrSource = strings.Join(capStrings(opaqueAt, maxErrSourceSites), ", ")
-			}
-			hit.ErrConstIDs = consts
-			// 仍有不可反推路径（或一个码都没反推到）时保留「未解析」行，不因部分命中而静默丢失
-			hit.ErrUnresolved = opaque || len(consts) == 0
-			hit.ErrIsVar = true
+			s.classifyErr(&hit, site, pat)
+			hit.ErrIsVar = !hit.Success
 		}
 		if !hit.Success && pat.ErrEnvelopeType != "" {
 			hit.EnvelopeType = pat.ErrEnvelopeType
@@ -265,9 +308,33 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 			// 包装器失败分支的信封码是常量（如 gin.H{"code": 500, ...}）：与 err 的具体值无关。
 			hit.FixedCode = pat.FailureCode
 			hit.ErrConstID, hit.ErrConstIDs, hit.ErrUnresolved, hit.ErrSource = "", nil, false, ""
+			hit.uncodedAt, hit.dynamicAt = "", ""
 		}
 	}
 	return hit
+}
+
+// classifyErr err 实参的值流定性：每条路径归为常量码 / 不带业务码 / 动态码 / 不可反推；
+// 只有不可反推的路径保留「未解析」行（LLM 兜底目标），不因部分命中而静默丢失。
+func (s *Slicer) classifyErr(hit *SinkHit, site codegraph.CallSite, pat profile.SinkPattern) {
+	ef := s.errCodesOf(site, pat.ErrSlot)
+	if ef.onlyNil {
+		hit.Success = true // err 恒为 nil（如被调方只 `return x, nil`）：只有成功写出，不是未解析错误
+		return
+	}
+	if !pat.ErrRaw && len(ef.uncodedAt) > 0 {
+		// 包装器不是把 err 原样放进信封（而是派生码/消息）：不带业务码的错误会渲染成什么不可静态确定。
+		ef.opaque, ef.opaqueAt, ef.uncodedAt = true, append(ef.opaqueAt, ef.uncodedAt...), nil
+		sortStrings(ef.opaqueAt)
+	}
+	hit.ErrSource = s.traceErrSource(site, pat.ErrSlot)
+	if len(ef.opaqueAt) > 0 {
+		// 值流给出的不可反推点比局部溯源更精确（跨函数定位到动态错误的构造处）。
+		hit.ErrSource = joinSites(ef.opaqueAt)
+	}
+	hit.ErrConstIDs = ef.consts
+	hit.uncodedAt, hit.dynamicAt = joinSites(ef.uncodedAt), joinSites(ef.dynamicAt)
+	hit.ErrUnresolved = ef.opaque || len(ef.consts)+len(ef.uncodedAt)+len(ef.dynamicAt) == 0
 }
 
 // inErrorBranch 写出点是否位于所在函数内 `if <error 值> != nil { ... }` 的 then 分支。
@@ -389,6 +456,11 @@ func (s *Slicer) isValueParamType(t types.Type) bool {
 
 // maxErrSourceSites 单个未解析错误行最多列出的不可反推来源点数（控制报告与提示词体积）。
 const maxErrSourceSites = 5
+
+// joinSites 来源点列表（截断到 maxErrSourceSites）拼为证据串；空列表为空串。
+func joinSites(sites []string) string {
+	return strings.Join(capStrings(sites, maxErrSourceSites), ", ") // 与 facts.SplitSites 的分隔口径一致
+}
 
 // capStrings 截取前 n 个元素（不足 n 原样返回）。
 func capStrings(ss []string, n int) []string {
@@ -611,6 +683,16 @@ func (s *Slicer) errMsgOf(constID string) string {
 
 // ---- 辅助 --------------------------------------------------------------
 
+// isAnonStruct 类型是否为匿名（非命名）结构体。
+func isAnonStruct(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	_, ok := types.Unalias(t).(*types.Struct)
+	return ok
+}
+
+// normalizeTypeID 类型串 → 可登记的命名类型 ID（去指针与泛型实参）；基础类型、切片、map、匿名类型返回空。
 func normalizeTypeID(t string) string {
 	t = strings.TrimSpace(t)
 	t = strings.TrimPrefix(t, "*")

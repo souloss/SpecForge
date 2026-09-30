@@ -20,6 +20,8 @@ type GapTask struct {
 	Sources []SourceSnippet `json:"sources"`
 	// DynamicErrorSites 值流不可反推的错误来源点「表达式@file:line」（错误缺口的精确定位）。
 	DynamicErrorSites []string `json:"dynamicErrorSites,omitempty"`
+	// SiteContexts 每个来源点周边的带行号源码（不受切片体积上限约束），模型无需调工具即可就地定性。
+	SiteContexts []SiteContext `json:"siteContexts,omitempty"`
 	// ErrCandidates 切片内已出现的具体错误码候选（证据注入）：LLM 优先从这里选。
 	ErrCandidates []ErrCandidateItem `json:"errCandidates,omitempty"`
 	// DataCandidates any 响应的字段候选（证据注入）：LLM 只能从这里选字段。
@@ -37,6 +39,13 @@ type SourceSnippet struct {
 	File   string `json:"file"`   // 仓库相对路径
 	Line   int    `json:"line"`   // 起始行号（源码首行对应的行号）
 	Code   string `json:"code"`   // 源码文本
+}
+
+// SiteContext 一个不可反推错误来源点的就地源码证据。
+type SiteContext struct {
+	Site string `json:"site"` // 来源点原文（与 DynamicErrorSites 中的条目一致）
+	File string `json:"file"` // 仓库相对路径
+	Code string `json:"code"` // 来源点所在函数内的源码窗口，每行带「行号| 」前缀
 }
 
 // ErrorCodeItem 错误码目录条目（序列化进 system prompt）。
@@ -68,6 +77,22 @@ type GapResolution struct {
 	Exhaustive bool `json:"exhaustive,omitempty"`
 	// Shapes 形状缺口的答案：每个缺口一棵形状树（字段名须能在源码中找到，类型取封闭集合）。
 	Shapes []ResolvedShape `json:"shapes,omitempty"`
+	// ErrorSites 对 DynamicErrorSites 逐点定性；全部来源点通过复核时据此移除「未解析」行。
+	ErrorSites []ResolvedSite `json:"errorSites,omitempty"`
+}
+
+// 来源点定性取值（ResolvedSite.Kind 的封闭集合）。
+const (
+	SiteKindCatalog = "catalog" // 只产出错误码目录中的常量（codeRefs 列出）
+	SiteKindDynamic = "dynamic" // 业务码取自运行时值（上游响应字段、透传的带码错误）
+	SiteKindUncoded = "uncoded" // 错误不带业务码（errors.New、fmt.Errorf、库/IO/反序列化错误）
+)
+
+// ResolvedSite 一个不可反推错误来源点的定性。
+type ResolvedSite struct {
+	Site     string   `json:"site"`               // 来源点（原样抄写 dynamicErrorSites 中的条目）
+	Kind     string   `json:"kind"`               // SiteKindCatalog / SiteKindDynamic / SiteKindUncoded
+	CodeRefs []string `json:"codeRefs,omitempty"` // Kind=catalog 时该点可能产出的目录常量
 }
 
 // ShapeGap 一个形状缺口：schema 的某条路径（"" 表示响应 data 本身）静态为 any。
@@ -114,6 +139,10 @@ const gapOutputSchema = `{
       "properties": {"codeRef": {"type": "string"}, "status": {"type": "integer"}},
       "required": ["codeRef"]}},
     "exhaustive": {"type": "boolean"},
+    "errorSites": {"type": "array", "items": {"type": "object",
+      "properties": {"site": {"type": "string"}, "kind": {"enum": ["catalog", "dynamic", "uncoded"]},
+        "codeRefs": {"type": "array", "items": {"type": "string"}}},
+      "required": ["site", "kind"]}},
     "shapes": {"type": "array", "items": {"type": "object",
       "properties": {"gap": {"type": "string"}, "shape": {"$ref": "#/$defs/node"}},
       "required": ["gap", "shape"]}}
@@ -142,7 +171,14 @@ const gapRules = "You are an API contract extractor for a Go HTTP service. You r
 	"schema path and describe it as a shape tree (nested objects/arrays allowed, max depth 4). Every field name " +
 	"must appear literally in the source (string literal, struct tag or field name); dataCandidates lists keys " +
 	"already found statically. Never invent a field.\n" +
-	"4. If a gap cannot be closed from the evidence, leave it out. Omission is always better than guessing.\n" +
+	"4. Error sites: for EVERY entry in dynamicErrorSites (its surrounding source is in siteContexts), add an " +
+	"errorSites item that copies the site string verbatim and classifies the error value reaching the response " +
+	"from there: \"catalog\" if it only ever carries catalog constants (list them in codeRefs, same rules as 1), " +
+	"\"dynamic\" if its business code is taken from a runtime value (a field of an upstream response, an error " +
+	"passed through from another service, channel, struct field or function value that carries a code), " +
+	"\"uncoded\" if it carries no business code at all (errors.New, fmt.Errorf, library/IO/unmarshal errors). " +
+	"Follow the value to where it is produced when the context is not enough.\n" +
+	"5. If a gap cannot be closed from the evidence, leave it out. Omission is always better than guessing.\n" +
 	"Respond with a single JSON object matching this schema (no prose, no comments):\n" + gapOutputSchema + "\n"
 
 // GapSystemPrompt 档位2/3 的 system prompt：只含固定规则，全仓所有 operation 共享同一前缀（利于网关前缀缓存）。
@@ -181,12 +217,17 @@ func ResolveGaps(ctx context.Context, p Provider, system string, task GapTask, t
 	return &out, nil
 }
 
-// completeJSON 发送请求并用 parse 解析输出：provider 不支持工具时退回单次调用；输出不合法时带上
-// 解析错误重试一次（不再开工具），仍失败返回错误由上层降级。
+// completeJSON 发送请求并用 parse 解析输出：provider 不支持工具、或工具循环用尽轮数时退回单次调用
+// （后者提示模型凭已给证据作答）；输出不合法时带上解析错误重试一次（不再开工具），仍失败返回错误由上层降级。
 func completeJSON(ctx context.Context, p Provider, req Request, parse func([]byte) error) error {
 	resp, err := p.Complete(ctx, req)
-	if errors.Is(err, ErrToolsUnsupported) {
+	switch {
+	case errors.Is(err, ErrToolsUnsupported):
 		req.Tools, req.MaxTurns = nil, 0
+		resp, err = p.Complete(ctx, req)
+	case errors.Is(err, ErrToolBudgetExhausted):
+		req.Tools, req.MaxTurns = nil, 0
+		req.Prompt += noToolsPrompt
 		resp, err = p.Complete(ctx, req)
 	}
 	if err != nil {
@@ -203,6 +244,10 @@ func completeJSON(ctx context.Context, p Provider, req Request, parse func([]byt
 	}
 	return parse(resp.Text)
 }
+
+// noToolsPrompt 工具轮数用尽后退回单次调用的追加提示。
+const noToolsPrompt = "\n\nTools are no longer available. Answer now from the sources and siteContexts above; " +
+	"omit anything you cannot support from them."
 
 // repairPromptFmt 输出修复重试的追加提示（%v 为上次的解析错误）。
 const repairPromptFmt = "\n\nYour previous reply could not be parsed (%v). Reply again with ONLY the JSON object, " +

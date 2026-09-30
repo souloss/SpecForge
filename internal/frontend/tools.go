@@ -3,6 +3,8 @@ package frontend
 import (
 	"context"
 	"encoding/json"
+	"strconv"
+	"strings"
 
 	"github.com/specforge/specforge/internal/infer"
 )
@@ -25,6 +27,9 @@ var idInputSchema = map[string]any{
 	"properties": map[string]any{"id": map[string]any{"type": "string", "description": "fully-qualified symbol ID"}},
 	"required":   []any{"id"},
 }
+
+// lineArgSchema 行号入参：模型常把数字写成字符串，schema 校验失败会中断整轮生成，故两者都收（intArg 统一转换）。
+var lineArgSchema = map[string]any{"type": []any{"integer", "string"}, "description": "1-based line number"}
 
 // Tools LLM 子 Agent 工具集：对程序视图的只读、确定性查询（缓存层据此重放校验读集）。任何前端的 Program 都可用。
 func Tools(prog Program) []infer.ToolSpec {
@@ -82,8 +87,8 @@ func Tools(prog Program) []infer.ToolSpec {
 				"type": "object",
 				"properties": map[string]any{
 					"file": map[string]any{"type": "string"},
-					"from": map[string]any{"type": "integer"},
-					"to":   map[string]any{"type": "integer"},
+					"from": lineArgSchema,
+					"to":   lineArgSchema,
 				},
 				"required": []any{"file", "from", "to"},
 			},
@@ -138,6 +143,9 @@ func intArg(v any) int {
 		return int(x)
 	case int:
 		return x
+	case string:
+		n, _ := strconv.Atoi(strings.TrimSpace(x))
+		return n
 	}
 	return 0
 }

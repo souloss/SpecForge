@@ -4,6 +4,7 @@ package verify
 
 import (
 	"errors"
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -49,8 +50,11 @@ func Shape(n *infer.ShapeNode, text string, tokens map[string]bool) (*schema.Sch
 
 // shape Shape 的递归实现。
 func shape(n *infer.ShapeNode, text string, tokens map[string]bool, depth int) (*schema.Schema, []string, error) {
-	if n == nil || depth > MaxShapeDepth {
-		return nil, nil, ErrRejected
+	if n == nil {
+		return nil, nil, fmt.Errorf("%w: missing shape node", ErrRejected)
+	}
+	if depth > MaxShapeDepth {
+		return nil, nil, fmt.Errorf("%w: depth exceeds %d", ErrRejected, MaxShapeDepth)
 	}
 	switch {
 	case scalarTypes[n.Type]:
@@ -66,7 +70,7 @@ func shape(n *infer.ShapeNode, text string, tokens map[string]bool, depth int) (
 		var names []string
 		for _, p := range n.Properties {
 			if !NameInSource(p.Name, text, tokens) {
-				return nil, nil, ErrRejected
+				return nil, nil, fmt.Errorf("%w: field %q not in source", ErrRejected, p.Name)
 			}
 			child, cn, err := shape(p.Shape, text, tokens, depth+1)
 			if err != nil {
@@ -81,5 +85,5 @@ func shape(n *infer.ShapeNode, text string, tokens map[string]bool, depth int) (
 		sort.Strings(sc.Required)
 		return sc, names, nil
 	}
-	return nil, nil, ErrRejected
+	return nil, nil, fmt.Errorf("%w: type %q outside closed set", ErrRejected, n.Type)
 }

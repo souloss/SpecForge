@@ -52,7 +52,8 @@ func (s *Slicer) DataLiterals(h SinkHit) ([]DataLiteral, bool) {
 	return lits, true
 }
 
-// FieldAssignTypes 函数 fn 内对「类型为 typeID 的值」的字段 field 的全部赋值（`x.F = rhs`）右值静态类型。
+// FieldAssignTypes 函数 fn 内对「类型为 typeID 的值」的字段 field 的全部赋值（`x.F = rhs`）右值静态类型；
+// 嵌入结构体的 promoted 字段赋值（`result.List = lists`，List 属于嵌入的 PageResult）同样命中。
 func (s *Slicer) FieldAssignTypes(fn, typeID, goField string) []types.Type {
 	fd := s.g.FuncDeclOf(fn)
 	info := s.g.TypeInfoOfFunc(fn)
@@ -70,11 +71,7 @@ func (s *Slicer) FieldAssignTypes(fn, typeID, goField string) []types.Type {
 			if !ok || sel.Sel.Name != goField {
 				continue
 			}
-			xt := info.TypeOf(sel.X)
-			if p, isPtr := xt.(*types.Pointer); isPtr {
-				xt = p.Elem()
-			}
-			if xt == nil || codegraph.TypeIDOf(xt) != typeID {
+			if baseTypeOf(sel.X, info) != typeID {
 				continue
 			}
 			if rt := info.TypeOf(as.Rhs[i]); rt != nil {
@@ -84,6 +81,18 @@ func (s *Slicer) FieldAssignTypes(fn, typeID, goField string) []types.Type {
 		return true
 	})
 	return out
+}
+
+// baseTypeOf 剥去指针取表达式类型 ID（与 FieldAssignTypes 的接收者口径一致）。
+func baseTypeOf(x ast.Expr, info *types.Info) string {
+	xt := info.TypeOf(x)
+	if p, isPtr := xt.(*types.Pointer); isPtr {
+		xt = p.Elem()
+	}
+	if xt == nil {
+		return ""
+	}
+	return codegraph.TypeIDOf(xt)
 }
 
 // holderOf 以 lit 为初值的局部变量（`m := lit` / `var m = lit`）；没有则 nil。

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"go/ast"
 	"go/constant"
+	"go/token"
 	"go/types"
 	"sort"
 	"strings"
@@ -60,8 +61,26 @@ func (b *ContractPayloadBuilder) narrowData(h slicing.SinkHit) (*facts.Fact, boo
 	}
 	typeName := lastSeg(codegraph.TypeIDOf(litType))
 	if typeName == "" || strings.ContainsAny(typeName, "[]{} ") {
-		typeName = "Object"
+		typeName = anonShapeName
 	}
+	pos := b.g.Fset.Position(lits[0].Lit.Pos())
+	return b.narrowFact(h, sc, typeName, pos.Filename, pos.Line, "narrowed from literal"), true
+}
+
+// anonShapeName 匿名类型（字面量或结构体类型无名字）收窄 schema 的组件名主干。
+const anonShapeName = "Object"
+
+// inlineDataFact data 槽经值流收窄到匿名结构体类型（如上游响应的 `Result struct{…}`）时，按类型合成专属 schema 事实；
+// 证据指向写出点。
+func (b *ContractPayloadBuilder) inlineDataFact(h slicing.SinkHit) *facts.Fact {
+	sc := b.synth.SchemaOf(h.DataInline)
+	return b.narrowFact(h, sc, anonShapeName, h.Site.File, h.Site.Line, "narrowed from inline struct type")
+}
+
+// narrowFact 收窄 schema 事实：ID 带形状指纹（同一 operation 内不同写出点的不同形状互不覆盖），
+// 组件名 <typeName>[Error]For<Op>。
+func (b *ContractPayloadBuilder) narrowFact(h slicing.SinkHit, sc *typeschema.Schema, typeName, file string, line int,
+	quote string) *facts.Fact {
 	branch := ""
 	if h.Raw && h.ErrorBranch {
 		branch = errorBranchInfix // 错误分支的形状单独命名（<类型>ErrorFor<Op>），不与成功体混名
@@ -70,15 +89,13 @@ func (b *ContractPayloadBuilder) narrowData(h slicing.SinkHit) (*facts.Fact, boo
 	if opName != "" {
 		opName = strings.ToUpper(opName[:1]) + opName[1:]
 	}
-	pos := b.g.Fset.Position(lits[0].Lit.Pos())
-	// ID 带形状指纹：同一 operation 内不同写出点的不同形状（如成功/失败分支）互不覆盖。
 	return &facts.Fact{
 		ID: "schema:" + narrowPrefix + shapeKey(sc) + "/" + opName + "." + typeName + branch + narrowNameInfix + opName, Kind: facts.KindSchema,
 		Value: facts.SchemaPayload{Schema: sc}, Source: facts.SourceStatic, Confidence: schemaConfidence(sc),
-		Evidence: []facts.Evidence{{File: pos.Filename, StartLine: pos.Line, EndLine: pos.Line,
-			BlobSHA: b.g.FileHashOf(pos.Filename), Quote: "narrowed from literal"}},
+		Evidence: []facts.Evidence{{File: file, StartLine: line, EndLine: line,
+			BlobSHA: b.g.FileHashOf(file), Quote: quote}},
 		Status: "verified",
-	}, true
+	}
 }
 
 // isStringAnyMap 类型底层是否为 map[string]<接口>（fiber.Map / map[string]any）。
@@ -192,8 +209,33 @@ func (b *ContractPayloadBuilder) structLiteralSchema(lits []slicing.DataLiteral,
 			narrowed[f.JSONName] = b.synth.SchemaOf(ct)
 		}
 	}
-	if len(narrowed) == 0 {
-		return nil
+	// 嵌入结构体的 any 字段（如 PageResult.List）：在声明者（typeID）的字面量里只以 `PageResult{List: …}` 出现，
+	// 即便该字段自己未写进字面量，也应逐条字段赋值回溯（FieldAssignTypes 已覆盖 promoted 字段的 `result.List = …`）。
+	for _, f := range ti.Fields {
+		if f.TypeID == "" || f.Kind != "struct" {
+			continue
+		}
+		inner := b.g.Type(f.TypeID)
+		if inner == nil || !inner.IsStruct {
+			continue
+		}
+		// 显式命名的嵌入字段按嵌套字段编码（不展平），路径不同，不在本处收窄。
+		if typeschema.HasExplicitJSONName(f.Tag) {
+			continue
+		}
+		for _, ef := range inner.Fields {
+			if ef.Kind != "any" {
+				continue
+			}
+			var cands []types.Type
+			for _, l := range lits {
+				// 只按外层类型回溯 promoted 字段赋值：内层类型的同名赋值属于无关变量，不参与。
+				cands = append(cands, b.slicer.FieldAssignTypes(l.Fn, typeID, ef.Name)...)
+			}
+			if ct := uniqueConcrete(cands); ct != nil {
+				narrowed[ef.JSONName] = b.synth.SchemaOf(ct)
+			}
+		}
 	}
 	sc := *base
 	sc.Props = make([]typeschema.Prop, len(base.Props))
@@ -203,7 +245,99 @@ func (b *ContractPayloadBuilder) structLiteralSchema(lits []slicing.DataLiteral,
 		}
 		sc.Props[i] = p
 	}
+	// 字面量内嵌的复合字面量（`Template: MessageTempate{Params: map[string]interface{}{…}}`）逐层下钻收窄；
+	// 多个字面量时须全部收窄出同一形状，否则某条路径的形状不能代表全部路径。
+	var agreed *typeschema.Schema
+	for i, l := range lits {
+		ns, ok := b.nestedLiteralSchema(l.Lit, l, &sc, 0)
+		if !ok || (i > 0 && shapeKey(ns) != shapeKey(agreed)) {
+			agreed = nil
+			break
+		}
+		agreed = ns
+	}
+	if agreed != nil {
+		return agreed
+	}
+	if len(narrowed) == 0 {
+		return nil
+	}
 	return &sc
+}
+
+// nestedLiteralSchema 结构体字面量 lit 中以复合字面量赋值的字段逐层收窄：map[string]any 字面量按常量键
+// 合成 object，嵌套结构体字面量递归。sc 为 lit 对应的 schema（不修改，沿路径浅克隆）；无任何收窄返回 false。
+func (b *ContractPayloadBuilder) nestedLiteralSchema(lit *ast.CompositeLit, l slicing.DataLiteral,
+	sc *typeschema.Schema, depth int) (*typeschema.Schema, bool) {
+	if sc == nil || sc.Ref != "" || depth > maxNarrowDepth {
+		return sc, false
+	}
+	t := l.Info.TypeOf(lit)
+	if t == nil {
+		return sc, false
+	}
+	st, ok := t.Underlying().(*types.Struct)
+	if !ok {
+		return sc, false
+	}
+	fields := b.g.StructFields(st)
+	out := *sc
+	out.Props = append([]typeschema.Prop(nil), sc.Props...)
+	changed := false
+	for _, el := range lit.Elts {
+		kv, ok := el.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, ok := kv.Key.(*ast.Ident)
+		if !ok {
+			continue
+		}
+		inner, ok := compositeOf(kv.Value)
+		if !ok {
+			continue
+		}
+		name := jsonFieldName(fields, key.Name)
+		for i, p := range out.Props {
+			if name == "" || p.Name != name {
+				continue
+			}
+			var ns *typeschema.Schema
+			if it := l.Info.TypeOf(inner); it != nil && isStringAnyMap(it) {
+				ns = b.mapLiteralSchema([]slicing.DataLiteral{{Lit: inner, Fn: l.Fn, Info: l.Info}}, depth+1)
+				if ns != nil && p.Schema != nil && !strings.HasPrefix(p.Schema.Description, typeschema.MapDescPrefix) {
+					ns.Description = p.Schema.Description // 保留字段 doc；map 合成说明随收窄丢弃
+				}
+			} else if rs, ok := b.nestedLiteralSchema(inner, l, p.Schema, depth+1); ok {
+				ns = rs
+			}
+			if ns != nil {
+				out.Props[i].Schema = ns
+				changed = true
+			}
+		}
+	}
+	return &out, changed
+}
+
+// compositeOf 表达式（去括号与取地址）是否为复合字面量。
+func compositeOf(e ast.Expr) (*ast.CompositeLit, bool) {
+	e = ast.Unparen(e)
+	if u, ok := e.(*ast.UnaryExpr); ok && u.Op == token.AND {
+		e = ast.Unparen(u.X)
+	}
+	lit, ok := e.(*ast.CompositeLit)
+	return lit, ok
+}
+
+// jsonFieldName 结构体中名为 goName 的非嵌入字段的序列化名；不存在或不序列化（`json:"-"`）返回空。
+func jsonFieldName(fields []codegraph.Field, goName string) string {
+	for _, f := range fields {
+		if f.Name == goName && !f.Embedded && f.JSONName != jsonSkipName {
+			return f.JSONName
+		}
+	}
+	return ""
 }
 
 // uniqueConcrete 候选类型中「有信息量」的类型（非接口、非接口元素切片、非 nil）若唯一则返回之。

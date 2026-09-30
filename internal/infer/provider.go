@@ -21,6 +21,9 @@ var ErrNoProvider = errors.New("infer: no LLM provider configured (offline mode)
 // ErrToolsUnsupported provider 不支持工具调用（档位3 不可用，上层退回档位2）。
 var ErrToolsUnsupported = errors.New("infer: provider does not support tools")
 
+// ErrToolBudgetExhausted 档位3 工具循环用尽最大轮数或单次调用时限仍未作答（上层退回档位2，凭已注入的证据作答）。
+var ErrToolBudgetExhausted = errors.New("infer: tool loop exhausted its turn or time budget")
+
 // Request 一次结构化补全请求。Tools 非空即档位3 多轮工具循环（MaxTurns 限定轮数）。
 type Request struct {
 	System   string     // system prompt（稳定前缀：放任务规则与大块静态上下文，利于网关前缀缓存）

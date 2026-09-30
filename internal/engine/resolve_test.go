@@ -44,6 +44,17 @@ func NewError(code int) error { return errors.New("x") }
 func Handler() error { return NewError(ErrA) }
 
 func Data() map[string]any { return map[string]any{"total": 1, "items": nil} }
+
+// Page 上游响应：JSON 名（itemCount）只出现在 tag 里，嵌套匿名结构体。
+type Page struct {
+	Result struct {
+		ItemCount int ` + "`json:\"itemCount\"`" + `
+	} ` + "`json:\"result\"`" + `
+}
+
+func Fetch() Page { return Page{} }
+
+func Paged() any { return Fetch().Result }
 `
 
 // fixturePhase 在临时目录构造夹具模块并返回 LLM 阶段上下文。
@@ -174,6 +185,39 @@ func TestApplyShapesVerified(t *testing.T) {
 	sc, _ := f.Schema()
 	if f.Verification != facts.VerifyText || len(sc.Props) != 2 || len(f.Evidence) == 0 {
 		t.Fatalf("fact = %+v schema = %+v", f, sc)
+	}
+}
+
+// TestApplyShapesEmptyObjectKeepsEvidence 空对象形状无字段证据：以 handler 首行兜底，schema 事实不被证据闸门丢弃。
+func TestApplyShapesEmptyObjectKeepsEvidence(t *testing.T) {
+	lp := fixturePhase(t)
+	lp.schemas = map[string]*schema.Schema{}
+	it := shapeItem(lp, anyPayload(), "m/svc.Data")
+	out := gapOutcome{cp: cloneContract(it.cp), minConf: 1}
+	lp.applyShapes(&out, []infer.ResolvedShape{{Gap: "s0", Shape: obj()}}, it)
+	if out.accepted != 1 || len(out.schemas) != 1 {
+		t.Fatalf("outcome = %+v", out)
+	}
+	evs := out.schemas[0].Evidence
+	if len(evs) != 1 || !filepath.IsAbs(evs[0].File) || !strings.HasPrefix(evs[0].Quote, "llm:shape ← ") {
+		t.Fatalf("fallback evidence = %+v", evs)
+	}
+}
+
+// TestApplyShapesAcceptsTaggedFields 字段名只出现在切片引用结构体的 json tag 里：放行，证据指向字段声明行。
+func TestApplyShapesAcceptsTaggedFields(t *testing.T) {
+	lp := fixturePhase(t)
+	lp.schemas = map[string]*schema.Schema{}
+	it := shapeItem(lp, anyPayload(), "m/svc.Paged")
+	out := gapOutcome{cp: cloneContract(it.cp), minConf: 1}
+	lp.applyShapes(&out, []infer.ResolvedShape{{Gap: "s0", Shape: obj(
+		infer.ShapeProp{Name: "itemCount", Shape: scalar("integer")})}}, it)
+	if out.accepted != 1 || len(out.schemas) != 1 {
+		t.Fatalf("outcome = %+v", out)
+	}
+	ev := out.schemas[0].Evidence
+	if len(ev) != 1 || !strings.Contains(ev[0].Quote, "llm:shape-field itemCount ← ItemCount int") {
+		t.Fatalf("evidence = %+v", ev)
 	}
 }
 
@@ -339,4 +383,98 @@ func TestEnrichOperationsEvidence(t *testing.T) {
 	if p := kept[0].Value.(facts.EnrichmentPayload); p.Summary != "Returns error A" {
 		t.Fatalf("payload = %+v", p)
 	}
+}
+
+// handlerSite 夹具中 Handler 的错误构造点（svc.go 第 10 行）。
+const handlerSite = "NewError(ErrA)@svc.go:10"
+
+// sitePayload 未解析行带来源点的载荷。
+func sitePayload(sites ...string) facts.ContractPayload {
+	cp := unresolvedPayload()
+	cp.Responses[0].ErrSource = facts.JoinSites(sites)
+	cp.Responses[0].Sink = "svc.go:10"
+	return cp
+}
+
+// TestApplyErrorSitesClosesUnresolved 全部来源点定性通过复核时写出占位码行并闭合缺口。
+func TestApplyErrorSitesClosesUnresolved(t *testing.T) {
+	lp := fixturePhase(t)
+	out := gapOutcome{cp: sitePayload(handlerSite), minConf: 1}
+	lp.applyErrorCodes(&out, &infer.GapResolution{ErrorSites: []infer.ResolvedSite{
+		{Site: "whatever@svc.go:10", Kind: infer.SiteKindDynamic}, // 表达式部分可改写，按位置回指
+	}}, lp.slice("m/svc.Handler", nil))
+	if out.accepted != 1 || out.rejected != 0 {
+		t.Fatalf("accepted=%d rejected=%d, want 1/0", out.accepted, out.rejected)
+	}
+	if len(out.cp.Responses) != 1 || len(out.cp.Gaps) != 0 {
+		t.Fatalf("unresolved row and gap should be replaced, got %+v gaps=%v", out.cp.Responses, out.cp.Gaps)
+	}
+	row := out.cp.Responses[0]
+	if row.Envelope.Code != facts.DynamicCode || row.Source != "llm" || row.ErrSource != "whatever@svc.go:10" || row.Sink != "svc.go:10" {
+		t.Fatalf("dynamic row not written back correctly: %+v", row)
+	}
+	if out.minConf != facts.VerificationCap(facts.VerifySymbol) {
+		t.Fatalf("site classification should cap at symbol verification, got %v", out.minConf)
+	}
+	if len(out.evidence) != 1 || !strings.Contains(out.evidence[0].Quote, "NewError(ErrA)") {
+		t.Fatalf("evidence should quote the site line, got %+v", out.evidence)
+	}
+}
+
+// TestApplyErrorSitesRejects 非本行来源点、未知定性与复核不过的 catalog 码均拒绝，未解析行保留。
+func TestApplyErrorSitesRejects(t *testing.T) {
+	lp := fixturePhase(t)
+	for name, rs := range map[string]infer.ResolvedSite{
+		"foreign site":   {Site: "x@svc.go:12", Kind: infer.SiteKindUncoded},
+		"unknown kind":   {Site: handlerSite, Kind: "maybe"},
+		"catalog absent": {Site: handlerSite, Kind: infer.SiteKindCatalog, CodeRefs: []string{"ErrB"}},
+		"catalog empty":  {Site: handlerSite, Kind: infer.SiteKindCatalog},
+	} {
+		out := gapOutcome{cp: sitePayload(handlerSite), minConf: 1}
+		lp.applyErrorCodes(&out, &infer.GapResolution{ErrorSites: []infer.ResolvedSite{rs}}, lp.slice("m/svc.Handler", nil))
+		if out.rejected != 1 || !hasUnresolved(out.cp) {
+			t.Errorf("%s: rejected=%d, unresolved kept=%v", name, out.rejected, hasUnresolved(out.cp))
+		}
+	}
+}
+
+// TestApplyErrorSitesCatalogAndPartial catalog 定性的码按目录复核写回；只定性部分来源点时不闭合。
+func TestApplyErrorSitesCatalogAndPartial(t *testing.T) {
+	lp := fixturePhase(t)
+	sl := lp.slice("m/svc.Handler", nil)
+	out := gapOutcome{cp: sitePayload(handlerSite), minConf: 1}
+	lp.applyErrorCodes(&out, &infer.GapResolution{ErrorSites: []infer.ResolvedSite{
+		{Site: handlerSite, Kind: infer.SiteKindCatalog, CodeRefs: []string{"ErrA"}},
+	}}, sl)
+	if out.accepted != 1 || hasUnresolved(out.cp) || out.cp.Responses[0].Envelope.Code != 1001 {
+		t.Fatalf("catalog site should close with ErrA row, got %+v", out.cp.Responses)
+	}
+
+	out = gapOutcome{cp: sitePayload(handlerSite, "y@svc.go:12"), minConf: 1}
+	lp.applyErrorCodes(&out, &infer.GapResolution{ErrorSites: []infer.ResolvedSite{
+		{Site: handlerSite, Kind: infer.SiteKindUncoded},
+	}}, sl)
+	if out.accepted != 1 || !hasUnresolved(out.cp) {
+		t.Fatalf("partial classification must keep the unresolved row, got %+v", out.cp.Responses)
+	}
+}
+
+// TestSiteContextsInjected 来源点窗口带行号注入任务，切片外的来源点跳过。
+func TestSiteContextsInjected(t *testing.T) {
+	lp := fixturePhase(t)
+	ctxs := lp.siteContexts(lp.slice("m/svc.Handler", nil), []string{handlerSite, "z@other.go:3"})
+	if len(ctxs) != 1 || ctxs[0].Site != handlerSite || ctxs[0].File != "svc/svc.go" ||
+		!strings.Contains(ctxs[0].Code, "10| func Handler() error") {
+		t.Fatalf("unexpected site contexts: %+v", ctxs)
+	}
+}
+
+// hasUnresolved 载荷是否仍有未解析错误行。
+func hasUnresolved(cp facts.ContractPayload) bool {
+	for _, r := range cp.Responses {
+		if r.Envelope != nil && r.Envelope.Code == facts.UnresolvedCode {
+			return true
+		}
+	}
+	return false
 }

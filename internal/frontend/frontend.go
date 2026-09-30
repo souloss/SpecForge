@@ -144,6 +144,22 @@ type FieldInfo struct {
 	Required bool   // 是否必填
 }
 
+// StructIndex 可选能力（有类型信息的前端实现）：函数体内引用到的结构体类型。
+// LLM 形状缺口的字段名常只出现在这些结构体的序列化 tag 里（切片函数体中只有源码字段名），
+// 复核据此把它们的 JSON 字段名视为「源码中出现」，并以字段声明行作证据。
+type StructIndex interface {
+	// JSONFieldsIn 函数集合体内引用到的结构体（命名或匿名，含字段类型的递归引用）的序列化字段，
+	// 按 JSON 名去重（同名取首个声明位置），按 JSON 名排序。
+	JSONFieldsIn(funcIDs []string) []FieldSite
+}
+
+// FieldSite 一个结构体序列化字段的声明位置。
+type FieldSite struct {
+	JSON string // 序列化字段名
+	File string // 声明所在文件（绝对路径）
+	Line int    // 声明行号
+}
+
 // Diagnoser 可选能力：前端自己的环境与仓库自检（doctor 命令）。未实现时 doctor 只做语言无关检查。
 type Diagnoser interface {
 	// Diagnose 语言相关检查（工具链、项目清单、框架、约定画像等），顺序固定。

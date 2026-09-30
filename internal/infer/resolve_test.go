@@ -1,0 +1,36 @@
+package infer
+
+import (
+	"context"
+	"strings"
+	"testing"
+)
+
+// turnsProvider 首次带工具的调用报告轮数用尽，其后返回固定答案；记录每次请求。
+type turnsProvider struct {
+	reqs []Request // 收到的请求（按序）
+}
+
+func (p *turnsProvider) Name() string { return "turns" }
+func (p *turnsProvider) Complete(_ context.Context, req Request) (Response, error) {
+	p.reqs = append(p.reqs, req)
+	if len(req.Tools) > 0 {
+		return Response{}, ErrToolBudgetExhausted
+	}
+	return Response{Text: []byte(`{"errorSites":[{"site":"a@x.go:1","kind":"uncoded"}]}`)}, nil
+}
+
+// TestResolveGapsFallsBackWhenToolTurnsExhausted 工具循环用尽轮数时退回无工具单次调用并提示凭证据作答。
+func TestResolveGapsFallsBackWhenToolTurnsExhausted(t *testing.T) {
+	p := &turnsProvider{}
+	res, err := ResolveGaps(context.Background(), p, "sys", GapTask{Method: "GET", Path: "/x"}, []ToolSpec{{Name: "read_source"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p.reqs) != 2 || len(p.reqs[1].Tools) != 0 || !strings.HasSuffix(p.reqs[1].Prompt, noToolsPrompt) {
+		t.Fatalf("expected a tool-less retry with the fallback note, got %d requests", len(p.reqs))
+	}
+	if len(res.ErrorSites) != 1 || res.ErrorSites[0].Kind != SiteKindUncoded {
+		t.Fatalf("unexpected resolution: %+v", res)
+	}
+}

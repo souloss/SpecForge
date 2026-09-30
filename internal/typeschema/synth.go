@@ -48,6 +48,13 @@ func NewRequest(g *codegraph.Graph) *Synthesizer {
 	return s
 }
 
+// MapDescPrefix map 字段合成 schema 的描述前缀（后接值类型串）：是合成说明而非字段 doc，
+// 值级收窄把 map 换成具体 object 后应丢弃。
+const MapDescPrefix = "map with value type "
+
+// emptyStructID 匿名空结构体的类型 ID（codegraph.TypeIDOf 对非命名类型取类型串）。
+const emptyStructID = "struct{}"
+
 // Synthesize 按类型 ID 合成 schema。
 func (s *Synthesizer) Synthesize(typeID string) *Schema {
 	if sc, ok := s.cache[typeID]; ok {
@@ -58,6 +65,9 @@ func (s *Synthesizer) Synthesize(typeID string) *Schema {
 		return &Schema{Ref: refNameOf(s.g, typeID)}
 	}
 	ti := s.g.Type(typeID)
+	if ti == nil && typeID == emptyStructID {
+		return &Schema{Type: "object"} // 空结构体恒序列化为 {}：静态可定型
+	}
 	if ti == nil {
 		return &Schema{Unknown: true, UnknownWhy: "type not found: " + typeID}
 	}
@@ -151,7 +161,10 @@ func (s *Synthesizer) embeddedSchema(f codegraph.Field) *Schema {
 	return inner
 }
 
-// hasExplicitJSONName json tag 是否显式命名（显式命名的嵌入字段按普通嵌套字段编码，不展平）。
+// HasExplicitJSONName json tag 是否显式命名（显式命名的嵌入字段按普通嵌套字段编码，不展平）。
+func HasExplicitJSONName(tag string) bool { return hasExplicitJSONName(tag) }
+
+// hasExplicitJSONName 见 HasExplicitJSONName。
 func hasExplicitJSONName(tag string) bool {
 	name, _, _ := strings.Cut(tagValue(tag, "json"), ",")
 	return name != ""
@@ -183,7 +196,7 @@ func (s *Synthesizer) synthField(f codegraph.Field) *Schema {
 		sc = &Schema{Type: "array", Items: s.synthElem(f)}
 	case "map":
 		sc = &Schema{Type: "object", Additional: true}
-		sc.Description = "map with value type " + f.TypeStr
+		sc.Description = MapDescPrefix + f.TypeStr
 		// map[string]any: 值不可定型 → 显式 unknown（设计文档 §7.2.3）
 		if strings.Contains(f.TypeStr, "any") || strings.Contains(f.TypeStr, "interface{}") {
 			sc.Unknown = true
@@ -253,7 +266,7 @@ func (s *Synthesizer) synthGoType(t types.Type, depth int) *Schema {
 	case *types.Array:
 		return &Schema{Type: "array", Items: s.synthGoType(u.Elem(), depth+1)}
 	case *types.Map:
-		return &Schema{Type: "object", Additional: true, Description: "map with value type " + u.Elem().String()}
+		return &Schema{Type: "object", Additional: true, Description: MapDescPrefix + u.Elem().String()}
 	case *types.Struct:
 		return s.synthType(&codegraph.TypeInfo{IsStruct: true, Fields: s.g.StructFields(u)}, "")
 	}

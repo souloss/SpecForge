@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -30,6 +31,9 @@ type cacheEntry struct {
 	Text  string     `json:"text"`  // 模型原始输出
 	Usage Usage      `json:"usage"` // 原调用用量（命中时计入节省）
 	Reads []ToolRead `json:"reads"` // 工具读集（命中前逐条重放校验）
+	// Exhausted 该请求的工具循环曾耗尽轮数/时限：命中时直接返回 ErrToolBudgetExhausted，
+	// 让上层立即退回无工具调用，而不是每次重跑注定失败的长循环。
+	Exhausted bool `json:"exhausted,omitempty"`
 }
 
 // CachedProvider 内容寻址的 LLM 调用缓存（设计文档 §5「LLM 调用也是可记忆化的 query」）。
@@ -37,7 +41,7 @@ type cacheEntry struct {
 // 键 = hash(格式版本, 模型名, system, prompt, schema, 工具签名, 轮数)：提示词或证据任何变化都换键，
 // 无需手工失效。档位3 的输出还依赖模型在循环中「读到了什么」——条目记录每次工具调用的
 // (工具, 入参, 输出指纹)，命中前在当前代码图上重放这些调用，任一输出指纹变化即判陈旧并重算。
-// 只缓存成功调用；调用失败不落盘（下次重试）。并发安全。
+// 只缓存成功调用与工具预算耗尽（后者为负缓存）；其余调用失败不落盘（下次重试）。并发安全。
 type CachedProvider struct {
 	inner Provider // 被包装的真实 provider
 	dir   string   // 缓存目录
@@ -78,6 +82,9 @@ func (c *CachedProvider) Complete(ctx context.Context, req Request) (Response, e
 	if e, ok := c.load(key); ok {
 		if replayValid(ctx, e.Reads, req.Tools) {
 			c.bump(func(s *CacheStats) { s.Hits++; s.SavedTokens += e.Usage.TotalTokens() })
+			if e.Exhausted {
+				return Response{}, ErrToolBudgetExhausted
+			}
 			return Response{Text: []byte(e.Text), Usage: e.Usage}, nil
 		}
 		c.bump(func(s *CacheStats) { s.Stale++ })
@@ -89,6 +96,9 @@ func (c *CachedProvider) Complete(ctx context.Context, req Request) (Response, e
 		ctx, scope = withToolScope(ctx, req.Tools)
 	}
 	resp, err := c.inner.Complete(ctx, req)
+	if errors.Is(err, ErrToolBudgetExhausted) && scope != nil {
+		_ = c.save(key, cacheEntry{Exhausted: true, Reads: scope.Reads()})
+	}
 	if err != nil {
 		return resp, err
 	}
@@ -101,10 +111,10 @@ func (c *CachedProvider) Complete(ctx context.Context, req Request) (Response, e
 }
 
 // Cached 请求当前是否可由缓存直接满足（条目存在且读集仍有效）；不计入命中统计。
-// 上层据此只对「需付费」的调用扣预算。
+// 上层据此只对「需付费」的调用扣预算；负缓存条目不算（其后的退回调用仍可能付费）。
 func (c *CachedProvider) Cached(ctx context.Context, req Request) bool {
 	e, ok := c.load(c.key(req))
-	return ok && replayValid(ctx, e.Reads, req.Tools)
+	return ok && !e.Exhausted && replayValid(ctx, e.Reads, req.Tools)
 }
 
 // bump 在锁内更新统计。

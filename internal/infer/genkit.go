@@ -3,6 +3,8 @@ package infer
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -60,8 +62,8 @@ func (p *genkitProvider) Name() string { return p.name }
 
 // Complete 实现 Provider：system + prompt（+ 可选输出 schema、工具循环）。
 // 超时与取消由 ctx 与 p.timeout 共同约束；工具经 ctx 分发到本次请求的实现。
-func (p *genkitProvider) Complete(ctx context.Context, req Request) (Response, error) {
-	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+func (p *genkitProvider) Complete(parent context.Context, req Request) (Response, error) {
+	ctx, cancel := context.WithTimeout(parent, p.timeout)
 	defer cancel()
 	opts := []ai.GenerateOption{
 		ai.WithModel(p.model),
@@ -81,14 +83,25 @@ func (p *genkitProvider) Complete(ctx context.Context, req Request) (Response, e
 		}
 	}
 	resp, err := genkit.Generate(ctx, p.g, opts...)
+	// 工具循环耗尽轮数，或本次时限到期而外层未取消：交上层退回无工具单次调用（重新计时）。
+	if len(req.Tools) > 0 && (errors.Is(err, ai.ErrMaxTurnsExceeded) ||
+		errors.Is(ctx.Err(), context.DeadlineExceeded) && parent.Err() == nil) {
+		p.addUsage(usageOf(resp)) // 已消耗的轮次照样计量
+		return Response{}, fmt.Errorf("%w: %v", ErrToolBudgetExhausted, err)
+	}
 	if err != nil {
 		return Response{}, err
 	}
 	u := usageOf(resp)
+	p.addUsage(u)
+	return Response{Text: []byte(resp.Text()), Usage: u}, nil
+}
+
+// addUsage 累加用量（并发安全）。
+func (p *genkitProvider) addUsage(u Usage) {
 	p.usageMu.Lock()
 	p.usage.Add(u)
 	p.usageMu.Unlock()
-	return Response{Text: []byte(resp.Text()), Usage: u}, nil
 }
 
 // usageOf 一次生成响应的用量（网关未上报时仅计调用次数）。

@@ -34,6 +34,7 @@ type SinkPattern struct {
 	EnvelopeType string `yaml:"envelope_type,omitempty"` // 真实信封结构体类型 ID；空 = 走 response_envelope 或无信封
 	DataField    string `yaml:"data_field,omitempty"`    // 信封中承载 data 的字段 JSON 名
 	ErrField     string `yaml:"err_field,omitempty"`     // 信封中承载错误对象的字段 JSON 名
+	ErrRaw       bool   `yaml:"-"`                       // err 形参原样进入 ErrField（非 err.Error() 等派生）：不带业务码的错误按其自身序列化
 	BranchOnErr  bool   `yaml:"branch_on_err,omitempty"` // 同一调用点按 err 是否为 nil 分流成功/失败信封
 	Raw          bool   `yaml:"raw,omitempty"`           // 框架原生写出器：data 即响应体本身，无业务信封
 	Auto         bool   `yaml:"-"`                       // 自动发现（非手写），报告中标注来源

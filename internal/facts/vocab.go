@@ -10,6 +10,20 @@ import (
 // UnresolvedCode 信封码占位：该错误行的码无法静态确定（排序置于最后，LLM 兜底的目标行）。
 const UnresolvedCode = -1
 
+// UncodedCode 信封码占位：该错误行的错误值由仓库外构造（errors.New、fmt.Errorf、三方库 error），
+// 不携带业务码，包装器把它原样序列化进信封——静态确定的结论，不是缺口。
+const UncodedCode = -2
+
+// DynamicCode 信封码占位：该错误行的业务码取自运行时值（上游响应字段等），来源确定但取值集合不可枚举——
+// 静态确定的结论，不是缺口；来源见 ResponseFact.ErrSource。
+const DynamicCode = -3
+
+// 占位码行的 CodeRef（与 UncodedCode / DynamicCode 一一对应）。
+const (
+	CodeRefUncoded = "uncoded"
+	CodeRefDynamic = "dynamic"
+)
+
 // GapAnyMarker any 类缺口描述中的标记子串。
 const GapAnyMarker = "any/interface{}"
 
@@ -80,7 +94,8 @@ const (
 // GapWrapperPrefix 「写出函数没被识别为响应包装器」缺口的描述前缀（后接函数符号 ID）。
 const GapWrapperPrefix = "response wrapper not summarized: "
 
-// SortResponses 响应行稳定排序：成功（码 0）在前，业务错误码升序，未解析行最后，同码按写出点。
+// SortResponses 响应行稳定排序：成功（码 0）在前，业务错误码升序，其后依次为动态码、不带业务码、未解析行，
+// 同码按写出点。
 func SortResponses(rows []ResponseFact) {
 	sort.Slice(rows, func(i, j int) bool {
 		a, b := rows[i], rows[j]
@@ -91,23 +106,37 @@ func SortResponses(rows []ResponseFact) {
 			if a.Envelope.Code == b.Envelope.Code && a.Failure != b.Failure {
 				return !a.Failure // 同码：成功体在前、错误分支在后
 			}
+			if ra, rb := codeRank(a.Envelope.Code), codeRank(b.Envelope.Code); ra != rb {
+				return ra < rb
+			}
 			if a.Envelope.Code != b.Envelope.Code {
-				// 成功(0)最前; -1(未解析)最后; 其余升序
-				if a.Envelope.Code == 0 {
-					return true
-				}
-				if b.Envelope.Code == 0 {
-					return false
-				}
-				if a.Envelope.Code == UnresolvedCode {
-					return false
-				}
-				if b.Envelope.Code == UnresolvedCode {
-					return true
-				}
 				return a.Envelope.Code < b.Envelope.Code
 			}
 		}
 		return a.Sink < b.Sink
 	})
+}
+
+// 响应行排序档位（codeRank 返回值）：成功、具体业务码、动态码、不带业务码、未解析。
+const (
+	rankSuccess = iota
+	rankBusiness
+	rankDynamic
+	rankUncoded
+	rankUnresolved
+)
+
+// codeRank 信封码的排序档位；未知的负数占位码与未解析同档。
+func codeRank(code int) int {
+	switch {
+	case code == 0:
+		return rankSuccess
+	case code > 0:
+		return rankBusiness
+	case code == DynamicCode:
+		return rankDynamic
+	case code == UncodedCode:
+		return rankUncoded
+	}
+	return rankUnresolved
 }

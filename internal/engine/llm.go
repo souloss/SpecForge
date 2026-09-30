@@ -38,6 +38,12 @@ const llmShapePrefix = "llm/shape/"
 // rootDataName 成功响应 data 本身为 any 时，补出形状的组件名主干。
 const rootDataName = "Data"
 
+// siteContextRadius 来源点就地源码窗口的半径（行；窗口裁剪到所在函数边界）。
+const siteContextRadius = 20
+
+// maxSiteContexts 单个 operation 注入的来源点窗口数上限（超出者模型可用工具自读）。
+const maxSiteContexts = 8
+
 // truncatedMark 源码截断标记（提示模型可用 read_source 工具取剩余部分）。
 const truncatedMark = "\n// …(truncated; use read_source for the rest)"
 
@@ -201,6 +207,7 @@ func (lp *llmPhase) prepare(it *gapItem) {
 	if hasAnyGap(it.cp.Gaps, facts.GapErrorPrefix) {
 		it.task.ErrorCatalog = lp.catalogSubset(it.sl)
 	}
+	it.task.SiteContexts = lp.siteContexts(it.sl, sites)
 	it.targets = lp.shapeTargets(it.cp)
 	for _, t := range it.targets {
 		it.task.ShapeGaps = append(it.task.ShapeGaps, t.gap)
@@ -326,11 +333,7 @@ func dynamicSites(cp facts.ContractPayload) []string {
 		if r.Envelope == nil || r.Envelope.Code != facts.UnresolvedCode || r.ErrSource == "" {
 			continue
 		}
-		for _, s := range strings.Split(r.ErrSource, ", ") {
-			if s = strings.TrimSpace(s); s != "" {
-				out = append(out, s)
-			}
-		}
+		out = append(out, facts.SplitSites(r.ErrSource)...)
 	}
 	return out
 }
@@ -418,6 +421,56 @@ func (lp *llmPhase) slice(handler string, focus []string) sliceEvidence {
 	}
 	sort.Strings(ev.reach)
 	return ev
+}
+
+// siteSpan 来源点在切片中的定位：所在文件、所在函数的行区间与来源点行号。
+type siteSpan struct {
+	file       string // 绝对路径
+	start, end int    // 所在函数的行区间
+	line       int    // 来源点行号
+}
+
+// locateSite 按「@基名:行号」在切片可达函数中定位来源点（按函数 ID 有序取首个包含者，结果确定）。
+func (lp *llmPhase) locateSite(sl sliceEvidence, site string) (siteSpan, bool) {
+	at := strings.LastIndex(site, "@")
+	colon := strings.LastIndex(site, ":")
+	if at < 0 || colon < at {
+		return siteSpan{}, false
+	}
+	base := site[at+1 : colon]
+	line, err := strconv.Atoi(site[colon+1:])
+	if err != nil {
+		return siteSpan{}, false
+	}
+	for _, fn := range sl.reach {
+		file, start, end, _, ok := lp.prog.FuncSource(fn)
+		if ok && filepath.Base(file) == base && start <= line && line <= end {
+			return siteSpan{file: file, start: start, end: end, line: line}, true
+		}
+	}
+	return siteSpan{}, false
+}
+
+// siteContexts 每个来源点所在函数内 ±siteContextRadius 行的带行号源码（有序、去重、限量）。
+func (lp *llmPhase) siteContexts(sl sliceEvidence, sites []string) []infer.SiteContext {
+	var out []infer.SiteContext
+	for _, site := range sites {
+		if len(out) == maxSiteContexts {
+			break
+		}
+		sp, ok := lp.locateSite(sl, site)
+		if !ok {
+			continue
+		}
+		lines := lp.prog.FileLines(sp.file)
+		from, to := max(sp.start, sp.line-siteContextRadius), min(sp.end, sp.line+siteContextRadius, len(lines))
+		var b strings.Builder
+		for l := from; l <= to; l++ {
+			fmt.Fprintf(&b, "%d| %s\n", l, lines[l-1])
+		}
+		out = append(out, infer.SiteContext{Site: site, File: lp.prog.RelPath(sp.file), Code: b.String()})
+	}
+	return out
 }
 
 // containsFocus 函数 [start,end] 是否包含某个聚焦点（聚焦点只有文件基名 + 行号）。
@@ -520,7 +573,9 @@ func isIdentRune(r rune) bool {
 // ---- 产出复核与写回 ---------------------------------------------------------
 
 // applyErrorCodes 错误码写回：每个 codeRef 须①命中目录（全名或无歧义末段名）②常量名在切片源码中出现
-// （行级证据）；通过者展开为独立错误行（Source=llm）。声明 exhaustive 且无一拒绝时移除「未解析」行。
+// （行级证据）；通过者展开为独立错误行（Source=llm）。来源点定性须①回指未解析行的某个来源点②该点能在切片中定位
+// （catalog 类其码另按上述两条复核）；dynamic/uncoded 类按类合并为占位码行。
+// 无一拒绝时，声明 exhaustive 且有码被采纳、或未解析行的全部来源点都已定性，移除「未解析」行与错误缺口。
 func (lp *llmPhase) applyErrorCodes(out *gapOutcome, r *infer.GapResolution, sl sliceEvidence) {
 	unresolved := -1
 	for i, row := range out.cp.Responses {
@@ -529,7 +584,7 @@ func (lp *llmPhase) applyErrorCodes(out *gapOutcome, r *infer.GapResolution, sl 
 			break
 		}
 	}
-	if unresolved < 0 || len(r.ErrorCodes) == 0 {
+	if unresolved < 0 || len(r.ErrorCodes) == 0 && len(r.ErrorSites) == 0 {
 		return
 	}
 	base := out.cp.Responses[unresolved]
@@ -541,37 +596,140 @@ func (lp *llmPhase) applyErrorCodes(out *gapOutcome, r *infer.GapResolution, sl 
 	}
 	rejected := 0
 	for _, ec := range r.ErrorCodes {
-		sym, entry, ok := lp.lookupCode(ec.CodeRef)
-		if !ok {
-			rejected++ // 幻觉 codeRef（目录外或末段名有歧义）
+		if !lp.acceptCode(out, ec.CodeRef, base, sl, present) {
+			lp.logReject(out, "code "+ec.CodeRef, "not in catalog or not in slice")
+			rejected++
+		}
+	}
+	codeAccepted := out.accepted
+
+	// 来源点定性：按「@file:line」回指（容忍模型改写表达式部分）。
+	pending := map[string]bool{} // 未解析行中尚未定性的来源点位置
+	for _, site := range facts.SplitSites(base.ErrSource) {
+		pending[siteKey(site)] = true
+	}
+	classified := map[string][]string{} // kind → 来源点（dynamic / uncoded 合并成行）
+	for _, rs := range r.ErrorSites {
+		key := siteKey(rs.Site)
+		sp, located := lp.locateSite(sl, rs.Site)
+		if _, known := pending[key]; !known || !located {
+			lp.logReject(out, "site "+rs.Site, "not a site of the unresolved row, or not in slice")
+			rejected++
 			continue
 		}
-		ev, found := lp.findIdent(sl, lastSeg(sym))
-		if !found {
-			rejected++ // 目录内但本 operation 切片里从未出现：无证据不成事实
+		switch rs.Kind {
+		case infer.SiteKindCatalog:
+			ok := len(rs.CodeRefs) > 0
+			for _, ref := range rs.CodeRefs {
+				ok = lp.acceptCode(out, ref, base, sl, present) && ok
+			}
+			if !ok {
+				lp.logReject(out, "site "+rs.Site, "catalog codes missing or rejected")
+				rejected++
+				continue
+			}
+		case infer.SiteKindDynamic, infer.SiteKindUncoded:
+			classified[rs.Kind] = append(classified[rs.Kind], rs.Site)
+			out.evidence = append(out.evidence, lp.lineEvidence(sp.file, sp.line, "llm:error-site "+rs.Kind))
+		default:
+			lp.logReject(out, "site "+rs.Site, "unknown kind "+rs.Kind)
+			rejected++
 			continue
 		}
-		if present[sym] {
-			continue // 静态已定的行不重复
+		pending[key] = false
+	}
+	for _, kind := range []string{infer.SiteKindDynamic, infer.SiteKindUncoded} {
+		if len(classified[kind]) == 0 {
+			continue
 		}
-		present[sym] = true
-		ev.Quote = "llm:error-code " + lastSeg(sym) + " ← " + ev.Quote
-		out.evidence = append(out.evidence, ev)
+		code, ref, msg := facts.DynamicCode, facts.CodeRefDynamic, llmDynamicMsg
+		if kind == infer.SiteKindUncoded {
+			code, ref, msg = facts.UncodedCode, facts.CodeRefUncoded, llmUncodedMsg
+		}
 		out.cp.Responses = append(out.cp.Responses, facts.ResponseFact{
 			Status: base.Status, Source: string(facts.SourceLLM),
-			Envelope:     &facts.Envelope{Code: entry.Code, CodeRef: sym, Msg: entry.Msg},
-			Sink:         filepath.Base(ev.File) + ":" + strconv.Itoa(ev.StartLine),
+			Envelope:     &facts.Envelope{Code: code, CodeRef: ref, Msg: msg},
+			Sink:         base.Sink,
+			ErrSource:    facts.JoinSites(classified[kind]),
 			EnvelopeType: base.EnvelopeType,
 		})
 		out.accepted++
-		out.minConf = min(out.minConf, facts.VerificationCap(facts.VerifyTyped))
+		out.minConf = min(out.minConf, facts.VerificationCap(facts.VerifySymbol))
 	}
 	out.rejected += rejected
-	if r.Exhaustive && rejected == 0 && out.accepted > 0 {
+
+	allSites := len(pending) > 0
+	for _, open := range pending {
+		allSites = allSites && !open
+	}
+	if rejected == 0 && (r.Exhaustive && codeAccepted > 0 || allSites) {
 		out.cp.Responses = append(out.cp.Responses[:unresolved], out.cp.Responses[unresolved+1:]...)
 		out.cp.Gaps = dropGaps(out.cp.Gaps, facts.GapErrorPrefix)
 	}
 	facts.SortResponses(out.cp.Responses)
+}
+
+// reject 记一条被复核拒绝的 LLM 答案（计数 + 调试日志）。
+func (lp *llmPhase) reject(out *gapOutcome, item, reason string) {
+	out.rejected++
+	lp.logReject(out, item, reason)
+}
+
+// logReject 复核拒绝的调试日志（--verbose 可见，便于定位模型答案为何被丢弃）。
+func (lp *llmPhase) logReject(out *gapOutcome, item, reason string) {
+	lp.log.Debug("LLM 答案复核拒绝", "op", out.cp.OperationID, "item", item, "reason", reason)
+}
+
+// LLM 定性的占位码行文案（与静态定性行区分来源）。
+const (
+	llmDynamicMsg = "business code passed through at runtime (classified by LLM)"
+	llmUncodedMsg = "error without business code (classified by LLM)"
+)
+
+// acceptCode 复核一个 codeRef 并写回错误行：目录外/末段歧义/切片中未出现返回 false；
+// 已有同码行（静态或本次已采纳）视为通过但不重复写。
+func (lp *llmPhase) acceptCode(out *gapOutcome, codeRef string, base facts.ResponseFact, sl sliceEvidence, present map[string]bool) bool {
+	sym, entry, ok := lp.lookupCode(codeRef)
+	if !ok {
+		return false // 幻觉 codeRef（目录外或末段名有歧义）
+	}
+	ev, found := lp.findIdent(sl, lastSeg(sym))
+	if !found {
+		return false // 目录内但本 operation 切片里从未出现：无证据不成事实
+	}
+	if present[sym] {
+		return true // 静态已定的行不重复
+	}
+	present[sym] = true
+	ev.Quote = "llm:error-code " + lastSeg(sym) + " ← " + ev.Quote
+	out.evidence = append(out.evidence, ev)
+	out.cp.Responses = append(out.cp.Responses, facts.ResponseFact{
+		Status: base.Status, Source: string(facts.SourceLLM),
+		Envelope:     &facts.Envelope{Code: entry.Code, CodeRef: sym, Msg: entry.Msg},
+		Sink:         filepath.Base(ev.File) + ":" + strconv.Itoa(ev.StartLine),
+		EnvelopeType: base.EnvelopeType,
+	})
+	out.accepted++
+	out.minConf = min(out.minConf, facts.VerificationCap(facts.VerifyTyped))
+	return true
+}
+
+// siteKey 来源点的位置键「基名:行号」（表达式部分不参与匹配）。
+func siteKey(site string) string {
+	if i := strings.LastIndex(site, "@"); i >= 0 {
+		return site[i+1:]
+	}
+	return site
+}
+
+// lineEvidence 单行证据（带内容指纹与「标签 ← 源码行」引文）。
+func (lp *llmPhase) lineEvidence(file string, line int, label string) facts.Evidence {
+	lines := lp.prog.FileLines(file)
+	quote := ""
+	if line >= 1 && line <= len(lines) {
+		quote = strings.TrimSpace(lines[line-1])
+	}
+	return facts.Evidence{File: file, StartLine: line, EndLine: line, BlobSHA: lp.prog.FileHash(file), Quote: label + " ← " + quote}
 }
 
 // lookupCode codeRef → (全限定符号, 目录条目)。末段名在目录中有歧义时拒绝（不猜包）。
@@ -653,28 +811,36 @@ func (lp *llmPhase) applyShapes(out *gapOutcome, shapes []infer.ResolvedShape, i
 	if len(shapes) == 0 || len(it.targets) == 0 {
 		return
 	}
-	byID := map[string]shapeTarget{}
+	byID := map[string]shapeTarget{} // 缺口 ID → 目标；模型常回抄缺口描述原文，也按描述回指
 	for _, t := range it.targets {
 		byID[t.gap.ID] = t
+		if _, dup := byID[t.gapText]; !dup {
+			byID[t.gapText] = t
+		}
 	}
 	text, tokens := lp.sliceText(it.sl)
+	tagged := lp.taggedFields(it.sl)
+	for name := range tagged {
+		tokens[name] = true
+	}
 	type rowState struct {
-		sc   *schema.Schema
-		base string
-		arr  bool
-		evs  []facts.Evidence
+		sc       *schema.Schema
+		base     string
+		arr      bool
+		evs      []facts.Evidence
+		gapTexts []string // 命中的缺口描述（含原文回抄），闭合后从 cp.Gaps 删除
 	}
 	rows := map[int]*rowState{}
 	var order []int
 	for _, sh := range shapes {
 		t, ok := byID[sh.Gap]
 		if !ok {
-			out.rejected++
+			lp.reject(out, "shape "+sh.Gap, "unknown gap")
 			continue
 		}
-		node, evs, err := lp.shapeSchema(sh.Shape, text, tokens, it.sl)
+		node, evs, err := lp.shapeSchema(sh.Shape, text, tokens, tagged, it.sl)
 		if err != nil {
-			out.rejected++
+			lp.reject(out, "shape "+sh.Gap, err.Error())
 			continue
 		}
 		st := rows[t.row]
@@ -685,13 +851,18 @@ func (lp *llmPhase) applyShapes(out *gapOutcome, shapes []infer.ResolvedShape, i
 		}
 		replaced, ok := replaceAt(st.sc, t.gap.Path, node)
 		if !ok {
-			out.rejected++
+			lp.reject(out, "shape "+sh.Gap, "path not in base schema")
 			continue
 		}
 		st.sc, st.evs = replaced, append(st.evs, evs...)
-		out.cp.Gaps = dropGaps(out.cp.Gaps, t.gapText)
+		st.gapTexts = append(st.gapTexts, t.gapText)
 		out.accepted++
 		out.minConf = min(out.minConf, facts.VerificationCap(facts.VerifyText))
+		// 模型回抄缺口描述原文（如「list is interface{}/any in source」）时代码缺口已按描述闭合；
+		// 按 ID 的写回会把这条原文当成缺口留下，导致该行缺口没关掉 → 报告仍低置信。
+		for _, g := range st.gapTexts {
+			out.cp.Gaps = dropGaps(out.cp.Gaps, g)
+		}
 	}
 	sort.Ints(order)
 	for _, ri := range order {
@@ -710,6 +881,12 @@ func (lp *llmPhase) applyShapes(out *gapOutcome, shapes []infer.ResolvedShape, i
 		if st.arr {
 			row.SchemaType = "[]" + id
 		}
+		// 无字段的形状（空对象）没有字段证据，证据闸门会丢弃整条 schema 事实；
+		// 与静态 shapeOf 同口径，以 handler 首行兜底作出处。
+		if len(st.evs) == 0 && len(it.sl.snippets) > 0 {
+			h := it.sl.snippets[0]
+			st.evs = append(st.evs, lp.lineEvidence(h.File, h.Line, "llm:shape"))
+		}
 		for i := range st.evs {
 			st.evs[i].File = lp.prog.AbsPath(st.evs[i].File)
 		}
@@ -721,8 +898,10 @@ func (lp *llmPhase) applyShapes(out *gapOutcome, shapes []infer.ResolvedShape, i
 	}
 }
 
-// shapeSchema 形状树 → schema（verify.Shape 做语言无关核对），并为每个字段名在切片中定位证据行。
-func (lp *llmPhase) shapeSchema(n *infer.ShapeNode, text string, tokens map[string]bool, sl sliceEvidence) (*schema.Schema, []facts.Evidence, error) {
+// shapeSchema 形状树 → schema（verify.Shape 做语言无关核对），并为每个字段名定位证据行：
+// 切片内字符串字面量优先，其次切片引用结构体的序列化字段声明，最后切片内标识符。
+func (lp *llmPhase) shapeSchema(n *infer.ShapeNode, text string, tokens map[string]bool,
+	tagged map[string]facts.Evidence, sl sliceEvidence) (*schema.Schema, []facts.Evidence, error) {
 	sc, names, err := verify.Shape(n, text, tokens)
 	if err != nil {
 		return nil, nil, err
@@ -730,6 +909,9 @@ func (lp *llmPhase) shapeSchema(n *infer.ShapeNode, text string, tokens map[stri
 	var evs []facts.Evidence
 	for _, name := range names {
 		ev, ok := lp.findStringLit(sl, name)
+		if !ok {
+			ev, ok = tagged[name]
+		}
 		if !ok {
 			ev, ok = lp.findIdent(sl, name)
 		}
@@ -791,6 +973,21 @@ func shapeHash(sc *schema.Schema) string {
 	b, _ := json.Marshal(sc)
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:])[:shapeHashLen]
+}
+
+// taggedFields 切片函数体引用到的结构体的 JSON 字段名 → 字段声明行证据（前端无类型信息时为空）。
+func (lp *llmPhase) taggedFields(sl sliceEvidence) map[string]facts.Evidence {
+	out := map[string]facts.Evidence{}
+	idx, ok := lp.prog.(frontend.StructIndex)
+	if !ok {
+		return out
+	}
+	for _, fs := range idx.JSONFieldsIn(sl.reach) {
+		ev := lp.lineEvidence(fs.File, fs.Line, "")
+		ev.Quote = strings.TrimPrefix(ev.Quote, " ← ")
+		out[fs.JSON] = ev
+	}
+	return out
 }
 
 // sliceText 切片全量可达函数的源码文本及其单词集合（标识符、字符串与 tag 中的单词）。

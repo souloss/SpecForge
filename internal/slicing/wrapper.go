@@ -155,12 +155,13 @@ func patternOf(fnID string, flows []writeFlow, status int) (profile.SinkPattern,
 			continue
 		}
 		if f.guardedBy != profile.NoSlot {
-			name, ok := f.fieldOf[f.guardedBy]
+			name, raw := f.fieldOf[f.guardedBy]
+			ok := raw
 			if !ok {
 				name, ok = f.derivedOf[f.guardedBy]
 			}
 			if ok {
-				p.ErrSlot, p.ErrField, hasFailure = f.guardedBy, name, true
+				p.ErrSlot, p.ErrField, p.ErrRaw, hasFailure = f.guardedBy, name, raw, true
 				p.ErrEnvelopeType, p.FailureCode = f.envType, f.code
 				if f.mapFields != nil {
 					envFlows = append(envFlows, f)

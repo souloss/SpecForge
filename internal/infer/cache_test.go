@@ -2,6 +2,7 @@ package infer
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -148,5 +149,24 @@ func (n *noToolsProvider) Complete(_ context.Context, req Request) (Response, er
 func TestResolveGapsOffline(t *testing.T) {
 	if _, err := ResolveGaps(context.Background(), nil, "", GapTask{}, nil); err != ErrNoProvider {
 		t.Fatalf("want ErrNoProvider, got %v", err)
+	}
+}
+
+// TestCachedProviderRemembersExhaustedToolLoop 工具预算耗尽被负缓存：重跑直接报耗尽、不再调用内层，且不算「已缓存」。
+func TestCachedProviderRemembersExhaustedToolLoop(t *testing.T) {
+	inner := &turnsProvider{}
+	p := NewCachedProvider(inner, t.TempDir()).(*CachedProvider)
+	ctx := context.Background()
+	req := Request{System: "s", Prompt: "p", Tools: []ToolSpec{{Name: "read_source"}}, MaxTurns: 3}
+	for i := 0; i < 2; i++ {
+		if _, err := p.Complete(ctx, req); !errors.Is(err, ErrToolBudgetExhausted) {
+			t.Fatalf("run %d: err = %v, want ErrToolBudgetExhausted", i, err)
+		}
+	}
+	if len(inner.reqs) != 1 {
+		t.Fatalf("inner calls = %d, want 1", len(inner.reqs))
+	}
+	if p.Cached(ctx, req) {
+		t.Fatal("an exhausted entry must not count as cached")
 	}
 }
