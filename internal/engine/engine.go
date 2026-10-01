@@ -138,6 +138,8 @@ type Result struct {
 	LowConf          int              `json:"low_confidence"`    // 低置信 operation 数
 	Gaps             []string         `json:"gaps"`              // LLM 兜底前的静态缺口（"METHOD /path: gap1; gap2"）
 	RemainingGaps    int              `json:"remaining_gaps"`    // 最终仍有缺口的 operation 数
+	Conflicts        int              `json:"conflicts"`         // Contract Graph 中保留的候选冲突数
+	UnknownSchemas   int              `json:"unknown_schemas"`   // 显式未知 schema 数
 	OpFailures       []OpFailure      `json:"op_failures"`       // 分析失败被隔离的 operation
 	LLM              llmStats         `json:"llm"`               // LLM 兜底统计
 	LLMCalls         int              `json:"llm_calls"`         // 实际发生的模型调用次数（缓存命中不计）
@@ -288,6 +290,8 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	}
 	res.SchemaTypes = len(schemaFacts)
 	res.FactsList, res.Facts = factList, len(factList)
+	graph := graphFromFacts(factList)
+	res.Conflicts, res.UnknownSchemas = graphStats(graph)
 	for _, f := range factList {
 		// 按 operation 计：schema 事实会随引用它的每个 operation 重复出现，按事实计会虚高
 		if f.Kind == facts.KindContract && f.Confidence < lowConfThreshold {
@@ -299,7 +303,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	}
 	doc, err := compiler.Compile(compiler.Input{
 		ServiceName: res.Service, Framework: an.Framework,
-		Facts: factList, Schemas: schemaFacts,
+		Graph: graph,
 	})
 	if err != nil {
 		return nil, err

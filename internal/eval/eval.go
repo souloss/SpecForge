@@ -71,16 +71,16 @@ type oasParam struct {
 }
 
 type oasBody struct {
-	Content map[string]struct {
-		Schema oasSchema `yaml:"schema"`
-	} `yaml:"content"`
+	Content map[string]oasMedia `yaml:"content"`
+}
+
+type oasMedia struct {
+	Schema oasSchema `yaml:"schema"`
 }
 
 type oasResp struct {
-	Description string `yaml:"description"`
-	Content     map[string]struct {
-		Schema oasSchema `yaml:"schema"`
-	} `yaml:"content"`
+	Description string              `yaml:"description"`
+	Content     map[string]oasMedia `yaml:"content"`
 }
 
 type oasSchema struct {
@@ -104,11 +104,70 @@ func loadDoc(path string) (*oasDoc, error) {
 	if err != nil {
 		return nil, err
 	}
+	if strings.Contains(string(data), "openapi:") {
+		document, err := openapi.LoadEvaluation(path)
+		if err != nil {
+			return nil, fmt.Errorf("load %s through OpenAPI adapter: %w", path, err)
+		}
+		return evaluationDoc(document), nil
+	}
 	d, err := parseDoc(data)
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return d, nil
+}
+
+func evaluationDoc(input *openapi.EvaluationDocument) *oasDoc {
+	result := &oasDoc{Paths: map[string]map[string]oasOp{}, Components: oasComponents{Schemas: map[string]oasSchema{}}}
+	if input == nil {
+		return result
+	}
+	for name, schema := range input.Components.Schemas {
+		result.Components.Schemas[name] = evaluationSchema(schema)
+	}
+	for path, methods := range input.Paths {
+		result.Paths[path] = map[string]oasOp{}
+		for method, operation := range methods {
+			item := oasOp{OperationID: operation.OperationID, Responses: map[string]oasResp{}}
+			for _, parameter := range operation.Parameters {
+				item.Parameters = append(item.Parameters, oasParam{Name: parameter.Name, In: parameter.In, Required: parameter.Required, Schema: evaluationSchema(parameter.Schema)})
+			}
+			if operation.RequestBody != nil {
+				body := &oasBody{Content: map[string]oasMedia{}}
+				for mediaType, media := range operation.RequestBody.Content {
+					body.Content[mediaType] = oasMedia{Schema: evaluationSchema(media.Schema)}
+				}
+				item.RequestBody = body
+			}
+			for status, response := range operation.Responses {
+				item.Responses[status] = oasResp{Description: response.Description, Content: map[string]oasMedia{}}
+				for mediaType, media := range response.Content {
+					item.Responses[status].Content[mediaType] = oasMedia{Schema: evaluationSchema(media.Schema)}
+				}
+			}
+			result.Paths[path][method] = item
+		}
+	}
+	return result
+}
+
+func evaluationSchema(input openapi.EvaluationSchema) oasSchema {
+	result := oasSchema{Ref: input.Ref, Type: input.Type, Format: input.Format, Enum: append([]interface{}(nil), input.Enum...), Required: append([]string(nil), input.Required...), Nullable: input.Nullable, AdditionalProperties: input.AdditionalProperties}
+	if len(input.Props) > 0 {
+		result.Props = map[string]oasSchema{}
+		for name, property := range input.Props {
+			result.Props[name] = evaluationSchema(property)
+		}
+	}
+	if input.Items != nil {
+		item := evaluationSchema(*input.Items)
+		result.Items = &item
+	}
+	for _, branch := range input.AllOf {
+		result.AllOf = append(result.AllOf, evaluationSchema(branch))
+	}
+	return result
 }
 
 // Evaluate 对比 truth 与生成 spec。

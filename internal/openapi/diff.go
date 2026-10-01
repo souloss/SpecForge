@@ -2,7 +2,10 @@ package openapi
 
 import (
 	"fmt"
+	"sort"
+
 	"github.com/pb33f/libopenapi/what-changed"
+	changeModel "github.com/pb33f/libopenapi/what-changed/model"
 )
 
 type Change struct {
@@ -43,8 +46,31 @@ func CompareDocuments(leftPath, rightPath string) (*DocumentDiff, error) {
 		if change == nil {
 			continue
 		}
-		kind := fmt.Sprintf("change-%d", change.ChangeType)
+		kind := changeKind(change.ChangeType)
 		result.Changes = append(result.Changes, Change{Property: change.Property, Path: change.Path, Kind: kind, Breaking: change.Breaking, Original: change.Original, New: change.New})
 	}
+	sort.SliceStable(result.Changes, func(i, j int) bool {
+		if result.Changes[i].Path != result.Changes[j].Path {
+			return result.Changes[i].Path < result.Changes[j].Path
+		}
+		return result.Changes[i].Kind < result.Changes[j].Kind
+	})
 	return result, nil
+}
+
+func changeKind(kind int) string {
+	switch kind {
+	case changeModel.Modified:
+		return "modified"
+	case changeModel.PropertyAdded:
+		return "property_added"
+	case changeModel.ObjectAdded:
+		return "object_added"
+	case changeModel.ObjectRemoved:
+		return "object_removed"
+	case changeModel.PropertyRemoved:
+		return "property_removed"
+	default:
+		return fmt.Sprintf("change-%d", kind)
+	}
 }

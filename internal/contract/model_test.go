@@ -43,6 +43,33 @@ func TestResolveMarksConflictsWithoutOrderWinner(t *testing.T) {
 	}
 }
 
+func TestStableMarshalSortsEvidenceAndCandidates(t *testing.T) {
+	g := New()
+	op := &Operation{Method: "GET", Path: "/x", Parameters: map[string][]Candidate[Parameter]{
+		"id": {
+			{Value: Parameter{Name: "id", In: "path"}, Confidence: .8, Status: StatusDeclared, Evidence: []Evidence{{Source: SourceOpenAPI, Location: Location{File: "b.yaml"}}}},
+			{Value: Parameter{Name: "id", In: "path"}, Confidence: 1, Status: StatusVerified, Evidence: []Evidence{{Source: SourceCode, Location: Location{File: "a.go"}}}},
+		},
+	}}
+	if err := g.AddOperation(op); err != nil {
+		t.Fatal(err)
+	}
+	first, err := g.MarshalStable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := g.MarshalStable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(first) != string(second) {
+		t.Fatalf("stable marshal changed between calls:\n%s\n%s", first, second)
+	}
+	if string(first) == "" || !contains(string(first), "a.go") {
+		t.Fatalf("stable graph omitted evidence: %s", first)
+	}
+}
+
 func TestUnknownSchemaIsExplicit(t *testing.T) {
 	g := New()
 	g.Schemas["Upload"] = &Schema{Unknown: true, UnknownReason: "generic map could not be resolved"}
@@ -52,6 +79,16 @@ func TestUnknownSchemaIsExplicit(t *testing.T) {
 	}
 	if string(data) == "" || !contains(string(data), "unknown_reason") {
 		t.Fatalf("unknown schema was not serialized: %s", data)
+	}
+}
+
+func TestGraphDiffSeparatesOperationChanges(t *testing.T) {
+	left, right := New(), New()
+	left.Operations["GET /old"] = &Operation{Key: "GET /old", Method: "GET", Path: "/old", State: OperationVerified}
+	right.Operations["GET /new"] = &Operation{Key: "GET /new", Method: "GET", Path: "/new", State: OperationSourceOnly}
+	diff := Diff(left, right)
+	if len(diff.Changes) != 2 || diff.Changes[0].Kind != "operation_added" || diff.Changes[1].Kind != "operation_removed" {
+		t.Fatalf("unexpected graph diff: %+v", diff)
 	}
 }
 

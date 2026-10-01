@@ -11,15 +11,30 @@ import (
 )
 
 type Workflow struct {
-	ID    string `yaml:"workflowId" json:"workflow_id"`
-	Steps []Step `yaml:"steps" json:"steps"`
+	ID      string         `yaml:"workflowId" json:"workflow_id"`
+	Summary string         `yaml:"summary,omitempty" json:"summary,omitempty"`
+	Inputs  map[string]any `yaml:"inputs,omitempty" json:"inputs,omitempty"`
+	Outputs map[string]any `yaml:"outputs,omitempty" json:"outputs,omitempty"`
+	Steps   []Step         `yaml:"steps" json:"steps"`
 }
 
 type Step struct {
-	ID           string `yaml:"stepId" json:"step_id"`
-	OperationRef string `yaml:"operationId,omitempty" json:"operation_id,omitempty"`
-	Success      bool   `yaml:"-" json:"success"`
-	Executed     bool   `yaml:"-" json:"executed"`
+	ID              string          `yaml:"stepId" json:"step_id"`
+	OperationRef    string          `yaml:"operationId,omitempty" json:"operation_id,omitempty"`
+	OperationPath   string          `yaml:"operationPath,omitempty" json:"operation_path,omitempty"`
+	Parameters      []StepParameter `yaml:"parameters,omitempty" json:"parameters,omitempty"`
+	RequestBody     any             `yaml:"requestBody,omitempty" json:"request_body,omitempty"`
+	SuccessCriteria []any           `yaml:"successCriteria,omitempty" json:"success_criteria,omitempty"`
+	Outputs         map[string]any  `yaml:"outputs,omitempty" json:"outputs,omitempty"`
+	FailureActions  []any           `yaml:"onFailure,omitempty" json:"failure_actions,omitempty"`
+	Success         bool            `yaml:"-" json:"success"`
+	Executed        bool            `yaml:"-" json:"executed"`
+}
+
+type StepParameter struct {
+	Name  string `yaml:"name" json:"name"`
+	In    string `yaml:"in,omitempty" json:"in,omitempty"`
+	Value any    `yaml:"value,omitempty" json:"value,omitempty"`
 }
 
 type WorkflowGraph struct {

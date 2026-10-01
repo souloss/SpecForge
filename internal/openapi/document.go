@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/pb33f/libopenapi"
 	validator "github.com/pb33f/libopenapi-validator"
@@ -29,8 +30,10 @@ type Diagnostic struct {
 
 // Document wraps the parsed and validated OpenAPI document.
 type Document struct {
-	document  libopenapi.Document
-	validator validator.Validator
+	document     libopenapi.Document
+	validator    validator.Validator
+	validateOnce sync.Once
+	validation   []Diagnostic
 }
 
 var _ runtimevalidation.Validator = (*Document)(nil)
@@ -86,8 +89,11 @@ func (d *Document) Validate() []Diagnostic {
 	if d == nil || d.validator == nil {
 		return []Diagnostic{{Code: "document_unavailable", Message: "OpenAPI document is not loaded"}}
 	}
-	valid, errs := d.validator.ValidateDocument()
-	return diagnosticsFromValidator(valid, errs, "document_invalid")
+	d.validateOnce.Do(func() {
+		valid, errs := d.validator.ValidateDocument()
+		d.validation = diagnosticsFromValidator(valid, errs, "document_invalid")
+	})
+	return append([]Diagnostic(nil), d.validation...)
 }
 
 // ValidateRequest checks one request and reports whether the operation exists.

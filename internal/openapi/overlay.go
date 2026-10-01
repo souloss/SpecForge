@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/pb33f/libopenapi"
 )
@@ -59,5 +60,9 @@ func formatDiagnostics(diagnostics []Diagnostic) string {
 	if len(diagnostics) == 0 {
 		return ""
 	}
-	return diagnostics[0].Code + ": " + diagnostics[0].Message
+	parts := make([]string, 0, len(diagnostics))
+	for _, diagnostic := range diagnostics {
+		parts = append(parts, diagnostic.Code+": "+diagnostic.Message)
+	}
+	return strings.Join(parts, "; ")
 }

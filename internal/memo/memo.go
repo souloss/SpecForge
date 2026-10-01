@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -91,6 +92,8 @@ type Store struct {
 	dir string // 缓存根目录；空 = 禁用
 }
 
+var storeMu sync.Mutex
+
 // New 创建 Store（惰性，首次 Save 时建目录）；dir 为空时 Load 恒未命中、Save 为空操作。
 func New(dir string) *Store { return &Store{dir: dir} }
 
@@ -100,6 +103,8 @@ func (s *Store) Load(fp string, names ...string) (map[string][]byte, bool) {
 	if s.dir == "" {
 		return nil, false
 	}
+	storeMu.Lock()
+	defer storeMu.Unlock()
 	entry := filepath.Join(s.dir, fp)
 	out := make(map[string][]byte, len(names))
 	for _, n := range names {
@@ -119,6 +124,8 @@ func (s *Store) Save(fp string, files map[string][]byte) error {
 	if s.dir == "" {
 		return nil
 	}
+	storeMu.Lock()
+	defer storeMu.Unlock()
 	if err := os.MkdirAll(s.dir, 0o755); err != nil {
 		return err
 	}

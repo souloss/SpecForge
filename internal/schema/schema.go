@@ -8,7 +8,10 @@ type Schema struct {
 	Format         string // int64|int32|double|date-time
 	Ref            string // $ref 名（命名类型引用）
 	Items          *Schema
+	AllOf          []*Schema
 	OneOf          []*Schema
+	AnyOf          []*Schema
+	Not            *Schema
 	Props          []Prop // object 属性（有序）
 	Required       []string
 	Enum           []string // 枚举值（字符串化）
@@ -23,6 +26,11 @@ type Schema struct {
 	MinItems       *int // 数组最少元素数（validator min/len 作用于 slice）
 	MaxItems       *int // 数组最多元素数
 	Pattern        string
+	Default        any
+	Examples       []any
+	Discriminator  string
+	ReadOnly       bool
+	WriteOnly      bool
 	NoBody         bool // RawMessage 透传: 无 schema
 }
 

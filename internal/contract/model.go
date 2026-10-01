@@ -5,6 +5,7 @@ package contract
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 )
 
 type EvidenceSource string
@@ -93,7 +94,14 @@ type Operation struct {
 	Key         string                            `json:"key"`
 	Path        string                            `json:"path"`
 	Method      string                            `json:"method"`
+	OperationID string                            `json:"operation_id,omitempty"`
+	Summary     string                            `json:"summary,omitempty"`
+	Description string                            `json:"description,omitempty"`
+	Tags        []string                          `json:"tags,omitempty"`
 	State       OperationState                    `json:"state"`
+	Confidence  float64                           `json:"confidence,omitempty"`
+	Gaps        []string                          `json:"gaps,omitempty"`
+	Security    []string                          `json:"security,omitempty"`
 	Parameters  map[string][]Candidate[Parameter] `json:"parameters,omitempty"`
 	RequestBody []Candidate[RequestBody]          `json:"request_body,omitempty"`
 	Responses   map[string][]Candidate[Response]  `json:"responses,omitempty"`
@@ -102,28 +110,47 @@ type Operation struct {
 }
 
 type Parameter struct {
-	Name     string `json:"name"`
-	In       string `json:"in"`
-	Required bool   `json:"required"`
-	Schema   string `json:"schema,omitempty"`
+	Name        string   `json:"name"`
+	In          string   `json:"in"`
+	Required    bool     `json:"required"`
+	Schema      string   `json:"schema,omitempty"`
+	Type        string   `json:"type,omitempty"`
+	Format      string   `json:"format,omitempty"`
+	Items       string   `json:"items,omitempty"`
+	Enum        []string `json:"enum,omitempty"`
+	Description string   `json:"description,omitempty"`
+	Origin      string   `json:"origin,omitempty"`
 }
 
 type RequestBody struct {
 	ContentType string `json:"content_type"`
 	Schema      string `json:"schema,omitempty"`
+	Envelope    string `json:"envelope,omitempty"`
+	DataField   string `json:"data_field,omitempty"`
 	Required    bool   `json:"required"`
 }
 
 type Response struct {
-	Status      string `json:"status"`
-	Description string `json:"description,omitempty"`
-	ContentType string `json:"content_type,omitempty"`
-	Schema      string `json:"schema,omitempty"`
+	Status       string `json:"status"`
+	Description  string `json:"description,omitempty"`
+	ContentType  string `json:"content_type,omitempty"`
+	Schema       string `json:"schema,omitempty"`
+	Envelope     string `json:"envelope,omitempty"`
+	DataField    string `json:"data_field,omitempty"`
+	MapValueType string `json:"map_value_type,omitempty"`
+	Code         int    `json:"code,omitempty"`
+	CodeKnown    bool   `json:"code_known,omitempty"`
+	HasBody      bool   `json:"has_body,omitempty"`
+	Raw          bool   `json:"raw,omitempty"`
+	Failure      bool   `json:"failure,omitempty"`
+	Sink         string `json:"sink,omitempty"`
+	ErrSource    string `json:"err_source,omitempty"`
 }
 
 type Schema struct {
 	Ref                  string             `json:"ref,omitempty"`
 	Types                []string           `json:"types,omitempty"`
+	Description          string             `json:"description,omitempty"`
 	Properties           map[string]*Schema `json:"properties,omitempty"`
 	Items                *Schema            `json:"items,omitempty"`
 	AdditionalProperties *bool              `json:"additional_properties,omitempty"`
@@ -170,7 +197,36 @@ func (g *Graph) AddOperation(op *Operation) error {
 }
 
 func (g *Graph) MarshalStable() ([]byte, error) {
+	if g == nil {
+		return []byte(`{"operations":{},"schemas":{}}`), nil
+	}
+	normalize(g)
 	return json.Marshal(g)
+}
+
+func normalize(g *Graph) {
+	for _, op := range g.Operations {
+		sort.Strings(op.Tags)
+		sort.SliceStable(op.Evidence, func(i, j int) bool { return evidenceKey(op.Evidence[i]) < evidenceKey(op.Evidence[j]) })
+		for name, candidates := range op.Parameters {
+			sort.SliceStable(candidates, func(i, j int) bool { return candidateKey(candidates[i]) < candidateKey(candidates[j]) })
+			op.Parameters[name] = candidates
+		}
+		sort.SliceStable(op.RequestBody, func(i, j int) bool { return candidateKey(op.RequestBody[i]) < candidateKey(op.RequestBody[j]) })
+		for status, candidates := range op.Responses {
+			sort.SliceStable(candidates, func(i, j int) bool { return candidateKey(candidates[i]) < candidateKey(candidates[j]) })
+			op.Responses[status] = candidates
+		}
+	}
+}
+
+func evidenceKey(e Evidence) string {
+	return fmt.Sprintf("%s|%s|%d|%d|%s|%s", e.Source, e.Location.File, e.Location.StartLine, e.Location.StartCol, e.Location.JSONPath, e.Summary)
+}
+
+func candidateKey[T any](candidate Candidate[T]) string {
+	value, _ := json.Marshal(candidate.Value)
+	return fmt.Sprintf("%s|%.6f|%s", value, candidate.Confidence, candidate.Status)
 }
 
 func (g *Graph) Unmarshal(data []byte) error {

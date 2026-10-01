@@ -245,23 +245,13 @@ func writeSchema(w func(string, ...interface{}), b *strings.Builder, sc *schema.
 	}
 	if sc.Ref != "" {
 		w("%s$ref: '#/components/schemas/%s'\n", pad, escapeRef(sc.Ref))
-		return
 	}
-	if len(sc.OneOf) > 0 {
-		w("%soneOf:\n", pad)
-		for _, variant := range sc.OneOf {
-			var buf strings.Builder
-			writeSchema(func(format string, args ...interface{}) { fmt.Fprintf(&buf, format, args...) }, &buf, variant, indent+2, pad+"  ")
-			lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
-			if len(lines) == 0 || lines[0] == "" {
-				continue
-			}
-			w("%s  - %s\n", pad, strings.TrimPrefix(lines[0], pad+"  "))
-			for _, line := range lines[1:] {
-				w("%s    %s\n", pad, strings.TrimPrefix(line, pad+"  "))
-			}
-		}
-		return
+	writeSchemaCompositions(w, indent, pad, "allOf", sc.AllOf)
+	writeSchemaCompositions(w, indent, pad, "oneOf", sc.OneOf)
+	writeSchemaCompositions(w, indent, pad, "anyOf", sc.AnyOf)
+	if sc.Not != nil {
+		w("%snot:\n", pad)
+		writeSchema(w, b, sc.Not, indent+2, pad+"  ")
 	}
 	if sc.Type != "" {
 		if sc.Nullable {
@@ -276,6 +266,25 @@ func writeSchema(w func(string, ...interface{}), b *strings.Builder, sc *schema.
 	}
 	if sc.Description != "" {
 		w("%sdescription: %s\n", pad, quoteIfNeeded(sc.Description))
+	}
+	if sc.Default != nil {
+		writeSchemaValue(w, pad, "default", sc.Default)
+	}
+	if len(sc.Examples) > 0 {
+		w("%sexamples:\n", pad)
+		for _, example := range sc.Examples {
+			writeSchemaSequenceValue(w, pad+"  ", example)
+		}
+	}
+	if sc.Discriminator != "" {
+		w("%sdiscriminator:\n", pad)
+		w("%s  propertyName: %s\n", pad, quoteIfNeeded(sc.Discriminator))
+	}
+	if sc.ReadOnly {
+		w("%sreadOnly: true\n", pad)
+	}
+	if sc.WriteOnly {
+		w("%swriteOnly: true\n", pad)
 	}
 	if len(sc.Enum) > 0 {
 		w("%senum:\n", pad)
@@ -323,6 +332,59 @@ func writeSchema(w func(string, ...interface{}), b *strings.Builder, sc *schema.
 	}
 	if sc.Unknown {
 		w("%sx-specforge-unknown: %s\n", pad, quoteIfNeeded(sc.UnknownWhy))
+	}
+}
+
+func writeSchemaCompositions(w func(string, ...interface{}), indent int, pad, key string, variants []*schema.Schema) {
+	if len(variants) == 0 {
+		return
+	}
+	w("%s%s:\n", pad, key)
+	for _, variant := range variants {
+		var buf strings.Builder
+		writeSchema(func(format string, args ...interface{}) { fmt.Fprintf(&buf, format, args...) }, &buf, variant, indent+2, pad+"  ")
+		lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+		if len(lines) == 0 || lines[0] == "" {
+			continue
+		}
+		w("%s  - %s\n", pad, strings.TrimPrefix(lines[0], pad+"  "))
+		for _, line := range lines[1:] {
+			w("%s    %s\n", pad, strings.TrimPrefix(line, pad+"  "))
+		}
+	}
+}
+
+func writeSchemaValue(w func(string, ...interface{}), pad, key string, value any) {
+	switch v := value.(type) {
+	case string:
+		w("%s%s: %s\n", pad, key, quoteIfNeeded(v))
+	case bool:
+		w("%s%s: %t\n", pad, key, v)
+	case int:
+		w("%s%s: %d\n", pad, key, v)
+	case int64:
+		w("%s%s: %d\n", pad, key, v)
+	case float64:
+		w("%s%s: %s\n", pad, key, numStr(v))
+	default:
+		w("%s%s: %s\n", pad, key, quoteIfNeeded(fmt.Sprint(v)))
+	}
+}
+
+func writeSchemaSequenceValue(w func(string, ...interface{}), pad string, value any) {
+	switch v := value.(type) {
+	case string:
+		w("%s- %s\n", pad, quoteIfNeeded(v))
+	case bool:
+		w("%s- %t\n", pad, v)
+	case int:
+		w("%s- %d\n", pad, v)
+	case int64:
+		w("%s- %d\n", pad, v)
+	case float64:
+		w("%s- %s\n", pad, numStr(v))
+	default:
+		w("%s- %s\n", pad, quoteIfNeeded(fmt.Sprint(v)))
 	}
 }
 

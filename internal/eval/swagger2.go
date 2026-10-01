@@ -119,9 +119,7 @@ func convertSwag2Op(s swag2Op) oasOp {
 	for _, p := range s.Parameters {
 		if p.In == paramInBody {
 			if p.Schema != nil {
-				op.RequestBody = &oasBody{Content: map[string]struct {
-					Schema oasSchema `yaml:"schema"`
-				}{jsonMediaType: {Schema: *p.Schema}}}
+				op.RequestBody = &oasBody{Content: map[string]oasMedia{jsonMediaType: {Schema: *p.Schema}}}
 			}
 			continue
 		}
@@ -133,9 +131,7 @@ func convertSwag2Op(s swag2Op) oasOp {
 	for status, r := range s.Responses {
 		resp := oasResp{Description: r.Description}
 		if r.Schema != nil {
-			resp.Content = map[string]struct {
-				Schema oasSchema `yaml:"schema"`
-			}{jsonMediaType: {Schema: *r.Schema}}
+			resp.Content = map[string]oasMedia{jsonMediaType: {Schema: *r.Schema}}
 		}
 		op.Responses[status] = resp
 	}

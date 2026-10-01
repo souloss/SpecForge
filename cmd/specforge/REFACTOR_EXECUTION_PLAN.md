@@ -565,3 +565,17 @@ runtime validation: 请求及响应样本结果
 | 两次独立生成 SHA-256 | `3da761c3e3bd41347b7705d67b81cef27bfc8908da441d173f05deee3f568ac0`，一致 |
 
 实现落点：`internal/contract` 提供候选事实、证据、冲突和未知 Schema；`internal/openapi` 封装 libopenapi、libopenapi-validator、Overlay、Arazzo 和文档 Diff；`internal/runtime` 提供稳定的请求/响应验证结果；生成链和 `specforge verify` 在输出边界执行 reload 与规范验证。`internal/eval` 通过 OpenAPI adapter 加载文档后保留字段展平指标。未引入 kin-openapi；进程级流量探针仍由调用方负责采集样本。
+
+## 15. 后续执行记录
+
+本轮在上述基线之上完成了可审查的迁移和优化：
+
+- Contract Graph 进入 engine -> compiler 主链路；源码 facts 先转换为候选、证据和状态，再由 compiler 生成现有确定性输出。
+- Contract Graph 增加 operation 元数据、响应候选、Schema 组合字段、稳定序列化、显式冲突统计和独立 Graph Diff。
+- OpenAPI adapter 增加 OpenAPI -> Contract Graph importer，并让 OAS3 eval 通过 adapter 投影；Swagger 2 兼容转换保持独立。
+- Schema IR/renderer 支持 `allOf`、`anyOf`、`not`、default、examples、discriminator、readOnly、writeOnly。
+- Runtime 边界增加 `handler_error`、`schema_unresolved` 状态和脱敏结构样本；文档验证结果缓存，memo 命中会重新加载并验证产物。
+- OpenAPI 文档 Diff 使用稳定语义 change kind；Overlay 保留全部诊断；Arazzo 模型保留 operationPath、inputs/outputs、parameters、requestBody、successCriteria 和 failure actions。
+- memo Store 增加进程内并发读写保护；报告新增 Graph conflict 和 unknown schema 统计。
+
+复跑结果：`go test ./...`、`go test -race ./...`、`go vet ./...`、`go build ./...` 全部通过；sample 生成/verify/eval 全部通过且指标为 1.000；两次 sample 生成 SHA-256 一致；chi fixture 5/5 路由通过生成和规范校验。

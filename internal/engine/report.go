@@ -13,6 +13,7 @@ import (
 
 	"github.com/specforge/specforge/internal/compiler"
 	"github.com/specforge/specforge/internal/memo"
+	"github.com/specforge/specforge/internal/openapi"
 )
 
 // renderReport 置信度报告（F11）：低置信明细 + 证据闸门丢弃清单 + 隔离失败 + 全量概览。
@@ -21,6 +22,7 @@ func renderReport(doc *compiler.Document, res *Result) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# SpecForge 置信度报告\n\n")
 	fmt.Fprintf(&b, "- operations: %d, schema types: %d\n", len(doc.Operations), len(doc.Schemas))
+	fmt.Fprintf(&b, "- Contract Graph conflicts: %d, unknown schemas: %d\n", res.Conflicts, res.UnknownSchemas)
 	fmt.Fprintf(&b, "- 低置信 operation (<%.1f): %d\n", lowConfThreshold, res.LowConf)
 	if len(res.Gaps) > 0 {
 		fmt.Fprintf(&b, "- 静态缺口 operation: %d（LLM 兜底后仍有缺口: %d）\n", len(res.Gaps), res.RemainingGaps)
@@ -171,6 +173,15 @@ func loadMemo(store *memo.Store, fp, outDir string) (*Result, bool) {
 		return nil, false
 	}
 	delete(files, summaryFile)
+	doc, err := openapi.LoadBytes(files[specFile], filepath.Join(outDir, specFile))
+	if err != nil {
+		return nil, false
+	}
+	valid := doc.Validate()
+	doc.Close()
+	if len(valid) > 0 {
+		return nil, false
+	}
 	if writeArtifacts(outDir, files) != nil {
 		return nil, false
 	}

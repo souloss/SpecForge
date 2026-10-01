@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/specforge/specforge/internal/contract"
 	"github.com/specforge/specforge/internal/facts"
 	"github.com/specforge/specforge/internal/schema"
 )
@@ -18,6 +19,7 @@ import (
 type Input struct {
 	ServiceName string
 	Framework   string
+	Graph       *contract.Graph
 	Facts       []*facts.Fact
 	Schemas     map[string]*schema.Schema
 }
@@ -155,6 +157,10 @@ type SecScheme struct {
 
 // Compile 执行编译流水线（Stage 3–7 的 P0 形态）。
 func Compile(in Input) (*Document, error) {
+	if in.Graph != nil {
+		graphFacts, graphSchemas := factsFromGraph(in.Graph)
+		in.Facts, in.Schemas = graphFacts, graphSchemas
+	}
 	d := &Document{
 		Title:     in.ServiceName + " API",
 		Version:   "1.0.0",
@@ -455,7 +461,22 @@ func writeShape(b *strings.Builder, sc *schema.Schema, depth int) {
 		for _, variant := range sc.OneOf {
 			writeShape(b, variant, depth+1)
 		}
-		return
+	}
+	if len(sc.AllOf) > 0 {
+		b.WriteString("all:")
+		for _, variant := range sc.AllOf {
+			writeShape(b, variant, depth+1)
+		}
+	}
+	if len(sc.AnyOf) > 0 {
+		b.WriteString("any:")
+		for _, variant := range sc.AnyOf {
+			writeShape(b, variant, depth+1)
+		}
+	}
+	if sc.Not != nil {
+		b.WriteString("not:")
+		writeShape(b, sc.Not, depth+1)
 	}
 	fmt.Fprintf(b, "t:%s;f:%s;nb:%v;n:%v;ad:%v;", sc.Type, sc.Format, sc.NoBody, sc.Nullable, sc.Additional)
 	if len(sc.Enum) > 0 {

@@ -121,3 +121,26 @@ func TestRenderOneOfSchema(t *testing.T) {
 		t.Fatalf("oneOf missing from YAML:\n%s", yaml)
 	}
 }
+
+func TestRenderSchemaCompositionAndMetadata(t *testing.T) {
+	doc := &Document{Title: "schema", Version: "1", Schemas: []NamedSchema{{Name: "Shape", Schema: &schema.Schema{
+		AllOf:         []*schema.Schema{{Type: "object"}},
+		AnyOf:         []*schema.Schema{{Type: "string"}, {Type: "integer"}},
+		Not:           &schema.Schema{Type: "null"},
+		Description:   "shape",
+		Default:       "x",
+		Examples:      []any{"y"},
+		Discriminator: "kind",
+		ReadOnly:      true,
+		WriteOnly:     true,
+	}}}}
+	yaml, err := RenderYAML(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"allOf:", "anyOf:", "not:", "default: x", "examples:", "discriminator:", "readOnly: true", "writeOnly: true"} {
+		if !strings.Contains(string(yaml), want) {
+			t.Fatalf("%q missing from YAML:\n%s", want, yaml)
+		}
+	}
+}

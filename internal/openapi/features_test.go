@@ -3,6 +3,7 @@ package openapi
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -53,6 +54,29 @@ func TestCompareDocumentsIsSeparateFromContractGraphDiff(t *testing.T) {
 	}
 }
 
+func TestCompareDocumentsUsesStableChangeKinds(t *testing.T) {
+	dir := t.TempDir()
+	left := filepath.Join(dir, "left.yaml")
+	right := filepath.Join(dir, "right.yaml")
+	if err := os.WriteFile(left, []byte(validDocument), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed := []byte(`openapi: 3.1.0
+info: {title: changed, version: '1'}
+paths: {}
+`)
+	if err := os.WriteFile(right, changed, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	diff, err := CompareDocuments(left, right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diff.Changes) == 0 || diff.Changes[0].Kind == "" || strings.HasPrefix(diff.Changes[0].Kind, "change-") {
+		t.Fatalf("change kind was not normalized: %+v", diff.Changes)
+	}
+}
+
 func TestLoadArazzoKeepsWorkflowExecutionStateSeparate(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "workflow.yaml")
 	data := []byte(`arazzo: 1.0.1
@@ -67,7 +91,13 @@ workflows:
   - workflowId: fetch
     steps:
       - stepId: get
-        operationId: getPet
+        operationPath: api.getPet
+        parameters:
+          - name: id
+            in: query
+            value: 42
+        successCriteria:
+          - condition: $statusCode == 200
 `)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
 		t.Fatal(err)
@@ -76,7 +106,28 @@ workflows:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(result.Diagnostics) != 0 || len(result.Graph.Workflows) != 1 || result.Graph.Workflows[0].Steps[0].Executed {
+	step := result.Graph.Workflows[0].Steps[0]
+	if len(result.Diagnostics) != 0 || len(result.Graph.Workflows) != 1 || step.Executed || step.OperationPath != "api.getPet" || len(step.Parameters) != 1 || step.Parameters[0].Name != "id" || step.Parameters[0].Value != 42 {
 		t.Fatalf("Arazzo result = %+v", result)
+	}
+}
+
+func TestImportBuildsContractGraphWithRefsAndResponses(t *testing.T) {
+	graph, err := ImportBytes([]byte(validDocument), "openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	op, ok := graph.Operations["GET /pets/{id}"]
+	if !ok {
+		t.Fatalf("operation not imported: %+v", graph.Operations)
+	}
+	if op.OperationID != "getPet" || len(op.Parameters["id"]) != 1 || len(op.Responses["200"]) != 1 {
+		t.Fatalf("unexpected imported operation: %+v", op)
+	}
+	if graph.Schemas["Pet"] == nil || graph.Schemas["Pet"].Properties["name"] == nil {
+		t.Fatalf("schema was not imported: %+v", graph.Schemas)
+	}
+	if op.Responses["200"][0].Value.Schema != "Pet" {
+		t.Fatalf("response reference was not retained: %+v", op.Responses["200"])
 	}
 }
