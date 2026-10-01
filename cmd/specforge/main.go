@@ -164,11 +164,11 @@ const Version = engine.Version
 func newRootCmd(a *app) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "specforge",
-		Short: "Agent-native OpenAPI generator for Go services (zero annotations)",
-		Long: `SpecForge extracts the real HTTP contract of a Go (fiber) service straight from source code —
+		Short: "Agent-native OpenAPI generator for source repositories (zero annotations)",
+		Long: `SpecForge extracts the real HTTP contract of a Go (Fiber, Gin or chi) service straight from source code —
 routes, parameters, request bodies, response envelopes and business error codes — and compiles it
 into a deterministic OpenAPI 3.1 document in which every fact is traceable to a file:line.
-No annotations are required.
+No annotations are required. Non-Go source trees can use the generic LLM frontend with --llm.
 
 Typical workflow:
   1. specforge doctor                 check toolchain, repository and LLM configuration

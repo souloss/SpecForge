@@ -82,15 +82,16 @@ type oasResp struct {
 }
 
 type oasSchema struct {
-	Ref      string               `yaml:"$ref"`
-	Type     interface{}          `yaml:"type"`
-	Format   string               `yaml:"format"`
-	Enum     []interface{}        `yaml:"enum"`
-	Props    map[string]oasSchema `yaml:"properties"`
-	Required []string             `yaml:"required"`
-	Items    *oasSchema           `yaml:"items"`
-	Nullable bool                 `yaml:"nullable"`
-	AllOf    []oasSchema          `yaml:"allOf"` // 组合 schema（swag 信封收窄 `Envelope{result=T}` 的产出形态）
+	Ref                  string               `yaml:"$ref"`
+	Type                 interface{}          `yaml:"type"`
+	Format               string               `yaml:"format"`
+	Enum                 []interface{}        `yaml:"enum"`
+	Props                map[string]oasSchema `yaml:"properties"`
+	Required             []string             `yaml:"required"`
+	Items                *oasSchema           `yaml:"items"`
+	Nullable             bool                 `yaml:"nullable"`
+	AdditionalProperties interface{}          `yaml:"additionalProperties"`
+	AllOf                []oasSchema          `yaml:"allOf"` // 组合 schema（swag 信封收窄 `Envelope{result=T}` 的产出形态）
 }
 
 // maxFlattenDepth schema 展平的递归深度上限（防自引用类型无限展开）。
@@ -166,6 +167,7 @@ func Evaluate(truthPath, specPath string) (*Metrics, error) {
 			// 请求字段（展平）
 			sf := flattenBody(specOp.RequestBody, spec.Components.Schemas)
 			tf := flattenBody(truthOp.RequestBody, truth.Components.Schemas)
+			sf = allowOpenObjectExtras(sf, tf, openBodyPaths(truthOp.RequestBody, truth.Components.Schemas))
 			reqTP, reqFP, reqFN = accumulate(reqTP, reqFP, reqFN, sf, tf)
 			totalFields += len(tf)
 			for _, f := range setDiffStr(tf, sf) {
@@ -178,6 +180,7 @@ func Evaluate(truthPath, specPath string) (*Metrics, error) {
 			// 响应字段（200 响应体整体展平，含信封字段）
 			sr := flattenRespData(specOp.Responses, spec.Components.Schemas)
 			tr := flattenRespData(truthOp.Responses, truth.Components.Schemas)
+			sr = allowOpenObjectExtras(sr, tr, openRespDataPaths(truthOp.Responses, truth.Components.Schemas))
 			respTP, respFP, respFN = accumulate(respTP, respFP, respFN, sr, tr)
 			shapeTP, shapeFP, shapeFN = accumulate(shapeTP, shapeFP, shapeFN, dropRequired(sr), dropRequired(tr))
 			totalFields += len(tr)
@@ -225,6 +228,120 @@ func flattenBody(b *oasBody, comps map[string]oasSchema) []string {
 		return flattenResolve(&mt.Schema, "", true, comps, 0)
 	}
 	return nil
+}
+
+// openBodyPaths returns object paths whose truth schema permits arbitrary
+// additional properties. Concrete keys under those objects are compatible
+// with the contract and must not count as spurious fields.
+func openBodyPaths(b *oasBody, comps map[string]oasSchema) map[string]bool {
+	if b == nil {
+		return nil
+	}
+	for _, mt := range b.Content {
+		return openSchemaPaths(&mt.Schema, "", comps, 0)
+	}
+	return nil
+}
+
+// openRespDataPaths is the response counterpart of openBodyPaths. Evaluation
+// compares the successful response body, so only its 200 schema is relevant.
+func openRespDataPaths(rs map[string]oasResp, comps map[string]oasSchema) map[string]bool {
+	r, ok := rs[statusOK]
+	if !ok {
+		return nil
+	}
+	for _, mt := range r.Content {
+		return openSchemaPaths(&mt.Schema, "", comps, 0)
+	}
+	return nil
+}
+
+// openSchemaPaths walks a schema while resolving refs and allOf branches.
+func openSchemaPaths(s *oasSchema, prefix string, comps map[string]oasSchema, depth int) map[string]bool {
+	paths := map[string]bool{}
+	if s == nil || depth > maxFlattenDepth {
+		return paths
+	}
+	if s.Ref != "" {
+		name := refName(s.Ref)
+		if sc, ok := comps[name]; ok {
+			return openSchemaPaths(&sc, prefix, comps, depth)
+		}
+		return paths
+	}
+	if len(s.AllOf) > 0 {
+		merged := mergeAllOf(s, comps, depth)
+		s = &merged
+	}
+	if additionalPropertiesOpen(s.AdditionalProperties) {
+		paths[prefix] = true
+	}
+	for name, prop := range s.Props {
+		path := name
+		if prefix != "" {
+			path = prefix + "." + name
+		}
+		for p := range openSchemaPaths(&prop, path, comps, depth+1) {
+			paths[p] = true
+		}
+	}
+	if s.Items != nil {
+		path := prefix + "[]"
+		for p := range openSchemaPaths(s.Items, path, comps, depth+1) {
+			paths[p] = true
+		}
+	}
+	return paths
+}
+
+func additionalPropertiesOpen(v interface{}) bool {
+	switch value := v.(type) {
+	case bool:
+		return value
+	case map[string]interface{}:
+		return true
+	case map[interface{}]interface{}:
+		return true
+	default:
+		return false
+	}
+}
+
+// allowOpenObjectExtras removes generated descendants that are permitted by
+// an open object in truth. Explicitly declared truth fields are retained so
+// their types and requiredness continue to be compared.
+func allowOpenObjectExtras(spec, truth []string, open map[string]bool) []string {
+	if len(spec) == 0 || len(open) == 0 {
+		return spec
+	}
+	truthPaths := make(map[string]bool, len(truth))
+	for _, field := range truth {
+		path := field
+		if i := strings.IndexByte(path, '|'); i >= 0 {
+			path = path[:i]
+		}
+		truthPaths[path] = true
+	}
+	out := make([]string, 0, len(spec))
+	for _, field := range spec {
+		path := field
+		if i := strings.IndexByte(path, '|'); i >= 0 {
+			path = path[:i]
+		}
+		if truthPaths[path] || !underOpenObject(path, open) {
+			out = append(out, field)
+		}
+	}
+	return out
+}
+
+func underOpenObject(path string, open map[string]bool) bool {
+	for parent := range open {
+		if parent == "" || strings.HasPrefix(path, parent+".") || strings.HasPrefix(path, parent+"[]") {
+			return true
+		}
+	}
+	return false
 }
 
 // flattenResolve $ref → components 解析后再展平（嵌套任意层）。

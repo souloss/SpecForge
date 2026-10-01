@@ -12,6 +12,8 @@
 | 上一版本 | v1.0（架构设计稿） |
 | 评审方式 | 分章评审：第 4–8 章需内核/适配器负责人逐条确认 |
 
+> **实现状态（2026-10）**：本仓库已经交付 Go 静态前端（Fiber、Gin、chi v4/v5）、通用源码 LLM 前端、Fact Graph 到 OpenAPI 3.1 的确定性编译、证据报告、`doctor/gen/ops/explain/eval/cache/version` CLI，以及 memo/LLM 文件缓存。SQLite 事实库、基于 readSet 的反向失效传播、运行时探针、Java/Python/Node 静态前端、破坏性变更 diff、PR 机器人和 MCP Server 仍属于路线图，不应视为当前 CLI 已提供的能力。当前实现的命令、环境变量、产物和验证方式以 [`README.md`](README.md) 与 [`DELIVERY.md`](DELIVERY.md) 为准。
+
 ## 0. v2 导读与变更总览
 
 v1 回答的是「SpecForge 应该长什么样」；v2 回答的是「它具体怎么实现、怎么验证、多少钱、谁来做」。两版之间不是推翻，而是把 v1 中四处「点到为止」的关键设计推到可以直接排开发任务的程度。老读者可以按下表定位增量内容，新读者按顺序通读即可。

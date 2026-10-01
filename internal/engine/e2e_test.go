@@ -208,6 +208,56 @@ func TestGinAdapter(t *testing.T) {
 	}
 }
 
+// TestChiAdapter chi v5 适配器端到端：回调式 Route/Group、路径/query 参数、标准库 JSON 绑定与写出。
+func TestChiAdapter(t *testing.T) {
+	repo := filepath.Join("..", "..", "testdata", "chi-repo")
+	res, err := Run(context.Background(), Config{RepoDir: repo, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("chi sample failed to load: %v", err)
+	}
+	if res.Operations < 3 {
+		t.Fatalf("chi operations = %d, want at least 3", res.Operations)
+	}
+	ops := map[string]compiler.Operation{}
+	for _, op := range res.Doc.Operations {
+		ops[op.Method+" "+op.Path] = op
+	}
+	get, ok := ops["GET /api/users/{id}"]
+	if !ok || len(get.Params) < 2 {
+		t.Fatalf("chi route or params missing: %+v", ops)
+	}
+	params := map[string]string{}
+	for _, p := range get.Params {
+		params[p.In+":"+p.Name] = p.Origin
+	}
+	if params["path:id"] != "chi:URLParam" || params["query:expand"] != "chi:Get" {
+		t.Fatalf("chi params = %v", params)
+	}
+	if len(get.Responses) == 0 || get.Responses[0].SchemaName != "User" {
+		t.Fatalf("chi JSON response missing: %+v", get.Responses)
+	}
+	create, ok := ops["POST /api/users"]
+	if !ok || create.Body == nil || create.Body.SchemaName != "CreateUserRequest" {
+		t.Fatalf("chi request body missing: %+v", create)
+	}
+	statuses := map[string]bool{}
+	for _, response := range create.Responses {
+		statuses[response.Status] = true
+	}
+	if !statuses["200"] || !statuses["400"] {
+		t.Fatalf("chi response statuses missing: %+v", create.Responses)
+	}
+	if _, ok := ops["GET /api/stats"]; !ok {
+		t.Fatalf("chi Group route missing: %+v", ops)
+	}
+	if _, ok := ops["GET /api/method"]; !ok {
+		t.Fatalf("chi Method route missing: %+v", ops)
+	}
+	if _, ok := ops["GET /base-url"]; !ok {
+		t.Fatalf("chi optional BaseURL route missing: %+v", ops)
+	}
+}
+
 // TestGinEnvelopeShapes gin 样本的信封与形状场景（离线）：
 // map 字面量信封包装器（含失败分支固定码）、同状态码多形状 oneOf、m["k"]=v 信封、以及未识别包装器必须显式报缺口。
 func TestGinEnvelopeShapes(t *testing.T) {

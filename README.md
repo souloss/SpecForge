@@ -1,126 +1,147 @@
 # SpecForge
 
-**Agent 原生的 OpenAPI 生成系统** —— 零注解、可溯源、确定性输出。
+**Agent 原生的 OpenAPI 生成器**：从没有注解的代码中提取真实 HTTP 契约，输出可追溯、可复现的 OpenAPI 3.1 文档。
 
-> 实现依据：《SpecForge v2.0 设计文档》（P0+P1 范围：静态全流水线 + IR + 确定性编译 + 评测闭环）
+SpecForge 把静态分析、调用图、类型合成和确定性编译组合成一条流水线。LLM 只处理静态分析明确标记的缺口，所有被采纳的事实都必须能回到源码证据。
 
-## 它做什么
+## 当前能力
 
-给定一个 Go 仓库（fiber/gin 框架），不要求任何注解/注释，产出：
+### Go 静态前端
 
-- **openapi.yaml** —— OpenAPI 3.1 规范文档
-- **report.md** —— 置信度报告（低置信项 + 证据链 + 未解析项清单）
+仓库根目录包含 `go.mod` 时自动使用 Go 前端。内置适配器覆盖：
 
-核心能力（对应设计文档 F1–F12 的 P0 子集）：
+- Fiber (`github.com/gofiber/fiber/v2`)
+- Gin (`github.com/gin-gonic/gin`)
+- chi v4 (`github.com/go-chi/chi`)
+- chi v5 (`github.com/go-chi/chi/v5`)
 
-| 能力 | 实现 |
+它们支持路由分组和中间件链、表驱动注册、chi 的 `Group`/`Route` 回调、请求绑定、路径/query/header/cookie 参数、响应写出、业务错误码和嵌套 JSON Schema。
+
+### 通用源码前端
+
+非 Go 仓库可以使用 `--frontend generic --llm`。它会按文件发现路由，再逐 operation 抽取请求和响应契约，并用源码文本核对路径、handler、字段和状态码。该模式需要 LLM，置信度上限为 0.6；未通过核对的结论会被拒绝并保留为缺口。
+
+未登记的 Go Web 框架也可以在 `--llm` 下由模型生成适配器声明。通过符号和签名复核后，声明会保存到 `.specforge/adapters/`，后续运行可复用。
+
+## 输出
+
+`specforge gen` 默认写入 `<repo>/.specforge/out/`：
+
+| 文件 | 用途 |
 |---|---|
-| 路由提取（含通配符组、中间件链、表驱动循环注册） | `internal/adapter/fiber.go` |
-| 请求契约（BodyParser 绑定 + Query/Params/Get/Cookies 扫描 + binding 约束） | `internal/engine/contract.go` |
-| **响应契约追踪**（调用图 + 响应汇聚点 + 信封矩阵） | `internal/slicing/slicer.go` |
-| Schema 合成（嵌套/枚举/可空/omitempty/时间/RawMessage/any 降级） | `internal/typeschema/synth.go` |
-| 横切（中间件→security、错误码目录、通配符展开） | `internal/profile` + engine |
-| 确定性编译（$ref 去重、固定 key 序、逐字节稳定） | `internal/compiler` |
-| 评测（路由召回/参数 F1/字段 F1/信封召回/幻觉率） | `internal/eval` |
+| `openapi.yaml` | 确定性渲染的 OpenAPI 3.1 文档 |
+| `report.md` | 总览、低置信 operation、缺口和证据位置 |
+| `operations.json` | 稳定的 operation 级契约和证据视图，供 `ops`、`explain` 和 Agent 消费 |
 
-## 架构（设计文档 §3.1 的 P0 形态）
-
-```
-loader ── go/packages 类型加载（等价 LSP 桥接）
-   ↓
-codegraph ── 符号表 / 调用边（含实参静态类型）/ 类型图 / 指纹
-   ↓
-adapter(fiber) ── 路由模式抽取（Group/Post/Use + 表驱动解析）
-   ↓
-slicing ── 正向可达 ∩ 响应汇聚点 → 信封矩阵（调用图深处找响应）
-   ↓
-typeschema ── Go 类型 → JSON Schema（§7 映射总表 + 边界 case）
-   ↓
-facts ── API Fact Graph（IR: route/contract/schema/security/errorcatalog/enrichment）
-   ↓
-compiler ── 八阶段流水线 → 确定性 YAML（双跑逐字节自检）
-   ↓
-eval ── ground truth 对比（七项指标）
-```
+运行级缓存默认写入 `<repo>/.specforge/cache/`：`memo/` 缓存完整运行产物，`llm/` 缓存单次模型调用并校验模型实际读取的源码。缓存不含认证信息。
 
 ## 快速开始
 
+环境要求：Go 1.27 或更高版本。
+
 ```bash
-# 构建（Go 1.27）
+# 构建
 go build -o specforge ./cmd/specforge
 
-# 生成（对任何 Go + fiber 仓库）
+# 检查工具链、仓库和画像
+./specforge doctor --repo path/to/repo
+
+# 生成 OpenAPI、报告和 operation 证据
 ./specforge gen --repo path/to/repo
 
-# 带约定画像（信封/中间件语义/通配符规则）
+# 指定服务和输出目录
+./specforge gen --repo . --service service-ipo --out docs/api
+
+# 使用仓库约定画像（默认会自动读取 .specforge/profile.yaml）
 ./specforge gen --repo . --profile .specforge/profile.yaml
 
-# 评测（对照 ground truth）
-./specforge eval --truth truth.yaml --spec out/openapi.yaml
+# 查看低置信 operation，并解释单个 operation 的证据
+./specforge ops --repo . --low-confidence
+./specforge explain POST /api/orders/{id} --repo .
+
+# 对照 ground truth 做评测；--fail-under 可作为 CI 闸门
+./specforge eval --truth truth.yaml --spec .specforge/out/openapi.yaml --fail-under 0.9
 ```
 
-## 验证结果（本仓库 testdata/sample-repo）
-
-样本仓库复刻了设计文档中的全部难点模式：`app.Group("/ipo/v*")` 通配符、
-三层中间件链、`code.WriteResponse` 业务码信封（HTTP 200 + code/msg/data）、
-service 层深处写响应、表驱动循环注册、`map[string]any`、`json.RawMessage`、
-可空指针字段、`time.Time`、枚举常量组、跨接口共享类型。
-
-```
-$ specforge eval --truth ground-truth.yaml --spec openapi.yaml
-
-Route Recall      : 1.000    （路由召回 ≥98% 达标）
-Route Precision   : 1.000
-Param F1          : 1.000    （请求字段 F1 ≥95% 达标）
-Request Field F1  : 1.000
-Response Field F1 : 1.000    （响应字段 F1 ≥90% 达标）
-Envelope Recall   : 1.000    （状态码/信封召回 ≥85% 达标）
-Hallucination     : 0.000    （幻觉率 <1% 达标）
-```
-
-确定性验证：双编译自检 + **跨进程两次运行逐字节一致**。
-
-## 设计原则的落地位置
-
-| 设计原则 | 落地 |
-|---|---|
-| 静态能算准的绝不问模型 | 全管线 0 token；LLM 层（`internal/infer`）仅在静态缺口时介入，无配置时显式降级 |
-| LLM 产出事实而非 YAML | `internal/facts` 强类型 IR；编译器消费 IR |
-| 无证据不成事实 | 每个事实带 `file:line + blobSha` 证据；unknown 显式标记绝不编造 |
-| 确定性 | 固定 key 序渲染器 + 排序不变式 + `CompileTwiceCheck` |
-| 增量就绪 | 代码图全产物带指纹（FileHash/TypeHash）；readSet 依赖三分法已在调用图查询落地 |
-
-## 目录
-
-```
-cmd/specforge/          CLI（gen / eval / version）
-internal/loader/        仓库摄入与服务拓扑
-internal/codegraph/     符号表、调用图、类型图、指纹、局部类型
-internal/adapter/       框架适配器（fiber；gin 部分）
-internal/slicing/       程序切片与响应汇聚点追踪
-internal/typeschema/    类型 → JSON Schema 合成
-internal/facts/         API Fact Graph IR
-internal/profile/       约定画像（信封/中间件/通配符）
-internal/engine/        生成流水线编排
-internal/compiler/      确定性编译器 + YAML 渲染
-internal/eval/          评测基准（七项指标）
-internal/infer/         LLM provider（OpenAI 兼容 + 离线降级）
-testdata/sample-repo/   样本仓库（复刻 trade/ipoServer 难点模式）
-testdata/ground-truth.yaml  人工标注真值
-```
-
-## 测试
+没有 LLM 凭据时，Go 静态路径仍可离线运行；静态缺口会在 `report.md` 中显式保留。启用 `--llm`、`--llm-enrich` 或 `--llm-learn-profile` 时，需要设置：
 
 ```bash
-go test ./...        # 单元 + 端到端精度回归守卫（满分基线）
+export ANTHROPIC_AUTH_TOKEN=...
+# 或 ANTHROPIC_API_KEY=...
+export ANTHROPIC_BASE_URL=https://your-anthropic-compatible-edge.example/v1  # 可选
+export ANTHROPIC_MODEL=deepseek-v4-pro-0813                                      # 可选
 ```
 
-端到端测试 `internal/engine/e2e_test.go` 锁定七项指标满分基线——
-任何使精度回退或破坏确定性的改动都会失败。这是设计文档 §8.5
-「文档进 CI gate」前提的测试化落地。
+常用 LLM 控制项：`--llm-budget` 限制本次新增调用数，`--llm-concurrency` 控制并发，`--fail-on-degraded` 在调用失败或预算耗尽时返回非零退出码。默认单次调用超时可用 `SPECFORGE_LLM_TIMEOUT` 覆盖，设 `SPECFORGE_LLM_THINKING=off` 可关闭扩展思考。
 
-## 后续路线（P2+，见设计文档）
+## CLI 工作流
 
-- SQLite 事实库 + readSet 反向索引 + 失效传播（P2 增量引擎）
-- 约定画像 Agent 自动学习（P3，替代人工 profile.yaml）
-- 多语言适配器（P4）、MCP Server 形态（P5）、运行时探针（P6）
+| 命令 | 作用 |
+|---|---|
+| `doctor` | 检查 Go 工具链、`go.mod`、框架依赖、画像、缓存和 LLM 配置 |
+| `gen` | 分析仓库并生成三份产物 |
+| `ops` | 从最近一次生成结果列出 operation、置信度和缺口 |
+| `explain METHOD PATH` | 展示参数、请求体、响应矩阵和逐行证据 |
+| `eval` | 计算 route、参数、请求/响应字段、信封召回和幻觉率 |
+| `cache stats` / `cache clean` | 查看或清理运行级和 LLM 缓存 |
+| `version` | 打印 CLI 和引擎版本 |
+
+分析和运维命令（`doctor`、`gen`、`ops`、`explain`、`eval`、`cache`、`version`）支持 `--json` 机器模式。stdout 只输出一个版本化 JSON 信封，日志写到 stderr，适合 CI 和脚本消费。
+
+## 架构
+
+```
+frontend
+  ├─ Go: go/packages + codegraph + framework adapters
+  └─ generic: LLM route/contract extraction with source verification
+        ↓
+facts      API Fact Graph（route / contract / schema / security / enrichment）
+        ↓
+slicing    调用图和值流追踪响应汇聚点与错误分支
+        ↓
+compiler   证据闸门、$ref 去重、稳定排序、OpenAPI 3.1 YAML
+        ↓
+eval       ground truth 对比与 CI 质量闸门
+```
+
+主要目录：
+
+```
+cmd/specforge/       CLI（doctor / gen / ops / explain / eval / cache / version）
+internal/frontend/   Go 静态前端与通用 LLM 前端
+internal/adapter/    Fiber、Gin、chi 和可学习的框架适配器
+internal/codegraph/  符号表、调用图、类型图和源码指纹
+internal/slicing/    响应写出、值流和错误流追踪
+internal/typeschema/ Go 类型到 JSON Schema 的合成
+internal/facts/      API Fact Graph 中间表示
+internal/compiler/   确定性编译器和 YAML 渲染器
+internal/eval/       OpenAPI 评测指标和报告
+internal/infer/      LLM provider、任务协议和调用缓存
+internal/memo/       运行级缓存
+testdata/            Fiber、Gin、chi、Echo、Express 和回归真值样本
+```
+
+## 验证
+
+```bash
+go test ./...
+```
+
+端到端回归覆盖 Fiber、Gin 和 chi，并检查路由、参数、请求/响应字段、信封、错误流、确定性和证据输出。样本真值评测可运行：
+
+```bash
+go run ./cmd/specforge gen --repo testdata/sample-repo --no-cache
+go run ./cmd/specforge eval \
+  --truth testdata/ground-truth.yaml \
+  --spec testdata/sample-repo/.specforge/out/openapi.yaml \
+  --fail-under 0.9
+```
+
+当前样本回归基线为 route recall、参数 F1、请求字段 F1、响应字段 F1 和 envelope recall 均为 1.000，幻觉率为 0.000；具体结果以本地测试和生成输入为准。
+
+## 设计与路线图
+
+- [`DESIGN.md`](DESIGN.md)：Fact 生命周期、证据协议、编译器、LLM 编排和增量引擎设计。
+- [`DELIVERY.md`](DELIVERY.md)：当前仓库的实现状态、交付内容、验证命令和已知边界。
+
+当前版本是全量分析 + 运行级 memo/LLM 缓存。SQLite 事实库、readSet 反向索引和失效传播仍属于后续增量引擎路线；Java、Python、Node 的静态前端以及运行时探针也尚未作为内置能力交付。

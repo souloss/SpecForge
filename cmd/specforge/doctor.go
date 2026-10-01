@@ -31,12 +31,12 @@ func newDoctorCmd(a *app) *cobra.Command {
 		Short: "Check toolchain, repository, profile and LLM configuration; list services",
 		Long: `Run quick pre-flight checks before 'gen' without analyzing the code or calling the LLM:
 
-  language   the repository is a project of a supported language (currently: Go)
-  go         a Go toolchain is on PATH (needed to type-check the repository)
+  language   the repository matches the Go or generic source frontend
+  go         a Go toolchain is on PATH (needed by the Go frontend)
   go.mod     --repo points at a module root
-  framework  a supported web framework is a dependency (gofiber/v2, gin)
+  framework  a supported web framework is a dependency (gofiber/v2, gin, chi/v4, chi/v5)
   profile    <repo>/.specforge/profile.yaml parses (absent is fine)
-  llm        whether LLM credentials are configured (only needed for --llm)
+  llm        whether LLM credentials are configured (needed by generic or --llm)
   cache      the cache directory is writable
 
 It also lists the services found in the repository (main packages); these are the names

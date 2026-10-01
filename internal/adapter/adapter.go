@@ -30,10 +30,11 @@ type Route struct {
 
 // Unresolved 归因枚举。
 const (
-	ReasonWildcard  = "wildcard-path"     // 路径含通配符，非合法 OpenAPI path
-	ReasonLoop      = "loop-registration" // 循环/表驱动注册，path 非字面量
-	ReasonDynamic   = "dynamic-path"      // 运行时拼接路径
-	ReasonNoHandler = "no-handler"        // 末参无法解析为符号
+	ReasonWildcard      = "wildcard-path"     // 路径含通配符，非合法 OpenAPI path
+	ReasonLoop          = "loop-registration" // 循环/表驱动注册，path 非字面量
+	ReasonDynamic       = "dynamic-path"      // 运行时拼接路径
+	ReasonDynamicMethod = "dynamic-method"    // HTTP 方法不是静态字符串
+	ReasonNoHandler     = "no-handler"        // 末参无法解析为符号
 )
 
 // Framework 框架适配器契约。
@@ -103,20 +104,33 @@ func (p Primitives) Merge(o Primitives) Primitives {
 }
 
 // registry 内置框架（按识别优先级）。新增框架：在同包新增声明文件并加入此表。
-var registry = []Framework{Fiber, Gin}
+var registry = []Framework{Fiber, Gin, ChiV4, ChiV5}
 
 // Detect 按仓库 import 的包路径识别使用的全部框架（按 registry 顺序，结果确定）。
 func Detect(imports []string) []Framework {
 	var out []Framework
 	for _, fw := range registry {
 		for _, imp := range imports {
-			if strings.HasPrefix(imp, fw.Module()) {
+			if moduleMatches(imp, fw.Module()) {
 				out = append(out, fw)
 				break
 			}
 		}
 	}
 	return out
+}
+
+func moduleMatches(importPath, module string) bool {
+	if importPath == module {
+		return true
+	}
+	rest, ok := strings.CutPrefix(importPath, module+"/")
+	if !ok {
+		return false
+	}
+	// A major-version module path is a distinct module, not a subpackage of
+	// the unversioned path (for example chi/v5 vs chi/middleware).
+	return !(len(rest) >= 2 && rest[0] == 'v' && rest[1] >= '0' && rest[1] <= '9' && (len(rest) == 2 || rest[2] == '/'))
 }
 
 // DetectFramework 首个识别出的框架名（F2，doctor 与产物标题用）；未识别返回空。

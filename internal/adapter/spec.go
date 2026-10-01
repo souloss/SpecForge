@@ -19,6 +19,10 @@ type Spec struct {
 	GroupMethod   string            `json:"groupMethod"`             // 分组方法名（无则空）
 	Verbs         map[string]string `json:"verbs"`                   // 注册方法名 → HTTP 方法
 	HandlerArg    int               `json:"handlerArg"`              // handler 实参下标；-1 = 末位
+	PathArg       int               `json:"pathArg,omitempty"`       // 路径实参下标；0 = 第一个实参
+	PathArgs      map[string]int    `json:"pathArgs,omitempty"`      // 按注册方法覆盖路径实参下标
+	MethodArgs    map[string]int    `json:"methodArgs,omitempty"`    // 按注册方法设置 HTTP 方法实参下标
+	NestedMethods map[string]bool   `json:"nestedMethods,omitempty"` // 回调式分组方法名
 	BodyBinders   []BodyBinder      `json:"bodyBinders,omitempty"`   // 请求体绑定原语
 	StructBinders []StructBinder    `json:"structBinders,omitempty"` // 结构体参数绑定原语
 	ParamReaders  []ParamReader     `json:"paramReaders,omitempty"`  // 单参数读取原语
@@ -35,7 +39,9 @@ func (s Spec) Framework() Framework {
 	}
 	return routerFramework{
 		name: s.Name, short: s.Short, module: s.Module,
-		spec: RouterSpec{RouterTypes: types, GroupMethod: s.GroupMethod, Verbs: s.Verbs, HandlerArg: s.HandlerArg},
+		spec: RouterSpec{RouterTypes: types, GroupMethod: s.GroupMethod, Verbs: s.Verbs,
+			HandlerArg: s.HandlerArg, PathArg: s.PathArg, PathArgs: s.PathArgs,
+			MethodArgs: s.MethodArgs, NestedMethods: s.NestedMethods},
 		prims: Primitives{BodyBinders: s.BodyBinders, StructBinders: s.StructBinders,
 			ParamReaders: s.ParamReaders, Writers: s.Writers},
 	}
@@ -99,7 +105,7 @@ func DetectWith(imports []string, extra []Framework) []Framework {
 	out := Detect(imports)
 	for _, fw := range extra {
 		for _, imp := range imports {
-			if strings.HasPrefix(imp, fw.Module()) {
+			if moduleMatches(imp, fw.Module()) {
 				out = append(out, fw)
 				break
 			}

@@ -1,59 +1,73 @@
-# SpecForge v2.0 完整交付包
+# SpecForge 当前交付说明
 
-Agent 原生的 OpenAPI 生成系统 —— 基于设计文档实现的完整工程（P0+P1 范围）。
+本文记录仓库当前代码的可运行能力。长期架构和产品规划见 [`DESIGN.md`](DESIGN.md)，面向使用者的安装和工作流见 [`README.md`](README.md)。
 
-## 包内容
+## 交付范围
 
-| 路径 | 说明 |
+### 已交付
+
+- Go 1.27 CLI，命令包括 `doctor`、`gen`、`ops`、`explain`、`eval`、`cache` 和 `version`。
+- Go 静态前端：`go/packages` 类型加载、符号/调用图、值流和证据校验。
+- 内置 Go 框架适配器：Fiber、Gin、chi v4、chi v5。
+- 路由分组、中间件链、表驱动注册、通配符路径、chi `Group`/`Route` 回调和 `Method` 注册。
+- 请求体绑定、query/path/header/cookie 参数、validator/binding 约束、响应矩阵和业务错误码追踪。
+- Go 类型到 JSON Schema：嵌套结构、数组、枚举、指针可空、`omitempty`、时间、`json.RawMessage`、`map[string]any` 和值级字面量收窄。
+- 确定性 OpenAPI 3.1 编译：固定排序、`$ref` 去重、证据闸门和编译双跑检查。
+- 通用源码前端：通过 LLM 发现非 Go 项目路由和契约，并对模型输出做源码核对。
+- LLM 缺口补全、约定画像学习、语义增强、未登记 Go 框架适配器学习和内容寻址缓存。
+- `--json` 机器契约、结构化退出码和 `eval --fail-under` CI 质量闸门。
+
+### 生成物
+
+每次 `gen` 在输出目录写入：
+
+| 文件 | 说明 |
 |---|---|
-| `SpecForge-v2.0-设计文档.md` | v2.0 完整设计文档（2.1 万字，20 章 + 3 附录） |
-| `specforge/` | 完整 Go 工程（含 git 历史、单元测试、端到端回归守卫） |
-| `specforge/testdata/sample-repo/` | 样本仓库：复刻设计文档全部难点模式 |
-| `specforge/testdata/ground-truth.yaml` | 人工标注真值 |
-| `specforge/testdata/sample-repo/.specforge/out/` | 已生成的 openapi.yaml + report.md 样例 |
+| `openapi.yaml` | OpenAPI 3.1 文档 |
+| `report.md` | 置信度、缺口、失败 operation 和证据总览 |
+| `operations.json` | schema version 1 的 operation 级证据接口 |
 
-## 快速开始
+仓库内还会按需生成：
+
+- `.specforge/profile.yaml`：输入画像，可手工维护；`--llm-learn-profile` 会在当前运行中补全缺失约定。
+- `.specforge/adapters/*.json`：经源码签名复核的 LLM 学习适配器。
+- `.specforge/cache/memo/`：完整运行缓存。
+- `.specforge/cache/llm/`：按 prompt 和工具读集校验的 LLM 调用缓存。
+
+## 使用与验证
 
 ```bash
-cd specforge
-
-# 构建（需要 Go 1.27+）
-go build -o specforge ./cmd/specforge
-
-# 对任何 Go + fiber 仓库生成 OpenAPI 3.1
-./specforge gen --repo path/to/your/repo
-
-# 带约定画像（信封/中间件语义/通配符规则）
-./specforge gen --repo . --profile .specforge/profile.yaml
-
-# 评测（对照 ground truth）
-./specforge eval --truth testdata/ground-truth.yaml \
-                 --spec testdata/sample-repo/.specforge/out/openapi.yaml
-
-# 运行全部测试（单元 + 端到端精度回归守卫）
+go version
 go test ./...
+
+go run ./cmd/specforge doctor --repo .
+go run ./cmd/specforge gen --repo testdata/sample-repo --no-cache
+go run ./cmd/specforge eval \
+  --truth testdata/ground-truth.yaml \
+  --spec testdata/sample-repo/.specforge/out/openapi.yaml \
+  --fail-under 0.9
 ```
 
-## 验收指标（已达精度上限）
+发布或部署时可先执行 `go build -o specforge ./cmd/specforge`，再用生成的二进制替换上面命令中的 `go run ./cmd/specforge`。
 
-| 指标 | 结果 | P0 门限 |
-|---|---|---|
-| Route Recall | 1.000 | ≥ 0.98 |
-| Route Precision | 1.000 | — |
-| Param F1 | 1.000 | — |
-| Request Field F1 | 1.000 | ≥ 0.95 |
-| Response Field F1 | 1.000 | ≥ 0.90 |
-| Envelope Recall | 1.000 | ≥ 0.85 |
-| Hallucination | 0.000 | < 0.01 |
+Go 静态前端没有 LLM 也能运行；不能静态确定的字段会保留为缺口。通用前端和显式的 `--llm`、`--llm-enrich`、`--llm-learn-profile` 需要 `ANTHROPIC_AUTH_TOKEN` 或 `ANTHROPIC_API_KEY`。完整环境变量、缓存和 CI 用法见 README。
 
-确定性：双编译自检（byte-identical）+ 跨进程两次运行逐字节一致。
+当前测试覆盖：
 
-## 环境要求
+- `internal/adapter`：Fiber、Gin、chi 路由形态和原语声明。
+- `internal/engine`：样本仓库端到端生成、响应/错误流、确定性和证据输出。
+- `internal/eval`：OpenAPI 评测、开放对象字段和响应信封展平。
+- `internal/frontend/generic`：LLM 路由/契约文本核对。
 
-- Go 1.27+（goproxy.cn 代理可加速国内依赖下载）
-- 依赖：golang.org/x/tools v0.50、gopkg.in/yaml.v3、gofiber/fiber v2.52.5（样本仓库用）
+## 已知边界
 
-## 详细文档
+- 默认 Go 前端只在仓库根目录存在 `go.mod` 时自动选择；可用 `--repo` 指向模块根。
+- 通用前端依赖模型发现路由和契约，置信度上限为 0.6，且必须通过源码核对。
+- 运行级缓存是 memo 和文件缓存，不是 SQLite 事实库；基于 readSet 的反向失效传播仍是后续路线。
+- Java、Python、Node 尚无静态语言前端；Express 样本用于通用前端回归。
+- 没有内置运行时探针、破坏性变更 diff、PR 评论机器人或 MCP Server。
+- 旧设计文档中的 Fiber-only、P0-only 和 `specforge/` 嵌套目录描述是历史背景；以本文件和 README 的当前实现说明为准。
 
-工程结构与设计原则的落地位置见 `specforge/README.md`；
-完整设计（Fact 生命周期、增量引擎、LLM 编排、成本模型）见设计文档。
+## 版本与兼容性
+
+CLI 和引擎版本来自 `internal/engine.Version`。`operations.json` 和 `--json` 信封当前为 schema version `1`。引擎版本会进入 memo 指纹，升级引擎后旧运行缓存会自动失效。
