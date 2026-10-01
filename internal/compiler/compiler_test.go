@@ -107,3 +107,17 @@ func TestRenderDeterminism(t *testing.T) {
 		t.Error("must declare 3.1.0")
 	}
 }
+
+func TestRenderOneOfSchema(t *testing.T) {
+	doc := &Document{Title: "oneof", Version: "1", Operations: []Operation{{
+		Method: "GET", Path: "/x", OperationID: "x",
+		Responses: []ResponseOut{{Status: "200", Description: "ok", Raw: true, HasBody: true, Variants: []BodyVariant{{SchemaName: "A"}, {SchemaName: "B"}}}},
+	}}, Schemas: []NamedSchema{{Name: "Union", Schema: &schema.Schema{OneOf: []*schema.Schema{{Type: "string"}, {Type: "integer"}}}}}}
+	yaml, err := RenderYAML(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(yaml), "oneOf:") {
+		t.Fatalf("oneOf missing from YAML:\n%s", yaml)
+	}
+}

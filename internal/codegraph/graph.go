@@ -9,7 +9,9 @@ import (
 	"go/ast"
 	"go/token"
 	"go/types"
+	"maps"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -94,16 +96,17 @@ type ConstValue struct {
 
 // Graph 代码图。
 type Graph struct {
-	Fset        *token.FileSet
-	Syms        map[string]*Symbol
-	Types       map[string]*TypeInfo
-	Callees     map[string][]string   // caller → callee IDs
-	Callers     map[string][]CallSite // callee → 调用点
-	constValue  map[string]string
-	constTypeID map[string]string // const → 声明类型 ID（枚举归属）
-	fileHash    map[string]string
-	pkgOf       map[string]*packages.Package
-	pkgs        []*packages.Package
+	Fset         *token.FileSet
+	Syms         map[string]*Symbol
+	Types        map[string]*TypeInfo
+	Callees      map[string][]string   // caller → callee IDs
+	Callers      map[string][]CallSite // callee → 调用点
+	constValue   map[string]string
+	constTypeID  map[string]string // const → 声明类型 ID（枚举归属）
+	constsByType map[string][]ConstValue
+	fileHash     map[string]string
+	pkgOf        map[string]*packages.Package
+	pkgs         []*packages.Package
 	// funcDecls 记录「符号 ID → 函数声明」，供 O(1) 查询函数体；
 	// 接口方法没有 FuncDecl，因此不在表中——这是区分接口方法与具体实现的依据。
 	funcDecls   map[string]*ast.FuncDecl
@@ -139,6 +142,7 @@ func NewGraph() *Graph {
 		Callers:      map[string][]CallSite{},
 		constValue:   map[string]string{},
 		constTypeID:  map[string]string{},
+		constsByType: map[string][]ConstValue{},
 		fileHash:     map[string]string{},
 		pkgOf:        map[string]*packages.Package{},
 		funcDecls:    map[string]*ast.FuncDecl{},
@@ -171,6 +175,80 @@ func Build(pkgs []*packages.Package, fset *token.FileSet) (*Graph, error) {
 	return g, nil
 }
 
+// ResultObjectTypes returns struct alternatives exposed by zero-argument
+// (value, error) accessors on an opaque union wrapper.
+func (g *Graph) ResultObjectTypes(typeKey string) []string {
+	var out []string
+	for _, result := range g.ResultTypes(typeKey) {
+		result = types.Unalias(result)
+		if pointer, ok := result.(*types.Pointer); ok {
+			result = types.Unalias(pointer.Elem())
+		}
+		named, ok := result.(*types.Named)
+		if !ok || named.Obj().Pkg() == nil {
+			continue
+		}
+		if _, ok := named.Underlying().(*types.Struct); ok {
+			out = append(out, typeID(named))
+		}
+	}
+	return out
+}
+
+// ResultTypes returns package-local alternatives exposed by zero-argument
+// (value, error) accessor methods on an opaque union wrapper.
+func (g *Graph) ResultTypes(typeKey string) []types.Type {
+	named := g.namedOf[typeKey]
+	if named == nil || named.Obj().Pkg() == nil {
+		return nil
+	}
+	pkgPath := named.Obj().Pkg().Path()
+	errorType := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
+	results := make(map[string]types.Type)
+	for _, receiver := range []types.Type{named, types.NewPointer(named)} {
+		methodSet := types.NewMethodSet(receiver)
+		for i := 0; i < methodSet.Len(); i++ {
+			signature, ok := methodSet.At(i).Type().(*types.Signature)
+			if !ok || signature.Params().Len() != 0 || signature.Results().Len() != 2 || !types.Implements(signature.Results().At(1).Type(), errorType) {
+				continue
+			}
+			result := signature.Results().At(0).Type()
+			if !containsTypeFromPackage(result, pkgPath) || types.Identical(types.Unalias(result), named) {
+				continue
+			}
+			results[types.TypeString(result, func(p *types.Package) string { return p.Path() })] = result
+		}
+	}
+	keys := slices.Sorted(maps.Keys(results))
+	out := make([]types.Type, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, results[key])
+	}
+	return out
+}
+
+func containsTypeFromPackage(t types.Type, pkgPath string) bool {
+	switch t := t.(type) {
+	case *types.Alias:
+		if t.Obj().Pkg() != nil && t.Obj().Pkg().Path() == pkgPath {
+			return true
+		}
+		return containsTypeFromPackage(types.Unalias(t), pkgPath)
+	case *types.Named:
+		return t.Obj().Pkg() != nil && t.Obj().Pkg().Path() == pkgPath
+	case *types.Pointer:
+		return containsTypeFromPackage(t.Elem(), pkgPath)
+	case *types.Slice:
+		return containsTypeFromPackage(t.Elem(), pkgPath)
+	case *types.Array:
+		return containsTypeFromPackage(t.Elem(), pkgPath)
+	case *types.Map:
+		return containsTypeFromPackage(t.Key(), pkgPath) || containsTypeFromPackage(t.Elem(), pkgPath)
+	default:
+		return false
+	}
+}
+
 // ---- 包处理 -----------------------------------------------------------
 
 func (g *Graph) buildPkg(p *packages.Package) {
@@ -186,6 +264,11 @@ func (g *Graph) buildPkg(p *packages.Package) {
 			g.addTypeSym(p, o)
 		case *types.Const:
 			g.addConstSym(p, o)
+		}
+	}
+	for ti := range maps.Values(g.Types) {
+		if ti.Pkg == p.PkgPath {
+			g.attachEnums(ti)
 		}
 	}
 	// 命名类型的方法集
@@ -420,7 +503,11 @@ func (g *Graph) addConstSym(p *packages.Package, c *types.Const) {
 		g.constValue[id] = c.Val().ExactString()
 	}
 	if t := c.Type(); t != nil {
-		g.constTypeID[id] = typeID(t)
+		tid := typeID(t)
+		g.constTypeID[id] = tid
+		if c.Val() != nil {
+			g.constsByType[enumGroupID(p.PkgPath, tid)] = append(g.constsByType[enumGroupID(p.PkgPath, tid)], ConstValue{ID: id, Name: c.Name(), Value: c.Val().ExactString()})
+		}
 	}
 	g.Syms[id] = sym
 }
@@ -447,7 +534,6 @@ func (g *Graph) addTypeSym(p *packages.Package, tn *types.TypeName) {
 		ID: ti.ID, Kind: KindType, Pkg: p.PkgPath, File: ti.File, Line: ti.Line,
 		Doc: g.docForSymbol(p, "TYPE:"+ti.ID),
 	}
-	g.attachEnums(ti)
 }
 
 func (g *Graph) fillTypeInfo(ti *TypeInfo, u types.Type) {
@@ -589,21 +675,13 @@ func commentText(cg *ast.CommentGroup) string {
 
 // attachEnums 枚举判定: 同类型 const ≥ 2（设计文档 §7.2.12 宁缺勿滥）。
 func (g *Graph) attachEnums(ti *TypeInfo) {
-	var vals []ConstValue
-	for id, v := range g.constValue {
-		// 同包且类型 ID 匹配（const 声明的类型 = 该命名类型）
-		if strings.HasPrefix(id, ti.Pkg+".") {
-			if g.constTypeID[id] == ti.ID {
-				vals = append(vals, ConstValue{
-					ID: id, Name: id[strings.LastIndex(id, ".")+1:], Value: v,
-				})
-			}
-		}
-	}
+	vals := append([]ConstValue(nil), g.constsByType[enumGroupID(ti.Pkg, ti.ID)]...)
 	sort.Slice(vals, func(i, j int) bool { return vals[i].Name < vals[j].Name })
 	ti.Consts = vals
 	ti.Enumish = len(vals) >= 2
 }
+
+func enumGroupID(pkg, typeID string) string { return pkg + "\x00" + typeID }
 
 // ---- 文档注释 ---------------------------------------------------------
 

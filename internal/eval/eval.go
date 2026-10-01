@@ -14,6 +14,8 @@ import (
 	"os"
 	"sort"
 	"strings"
+
+	"github.com/specforge/specforge/internal/openapi"
 )
 
 // Metrics 评测结果。
@@ -111,6 +113,18 @@ func loadDoc(path string) (*oasDoc, error) {
 
 // Evaluate 对比 truth 与生成 spec。
 func Evaluate(truthPath, specPath string) (*Metrics, error) {
+	// Flattening remains an evaluator concern, while loading, reference
+	// resolution, and OpenAPI validation use the shared adapter boundary.
+	truthDocument, err := openapi.Load(truthPath)
+	if err != nil {
+		return nil, err
+	}
+	defer truthDocument.Close()
+	specDocument, err := openapi.Load(specPath)
+	if err != nil {
+		return nil, err
+	}
+	defer specDocument.Close()
 	truth, err := loadDoc(truthPath)
 	if err != nil {
 		return nil, err

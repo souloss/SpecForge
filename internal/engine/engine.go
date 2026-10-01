@@ -27,6 +27,7 @@ import (
 	"github.com/specforge/specforge/internal/frontend/golang"
 	"github.com/specforge/specforge/internal/infer"
 	"github.com/specforge/specforge/internal/memo"
+	"github.com/specforge/specforge/internal/openapi"
 	"github.com/specforge/specforge/internal/schema"
 )
 
@@ -309,6 +310,16 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Keep generated output inside the OpenAPI adapter boundary. This catches
+	// malformed references and spec violations before artifacts are published.
+	generated, err := openapi.LoadBytes(specYAML, filepath.Join(outDir, specFile))
+	if err != nil {
+		return nil, fmt.Errorf("reload generated OpenAPI: %w", err)
+	}
+	defer generated.Close()
+	if diagnostics := generated.Validate(); len(diagnostics) > 0 {
+		return nil, fmt.Errorf("generated OpenAPI validation failed: %s", formatOpenAPIDiagnostics(diagnostics))
+	}
 
 	// 9. 写产物 + memo
 	end = timer.begin("write")
@@ -330,6 +341,21 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	}
 	res.ElapsedMs = time.Since(t0).Milliseconds()
 	return res, nil
+}
+
+func formatOpenAPIDiagnostics(diagnostics []openapi.Diagnostic) string {
+	parts := make([]string, 0, len(diagnostics))
+	for _, diagnostic := range diagnostics {
+		location := ""
+		if diagnostic.Path != "" {
+			location = " at " + diagnostic.Path
+		}
+		if diagnostic.Line > 0 {
+			location += fmt.Sprintf(" (line %d, column %d)", diagnostic.Line, diagnostic.Column)
+		}
+		parts = append(parts, diagnostic.Code+location+": "+diagnostic.Message)
+	}
+	return strings.Join(parts, "; ")
 }
 
 // writeArtifacts 写产物文件（目录不存在则创建）。

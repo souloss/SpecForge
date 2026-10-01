@@ -55,6 +55,9 @@ go build -o specforge ./cmd/specforge
 # 使用仓库约定画像（默认会自动读取 .specforge/profile.yaml）
 ./specforge gen --repo . --profile .specforge/profile.yaml
 
+# validate an existing OpenAPI document (resolves local refs)
+./specforge verify --spec .specforge/out/openapi.yaml
+
 # 查看低置信 operation，并解释单个 operation 的证据
 ./specforge ops --repo . --low-confidence
 ./specforge explain POST /api/orders/{id} --repo .
@@ -83,10 +86,11 @@ export ANTHROPIC_MODEL=deepseek-v4-pro-0813                                     
 | `ops` | 从最近一次生成结果列出 operation、置信度和缺口 |
 | `explain METHOD PATH` | 展示参数、请求体、响应矩阵和逐行证据 |
 | `eval` | 计算 route、参数、请求/响应字段、信封召回和幻觉率 |
+| `verify` | 使用 libopenapi 加载、解析引用并校验 OpenAPI 文档 |
 | `cache stats` / `cache clean` | 查看或清理运行级和 LLM 缓存 |
 | `version` | 打印 CLI 和引擎版本 |
 
-分析和运维命令（`doctor`、`gen`、`ops`、`explain`、`eval`、`cache`、`version`）支持 `--json` 机器模式。stdout 只输出一个版本化 JSON 信封，日志写到 stderr，适合 CI 和脚本消费。
+分析和运维命令（`doctor`、`gen`、`ops`、`explain`、`eval`、`verify`、`cache`、`version`）支持 `--json` 机器模式。stdout 只输出一个版本化 JSON 信封，日志写到 stderr，适合 CI 和脚本消费。
 
 ## 架构
 
@@ -107,7 +111,7 @@ eval       ground truth 对比与 CI 质量闸门
 主要目录：
 
 ```
-cmd/specforge/       CLI（doctor / gen / ops / explain / eval / cache / version）
+cmd/specforge/       CLI（doctor / gen / ops / explain / eval / verify / cache / version）
 internal/frontend/   Go 静态前端与通用 LLM 前端
 internal/adapter/    Fiber、Gin、chi 和可学习的框架适配器
 internal/codegraph/  符号表、调用图、类型图和源码指纹

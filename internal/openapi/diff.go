@@ -1,0 +1,50 @@
+package openapi
+
+import (
+	"fmt"
+	"github.com/pb33f/libopenapi/what-changed"
+)
+
+type Change struct {
+	Property string `json:"property,omitempty"`
+	Path     string `json:"path,omitempty"`
+	Kind     string `json:"kind"`
+	Breaking bool   `json:"breaking"`
+	Original string `json:"original,omitempty"`
+	New      string `json:"new,omitempty"`
+}
+
+type DocumentDiff struct {
+	Changes []Change `json:"changes,omitempty"`
+}
+
+func CompareDocuments(leftPath, rightPath string) (*DocumentDiff, error) {
+	left, err := Load(leftPath)
+	if err != nil {
+		return nil, err
+	}
+	defer left.Close()
+	right, err := Load(rightPath)
+	if err != nil {
+		return nil, err
+	}
+	defer right.Close()
+	leftModel, err := left.document.BuildV3Model()
+	if err != nil {
+		return nil, fmt.Errorf("build left OpenAPI model: %w", err)
+	}
+	rightModel, err := right.document.BuildV3Model()
+	if err != nil {
+		return nil, fmt.Errorf("build right OpenAPI model: %w", err)
+	}
+	changes := what_changed.CompareOpenAPIDocuments(leftModel.Model.GoLow(), rightModel.Model.GoLow())
+	result := &DocumentDiff{}
+	for _, change := range changes.GetAllChanges() {
+		if change == nil {
+			continue
+		}
+		kind := fmt.Sprintf("change-%d", change.ChangeType)
+		result.Changes = append(result.Changes, Change{Property: change.Property, Path: change.Path, Kind: kind, Breaking: change.Breaking, Original: change.Original, New: change.New})
+	}
+	return result, nil
+}

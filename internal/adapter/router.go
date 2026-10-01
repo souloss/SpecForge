@@ -16,6 +16,7 @@ import (
 //	for _, r := range table { app.Get(r.Path, r.Handler) }   // 表驱动注册
 type RouterSpec struct {
 	RouterTypes   map[string]bool   // 路由对象类型 ID（去指针，如 github.com/gofiber/fiber/v2.App）
+	ChiPathSyntax bool              // chi uses {name} parameters; colon is a literal path character
 	GroupMethod   string            // 分组方法名（如 Group）
 	Verbs         map[string]string // 注册方法名 → HTTP 方法（如 Get → GET、Any → ALL）
 	HandlerArg    int               // handler 实参下标（0 为路径）；<=0 表示末位（其前为中间件，fiber/gin）
@@ -55,9 +56,9 @@ type routeState struct {
 func (f routerFramework) ExtractRoutes(p *PkgCtx) []Route {
 	var routes []Route
 	for _, file := range p.Syntax {
-		st := &routeState{groupPrefix: map[string]string{}}
 		for _, d := range file.Decls {
 			if fd, ok := d.(*ast.FuncDecl); ok && fd.Body != nil {
+				st := &routeState{groupPrefix: map[string]string{}}
 				routes = append(routes, f.extractFunc(p, st, fd)...)
 			}
 		}
@@ -241,7 +242,7 @@ func (f routerFramework) extractRouteCall(p *PkgCtx, st *routeState, call *ast.C
 		prefix = g // 链式 app.Group("/x").Post(...)
 	}
 	full := prefix + rawPath
-	normalized, wildcard := NormalizePath(full)
+	normalized, wildcard := f.normalizePath(full)
 	r := Route{Method: method, Path: normalized, RawPath: full, File: p.File(call), Line: p.Line(call)}
 	if !pathKnown {
 		r.Unresolved = ReasonDynamic
@@ -365,7 +366,7 @@ func (f routerFramework) resolveTableRoute(p *PkgCtx, st *routeState, routeCall 
 			continue
 		}
 		full := prefix + pathStr
-		normalized, wildcard := NormalizePath(full)
+		normalized, wildcard := f.normalizePath(full)
 		nr := Route{
 			Method: method, Path: normalized, RawPath: full,
 			Handler: p.Info.ResolveExpr(handlerExpr),
@@ -381,6 +382,13 @@ func (f routerFramework) resolveTableRoute(p *PkgCtx, st *routeState, routeCall 
 		routes = append(routes, nr)
 	}
 	return routes
+}
+
+func (f routerFramework) normalizePath(path string) (string, bool) {
+	if f.spec.ChiPathSyntax {
+		return path, false
+	}
+	return NormalizePath(path)
 }
 
 // findLoopTable 定位 range 循环变量对应的复合字面量表。

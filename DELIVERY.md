@@ -6,13 +6,16 @@
 
 ### 已交付
 
-- Go 1.27 CLI，命令包括 `doctor`、`gen`、`ops`、`explain`、`eval`、`cache` 和 `version`。
+- Go 1.27 CLI，命令包括 `doctor`、`gen`、`ops`、`explain`、`eval`、`verify`、`cache` 和 `version`。
 - Go 静态前端：`go/packages` 类型加载、符号/调用图、值流和证据校验。
 - 内置 Go 框架适配器：Fiber、Gin、chi v4、chi v5。
 - 路由分组、中间件链、表驱动注册、通配符路径、chi `Group`/`Route` 回调和 `Method` 注册。
 - 请求体绑定、query/path/header/cookie 参数、validator/binding 约束、响应矩阵和业务错误码追踪。
 - Go 类型到 JSON Schema：嵌套结构、数组、枚举、指针可空、`omitempty`、时间、`json.RawMessage`、`map[string]any` 和值级字面量收窄。
 - 确定性 OpenAPI 3.1 编译：固定排序、`$ref` 去重、证据闸门和编译双跑检查。
+- libopenapi OpenAPI 边界：本地引用解析、文档规范校验、Overlay 应用后 reload 校验、OpenAPI 文档 Diff 和 Arazzo 工作流解析。
+- libopenapi-validator HTTP 验证边界：请求、响应和文档诊断转换为稳定的 SpecForge 结果；运行时验证不覆盖未访问接口。
+- Contract Graph 核心模型：多来源 Candidate、Evidence、冲突、未知 Schema 和显式 operation 状态。
 - 通用源码前端：通过 LLM 发现非 Go 项目路由和契约，并对模型输出做源码核对。
 - LLM 缺口补全、约定画像学习、语义增强、未登记 Go 框架适配器学习和内容寻址缓存。
 - `--json` 机器契约、结构化退出码和 `eval --fail-under` CI 质量闸门。
@@ -42,6 +45,7 @@ go test ./...
 
 go run ./cmd/specforge doctor --repo .
 go run ./cmd/specforge gen --repo testdata/sample-repo --no-cache
+go run ./cmd/specforge verify --spec testdata/sample-repo/.specforge/out/openapi.yaml
 go run ./cmd/specforge eval \
   --truth testdata/ground-truth.yaml \
   --spec testdata/sample-repo/.specforge/out/openapi.yaml \
@@ -57,6 +61,8 @@ Go 静态前端没有 LLM 也能运行；不能静态确定的字段会保留为
 - `internal/adapter`：Fiber、Gin、chi 路由形态和原语声明。
 - `internal/engine`：样本仓库端到端生成、响应/错误流、确定性和证据输出。
 - `internal/eval`：OpenAPI 评测、开放对象字段和响应信封展平。
+- `internal/contract`：候选事实、证据、冲突解析和 JSON 往返不变量。
+- `internal/openapi`：3.0/3.1 加载、引用、Overlay、Arazzo、文档 Diff 和 HTTP 验证适配器。
 - `internal/frontend/generic`：LLM 路由/契约文本核对。
 
 ## 已知边界
@@ -65,7 +71,7 @@ Go 静态前端没有 LLM 也能运行；不能静态确定的字段会保留为
 - 通用前端依赖模型发现路由和契约，置信度上限为 0.6，且必须通过源码核对。
 - 运行级缓存是 memo 和文件缓存，不是 SQLite 事实库；基于 readSet 的反向失效传播仍是后续路线。
 - Java、Python、Node 尚无静态语言前端；Express 样本用于通用前端回归。
-- 没有内置运行时探针、破坏性变更 diff、PR 评论机器人或 MCP Server。
+- 尚未提供进程级流量探针、PR 评论机器人或 MCP Server；HTTP 验证器可由调用方提供已捕获的请求/响应样本。
 - 旧设计文档中的 Fiber-only、P0-only 和 `specforge/` 嵌套目录描述是历史背景；以本文件和 README 的当前实现说明为准。
 
 ## 版本与兼容性

@@ -450,6 +450,13 @@ func writeShape(b *strings.Builder, sc *schema.Schema, depth int) {
 		b.WriteString("ref:" + sc.Ref)
 		return
 	}
+	if len(sc.OneOf) > 0 {
+		b.WriteString("one:")
+		for _, variant := range sc.OneOf {
+			writeShape(b, variant, depth+1)
+		}
+		return
+	}
 	fmt.Fprintf(b, "t:%s;f:%s;nb:%v;n:%v;ad:%v;", sc.Type, sc.Format, sc.NoBody, sc.Nullable, sc.Additional)
 	if len(sc.Enum) > 0 {
 		b.WriteString("e:" + strings.Join(sc.Enum, "|") + ";")

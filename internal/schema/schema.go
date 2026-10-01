@@ -8,6 +8,7 @@ type Schema struct {
 	Format         string // int64|int32|double|date-time
 	Ref            string // $ref 名（命名类型引用）
 	Items          *Schema
+	OneOf          []*Schema
 	Props          []Prop // object 属性（有序）
 	Required       []string
 	Enum           []string // 枚举值（字符串化）

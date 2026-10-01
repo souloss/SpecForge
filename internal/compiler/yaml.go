@@ -247,6 +247,22 @@ func writeSchema(w func(string, ...interface{}), b *strings.Builder, sc *schema.
 		w("%s$ref: '#/components/schemas/%s'\n", pad, escapeRef(sc.Ref))
 		return
 	}
+	if len(sc.OneOf) > 0 {
+		w("%soneOf:\n", pad)
+		for _, variant := range sc.OneOf {
+			var buf strings.Builder
+			writeSchema(func(format string, args ...interface{}) { fmt.Fprintf(&buf, format, args...) }, &buf, variant, indent+2, pad+"  ")
+			lines := strings.Split(strings.TrimSuffix(buf.String(), "\n"), "\n")
+			if len(lines) == 0 || lines[0] == "" {
+				continue
+			}
+			w("%s  - %s\n", pad, strings.TrimPrefix(lines[0], pad+"  "))
+			for _, line := range lines[1:] {
+				w("%s    %s\n", pad, strings.TrimPrefix(line, pad+"  "))
+			}
+		}
+		return
+	}
 	if sc.Type != "" {
 		if sc.Nullable {
 			// 3.1 可空: type 数组（§7.2.6），唯一 type 键

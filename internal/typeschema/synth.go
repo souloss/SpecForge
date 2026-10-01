@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
+	"slices"
 	"sort"
 	"strings"
 
@@ -96,6 +97,9 @@ func (s *Synthesizer) synthType(ti *codegraph.TypeInfo, typeID string) *Schema {
 		}
 		return sc
 	}
+	if variants := s.unionVariantSchemas(typeID, ti); len(variants) > 0 {
+		return &Schema{OneOf: variants}
+	}
 	// struct → object（嵌入字段展平，设计文档 §7.2.8）
 	sc := &Schema{Type: "object"}
 	var required []string
@@ -148,6 +152,58 @@ func (s *Synthesizer) synthType(ti *codegraph.TypeInfo, typeID string) *Schema {
 	return sc
 }
 
+func (s *Synthesizer) unionVariantSchemas(typeID string, ti *codegraph.TypeInfo) []*Schema {
+	if ti == nil || ti.Pkg == "" {
+		return nil
+	}
+	for _, field := range ti.Fields {
+		if field.Name != "union" || (field.Kind != "rawmsg" && !strings.Contains(field.TypeStr, "RawMessage")) {
+			continue
+		}
+		prefix := lastTypeSegment(typeID)
+		var ids []string
+		for id, candidate := range s.g.Types {
+			if candidate.Pkg != ti.Pkg || !strings.HasPrefix(lastTypeSegment(id), prefix) {
+				continue
+			}
+			suffix := strings.TrimPrefix(lastTypeSegment(id), prefix)
+			if suffix == "" || strings.Trim(suffix, "0123456789") != "" {
+				continue
+			}
+			ids = append(ids, id)
+		}
+		slices.Sort(ids)
+		ids = slices.Compact(ids)
+		variants := make([]*Schema, 0, len(ids))
+		seen := make(map[string]bool, len(ids))
+		for _, id := range ids {
+			variants = append(variants, s.Synthesize(id))
+			seen[id] = true
+		}
+		for _, result := range s.g.ResultTypes(typeID) {
+			key := types.TypeString(result, func(pkg *types.Package) string { return pkg.Path() })
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			if named, ok := types.Unalias(result).(*types.Named); ok && s.g.Type(codegraph.TypeIDOf(named)) != nil {
+				variants = append(variants, s.Synthesize(codegraph.TypeIDOf(named)))
+			} else {
+				variants = append(variants, s.synthGoType(result, 0))
+			}
+		}
+		return variants
+	}
+	return nil
+}
+
+func lastTypeSegment(id string) string {
+	if i := strings.LastIndexByte(id, '.'); i >= 0 {
+		return id[i+1:]
+	}
+	return id
+}
+
 // embeddedSchema 嵌入字段指向的结构体 schema（供外层展平）；非结构体嵌入返回 nil，按普通字段处理。
 func (s *Synthesizer) embeddedSchema(f codegraph.Field) *Schema {
 	ti := s.g.Type(f.TypeID)
@@ -197,14 +253,11 @@ func (s *Synthesizer) synthField(f codegraph.Field) *Schema {
 	case "map":
 		sc = &Schema{Type: "object", Additional: true}
 		sc.Description = MapDescPrefix + f.TypeStr
-		// map[string]any: 值不可定型 → 显式 unknown（设计文档 §7.2.3）
 		if strings.Contains(f.TypeStr, "any") || strings.Contains(f.TypeStr, "interface{}") {
 			sc.Unknown = true
 			sc.UnknownWhy = "map value type any/interface{}: not statically resolvable"
 		}
 	case "any":
-		// §7.2.3: 静态不可定型 → 显式 unknown，禁止编造
-		// 不声明 type：any 可为任意 JSON 值（与 swag 的 `{}` 同义），声明 object 即是编造
 		sc = &Schema{Unknown: true, UnknownWhy: "interface{}/any: cannot be statically resolved"}
 	case "struct":
 		if ti := s.g.Type(f.TypeID); ti != nil {

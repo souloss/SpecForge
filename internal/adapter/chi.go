@@ -10,6 +10,7 @@ const (
 	httpPkg        = "net/http"
 	jsonPkg        = "encoding/json"
 	urlPkg         = "net/url"
+	ioPkg          = "io"
 )
 
 func chiMethod(pkg, recv, method string) string { return MethodSymbol(pkg, recv, method) }
@@ -37,6 +38,8 @@ func chiPrimitives(pkg string) Primitives {
 			{Symbol: chiFunc(httpPkg, "Error"), BodyArg: 1, StatusArg: 2, DefaultStatus: defaultOKStatus},
 			{Symbol: chiMethod(jsonPkg, "Encoder", "Encode"), BodyArg: 0, StatusArg: NoArg, DefaultStatus: defaultOKStatus},
 			{Symbol: chiInterfaceMethod(httpPkg, "ResponseWriter", "Write"), BodyArg: 0, StatusArg: NoArg, DefaultStatus: defaultOKStatus},
+			{Symbol: chiInterfaceMethod(httpPkg, "ResponseWriter", "WriteHeader"), BodyArg: NoArg, StatusArg: 0, DefaultStatus: defaultOKStatus},
+			{Symbol: chiFunc(ioPkg, "Copy"), BodyArg: 1, StatusArg: NoArg, DefaultStatus: defaultOKStatus},
 		},
 	}
 	prims.BodyBinders = append(prims.BodyBinders, BodyBinder{Symbol: chiFunc(renderPkg, "Bind"), Arg: 1, ContentType: jsonContentType})
@@ -67,7 +70,7 @@ func chiRouterSpec(pkg string) RouterSpec {
 		"Trace": "TRACE", "Any": "ALL", "Handle": "ALL", "HandleFunc": "ALL",
 		"Method": "ALL", "MethodFunc": "ALL",
 	}
-	return RouterSpec{RouterTypes: types, GroupMethod: "Group", Verbs: verbs,
+	return RouterSpec{RouterTypes: types, ChiPathSyntax: true, GroupMethod: "Group", Verbs: verbs,
 		PathArgs:      map[string]int{"Method": 1, "MethodFunc": 1},
 		MethodArgs:    map[string]int{"Method": 0, "MethodFunc": 0},
 		NestedMethods: map[string]bool{"Group": true, "Route": true}}

@@ -195,6 +195,7 @@ Typical workflow:
 		newOpsCmd(a),
 		newExplainCmd(a),
 		newEvalCmd(a),
+		newVerifyCmd(a),
 		newCacheCmd(a),
 		newDoctorCmd(a),
 		newVersionCmd(a),

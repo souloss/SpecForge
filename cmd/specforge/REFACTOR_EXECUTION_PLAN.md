@@ -550,3 +550,18 @@ runtime validation: 请求及响应样本结果
 给执行 Agent 的核心要求：
 
 > 先建立 Contract Graph 和 libopenapi adapter，再分阶段迁移源码分析、文档导入、运行时验证和 Compiler。所有来源都必须保留候选事实、证据、冲突与置信度；第三方 OpenAPI 模型不能成为核心模型。每次迁移都要有回归测试，所有生成文档都必须重新加载、解析引用并通过规范验证。
+
+## 14. 本次执行记录
+
+本次执行以提交 `4380927` 作为已有改动基线，随后完成以下可复跑结果：
+
+| 验证 | 结果 |
+|---|---|
+| `go test ./...` | 通过 |
+| `go test -race ./...` | 通过 |
+| `go vet ./...` | 通过 |
+| `go build ./...` | 通过 |
+| chi fixture `gen` | 5/5 路由解析，生成文档可 reload/validation |
+| 两次独立生成 SHA-256 | `3da761c3e3bd41347b7705d67b81cef27bfc8908da441d173f05deee3f568ac0`，一致 |
+
+实现落点：`internal/contract` 提供候选事实、证据、冲突和未知 Schema；`internal/openapi` 封装 libopenapi、libopenapi-validator、Overlay、Arazzo 和文档 Diff；`internal/runtime` 提供稳定的请求/响应验证结果；生成链和 `specforge verify` 在输出边界执行 reload 与规范验证。`internal/eval` 通过 OpenAPI adapter 加载文档后保留字段展平指标。未引入 kin-openapi；进程级流量探针仍由调用方负责采集样本。
