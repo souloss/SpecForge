@@ -3,7 +3,6 @@ package compiler
 import (
 	"fmt"
 	"sort"
-	"strings"
 
 	"github.com/specforge/specforge/internal/contract"
 	"github.com/specforge/specforge/internal/facts"
@@ -57,14 +56,14 @@ func factsFromGraph(graph *contract.Graph) ([]*facts.Fact, map[string]*schema.Sc
 			candidates := operation.Responses[status]
 			for _, candidate := range candidates {
 				response := candidate.Value
-				row := facts.ResponseFact{Status: atoi(status), SchemaType: response.Schema, EnvelopeType: response.Envelope, DataField: response.DataField, MapValueType: response.MapValueType, HasBody: response.HasBody, Raw: response.Raw, Failure: response.Failure, Sink: response.Sink, ErrSource: response.ErrSource}
+				row := facts.ResponseFact{Status: atoi(status), Description: response.Description, ContentType: response.ContentType, SchemaType: response.Schema, EnvelopeType: response.Envelope, DataField: response.DataField, MapValueType: response.MapValueType, HasBody: response.HasBody, Raw: response.Raw, Failure: response.Failure, Sink: response.Sink, ErrSource: response.ErrSource}
 				if response.CodeKnown {
 					row.Envelope = &facts.Envelope{Code: response.Code, Msg: response.Description}
 				}
 				payload.Responses = append(payload.Responses, row)
 			}
 		}
-		result = append(result, &facts.Fact{ID: graphFactID(operation), Kind: facts.KindContract, Value: payload, Source: facts.SourceStatic, Confidence: operationConfidence(operation), Evidence: graphEvidence(operation.Evidence), Status: graphStatus(operation.State)})
+		result = append(result, &facts.Fact{ID: graphFactID(operation), Kind: facts.KindContract, Value: payload, Source: facts.SourceStatic, Confidence: operationConfidence(operation), Evidence: graphOperationEvidence(operation), Status: graphStatus(operation.State)})
 		if operation.Summary != "" || operation.Description != "" {
 			result = append(result, &facts.Fact{ID: graphFactID(operation) + ":enrich", Kind: facts.KindEnrichment, Value: facts.EnrichmentPayload{Summary: operation.Summary, Description: operation.Description, Tags: append([]string(nil), operation.Tags...)}, Source: facts.SourceStatic, Confidence: 1, Status: "verified"})
 		}
@@ -105,9 +104,30 @@ func operationConfidence(operation *contract.Operation) float64 {
 func graphEvidence(items []contract.Evidence) []facts.Evidence {
 	out := make([]facts.Evidence, 0, len(items))
 	for _, item := range items {
-		out = append(out, facts.Evidence{File: item.Location.File, StartLine: item.Location.StartLine, EndLine: item.Location.EndLine, Quote: item.Summary})
+		out = append(out, facts.Evidence{File: item.Location.File, StartLine: item.Location.StartLine, EndLine: item.Location.EndLine, Quote: item.Summary, Source: string(item.Source)})
 	}
 	return out
+}
+
+func graphOperationEvidence(operation *contract.Operation) []facts.Evidence {
+	if operation == nil {
+		return nil
+	}
+	items := append([]contract.Evidence(nil), operation.Evidence...)
+	for _, candidates := range operation.Parameters {
+		for _, candidate := range candidates {
+			items = append(items, candidate.Evidence...)
+		}
+	}
+	for _, candidate := range operation.RequestBody {
+		items = append(items, candidate.Evidence...)
+	}
+	for _, candidates := range operation.Responses {
+		for _, candidate := range candidates {
+			items = append(items, candidate.Evidence...)
+		}
+	}
+	return graphEvidence(items)
 }
 
 func graphStatus(state contract.OperationState) string {
@@ -121,7 +141,7 @@ func schemaFromGraph(input *contract.Schema) *schema.Schema {
 	if input == nil {
 		return nil
 	}
-	result := &schema.Schema{Type: first(input.Types), Format: input.Format, Ref: strings.TrimPrefix(input.Ref, "#/components/schemas/"), Nullable: input.Nullable, Description: input.Description, Required: append([]string(nil), input.Required...), ReadOnly: input.ReadOnly, WriteOnly: input.WriteOnly, Unknown: input.Unknown, UnknownWhy: input.UnknownReason, Discriminator: input.Discriminator, Default: input.Default, Examples: append([]any(nil), input.Examples...)}
+	result := &schema.Schema{Type: first(input.Types), Format: input.Format, Ref: contract.NormalizeSchemaRef(input.Ref), Nullable: input.Nullable, ContentEncoding: input.ContentEncoding, ContentMediaType: input.ContentMediaType, Description: input.Description, Required: append([]string(nil), input.Required...), ReadOnly: input.ReadOnly, WriteOnly: input.WriteOnly, Unknown: input.Unknown, UnknownWhy: input.UnknownReason, Discriminator: input.Discriminator, Default: input.Default, Examples: append([]any(nil), input.Examples...)}
 	for _, value := range input.Enum {
 		result.Enum = append(result.Enum, fmt.Sprint(value))
 	}

@@ -62,9 +62,12 @@ func DiscoverRoutes(ctx context.Context, p Provider, task RouteTask) (*RouteList
 
 // ContractTask 契约抽取任务：一个 operation 的 handler 源码切片。
 type ContractTask struct {
-	Method  string          `json:"method"`  // HTTP 方法
-	Path    string          `json:"path"`    // 路径
-	Sources []SourceSnippet `json:"sources"` // handler 与其调用的函数源码
+	Source        string          `json:"source,omitempty"`        // generic|static|openapi|runtime|documentation
+	Operation     string          `json:"operation,omitempty"`     // stable operation identity
+	AllowedFields []string        `json:"allowedFields,omitempty"` // fields the model may fill
+	Method        string          `json:"method"`                  // HTTP 方法
+	Path          string          `json:"path"`                    // 路径
+	Sources       []SourceSnippet `json:"sources"`                 // handler 与其调用的函数源码
 }
 
 // ExtractedContract LLM 抽取的契约（字段名须能在源码中找到，形状取封闭集合）。

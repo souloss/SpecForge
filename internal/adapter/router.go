@@ -63,7 +63,34 @@ func (f routerFramework) ExtractRoutes(p *PkgCtx) []Route {
 			}
 		}
 	}
-	return routes
+	return expandAllMethodRoutes(routes)
+}
+
+// OpenAPI Path Item supports these standard operations. CONNECT has no
+// corresponding field, so retain it as an unresolved route instead of
+// emitting an invalid `connect:` or `all:` key.
+var openAPIMethods = []string{"GET", "PUT", "POST", "DELETE", "OPTIONS", "HEAD", "PATCH", "TRACE"}
+
+func expandAllMethodRoutes(routes []Route) []Route {
+	var expanded []Route
+	for _, route := range routes {
+		if route.Method != "ALL" {
+			expanded = append(expanded, route)
+			continue
+		}
+		for _, method := range openAPIMethods {
+			copy := route
+			copy.Method = method
+			copy.Middleware = append([]string(nil), route.Middleware...)
+			expanded = append(expanded, copy)
+		}
+		connect := route
+		connect.Method = "CONNECT"
+		connect.Middleware = append([]string(nil), route.Middleware...)
+		connect.Unresolved = ReasonUnsupportedMethod
+		expanded = append(expanded, connect)
+	}
+	return expanded
 }
 
 // extractFunc 抽取单个函数体内的分组与路由注册。

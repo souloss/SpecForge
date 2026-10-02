@@ -30,11 +30,12 @@ type Route struct {
 
 // Unresolved 归因枚举。
 const (
-	ReasonWildcard      = "wildcard-path"     // 路径含通配符，非合法 OpenAPI path
-	ReasonLoop          = "loop-registration" // 循环/表驱动注册，path 非字面量
-	ReasonDynamic       = "dynamic-path"      // 运行时拼接路径
-	ReasonDynamicMethod = "dynamic-method"    // HTTP 方法不是静态字符串
-	ReasonNoHandler     = "no-handler"        // 末参无法解析为符号
+	ReasonWildcard          = "wildcard-path"      // 路径含通配符，非合法 OpenAPI path
+	ReasonLoop              = "loop-registration"  // 循环/表驱动注册，path 非字面量
+	ReasonDynamic           = "dynamic-path"       // 运行时拼接路径
+	ReasonDynamicMethod     = "dynamic-method"     // HTTP 方法不是静态字符串
+	ReasonUnsupportedMethod = "unsupported-method" // 框架方法无法表示为 OpenAPI operation
+	ReasonNoHandler         = "no-handler"         // 末参无法解析为符号
 )
 
 // Framework 框架适配器契约。

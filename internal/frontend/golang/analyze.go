@@ -50,10 +50,19 @@ func (*Frontend) IsSource(name string) bool {
 // Analyze 实现 frontend.Frontend。
 func (*Frontend) Analyze(ctx context.Context, req frontend.Request) (*frontend.Analysis, error) {
 	end := req.Stage("load")
-	l, err := loader.LoadRepo(req.RepoDir)
+	l, err := loader.LoadRepoContext(ctx, req.RepoDir)
 	end()
 	if err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("%w: %v", frontend.ErrConfig, err)
+	}
+	if !l.HasService(req.Service) {
+		if len(l.Errors) > 0 {
+			return nil, fmt.Errorf("%w: service %q was not found after package loading errors: %s", frontend.ErrConfig, req.Service, strings.Join(l.Errors, "; "))
+		}
+		return nil, fmt.Errorf("%w: service %q was not found", frontend.ErrConfig, req.Service)
 	}
 	an := &frontend.Analysis{Service: serviceTitle(req.Service, l), Handlers: map[string]string{}}
 	learned, err := adapter.LoadSpecs(filepath.Join(req.RepoDir, adaptersDir))
@@ -102,6 +111,8 @@ func (*Frontend) Analyze(ctx context.Context, req frontend.Request) (*frontend.A
 	routes := extractAllRoutes(g, fws)
 	an.Stats.Routes = len(routes)
 	routes = expandWildcards(routes, prof)
+	an.Stats.RoutesUnique, an.Stats.RoutesCollapsed = routeIdentityStats(routes)
+	an.UnresolvedRoutes = unresolvedRouteIssues(routes, prog.RelPath)
 	var resolved []adapter.Route
 	for _, r := range routes {
 		if r.Unresolved == "" {
@@ -144,12 +155,76 @@ func (*Frontend) Analyze(ctx context.Context, req frontend.Request) (*frontend.A
 			end()
 		}
 	}
+	an.Facts = append(an.Facts, unresolvedRouteFacts(routes)...)
 	an.Catalog = make(map[string]frontend.ErrorCode, len(catalog))
 	for id, e := range catalog {
 		an.Catalog[id] = frontend.ErrorCode{Symbol: id, Code: e.Code, Msg: e.Msg}
 	}
 	an.SuccessCode = successCodeOf(prof)
 	return an, nil
+}
+
+func routeIdentityStats(routes []adapter.Route) (unique, collapsed int) {
+	seen := make(map[string]bool, len(routes))
+	for _, route := range routes {
+		if route.Unresolved != "" && route.Unresolved != adapter.ReasonNoHandler {
+			continue
+		}
+		if route.Method == "" || route.Path == "" {
+			continue
+		}
+		key := facts.OpKey(route.Method, route.Path)
+		if seen[key] {
+			collapsed++
+			continue
+		}
+		seen[key] = true
+		unique++
+	}
+	return unique, collapsed
+}
+
+func unresolvedRouteIssues(routes []adapter.Route, relativePath func(string) string) []frontend.RouteIssue {
+	var issues []frontend.RouteIssue
+	for _, route := range routes {
+		if route.Unresolved == "" {
+			continue
+		}
+		file := route.File
+		if relativePath != nil && file != "" {
+			file = relativePath(file)
+		}
+		issues = append(issues, frontend.RouteIssue{
+			Method: route.Method, Path: route.Path, RawPath: route.RawPath, Handler: route.Handler,
+			File: file, Line: route.Line, Reason: route.Unresolved,
+		})
+	}
+	return issues
+}
+
+func unresolvedRouteFacts(routes []adapter.Route) []*facts.Fact {
+	var generated []*facts.Fact
+	for _, route := range routes {
+		if route.Unresolved != adapter.ReasonNoHandler || route.Method == "" || route.Path == "" {
+			continue
+		}
+		generated = append(generated, &facts.Fact{
+			ID:   "contract:" + facts.OpKey(route.Method, route.Path),
+			Kind: facts.KindContract,
+			Value: facts.ContractPayload{
+				Responses: []facts.ResponseFact{{
+					Status: 200, Description: "Response contract unresolved because the route handler is not statically resolvable.", Raw: true,
+				}},
+				Gaps: []string{"route handler is not statically resolvable: " + route.Unresolved},
+			},
+			Source: facts.SourceStatic, Confidence: 0.35, Status: "unresolved",
+			Evidence: []facts.Evidence{{
+				File: route.File, StartLine: route.Line, EndLine: route.Line,
+				Quote: "route registration with unresolved handler: " + route.RawPath,
+			}},
+		})
+	}
+	return generated
 }
 
 // opRun 一轮逐 operation 契约分析的输入（L2 采纳新包装器后以同一输入重跑）。

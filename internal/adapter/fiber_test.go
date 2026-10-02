@@ -5,6 +5,29 @@ import (
 	"testing"
 )
 
+func TestExpandAllMethodRoutes(t *testing.T) {
+	got := expandAllMethodRoutes([]Route{{Method: "ALL", Path: "/proxy/{wildcard}", Handler: "proxy.Handler", Unresolved: ReasonWildcard}})
+	if len(got) != len(openAPIMethods)+1 {
+		t.Fatalf("expanded route count = %d, want %d: %+v", len(got), len(openAPIMethods)+1, got)
+	}
+	methods := make(map[string]Route, len(got))
+	for _, route := range got {
+		if route.Method == "ALL" {
+			t.Fatalf("ALL must not reach OpenAPI compilation: %+v", route)
+		}
+		methods[route.Method] = route
+	}
+	for _, method := range openAPIMethods {
+		route, ok := methods[method]
+		if !ok || route.Unresolved != ReasonWildcard || route.Handler != "proxy.Handler" {
+			t.Errorf("expanded %s route = %+v, found=%v", method, route, ok)
+		}
+	}
+	if route := methods["CONNECT"]; route.Unresolved != ReasonUnsupportedMethod {
+		t.Errorf("CONNECT route = %+v, want unresolved reason %q", route, ReasonUnsupportedMethod)
+	}
+}
+
 func TestNormalizePath(t *testing.T) {
 	cases := []struct {
 		in       string

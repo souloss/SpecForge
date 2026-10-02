@@ -40,6 +40,8 @@ type Frontend interface {
 type Request struct {
 	RepoDir      string              // 仓库根
 	Service      string              // 服务过滤名；空 = 全仓
+	ServiceRoot  string              // 可选服务源码根；空 = 由前端按 Service 发现
+	Manifest     ServiceManifest     // 语言无关服务边界描述
 	ProfilePath  string              // 约定画像文件；空 = 前端默认查找
 	Provider     infer.Provider      // 可选 LLM（前端内的 LLM 步骤，如画像学习）；nil = 离线
 	LearnProfile bool                // 是否用 LLM 学习仓库约定
@@ -50,19 +52,20 @@ type Request struct {
 
 // Analysis 前端分析结果。
 type Analysis struct {
-	Program     Program              // 可查询的程序视图（LLM 证据、工具、证据闸门）
-	Service     string               // 产物标题用的服务名
-	Framework   string               // 识别出的框架（逗号分隔；未识别为 unknown）
-	Facts       []*facts.Fact        // 静态事实（route/contract/schema/security/enrichment）
-	Handlers    map[string]string    // operation 键（facts.OpKey）→ handler 符号 ID
-	Catalog     map[string]ErrorCode // 错误码目录（符号 ID → 码）
-	SuccessCode int                  // 业务信封的成功码（无信封约定时为 0）
-	Stats       Stats                // 统计
-	OpFailures  []OpFailure          // 分析失败被隔离的 operation
-	Wrappers    StepStats            // L2 LLM 包装器摘要统计
-	Adapter     StepStats            // L3 LLM 适配器生成统计
-	Routes      StepStats            // L4 通用前端路由发现统计（按路由计）
-	Contracts   StepStats            // L4 通用前端契约抽取统计（按 operation 计）
+	Program          Program              // 可查询的程序视图（LLM 证据、工具、证据闸门）
+	Service          string               // 产物标题用的服务名
+	Framework        string               // 识别出的框架（逗号分隔；未识别为 unknown）
+	Facts            []*facts.Fact        // 静态事实（route/contract/schema/security/enrichment）
+	Handlers         map[string]string    // operation 键（facts.OpKey）→ handler 符号 ID
+	Catalog          map[string]ErrorCode // 错误码目录（符号 ID → 码）
+	SuccessCode      int                  // 业务信封的成功码（无信封约定时为 0）
+	Stats            Stats                // 统计
+	UnresolvedRoutes []RouteIssue         // 未能生成 operation 的路由注册及原因
+	OpFailures       []OpFailure          // 分析失败被隔离的 operation
+	Wrappers         StepStats            // L2 LLM 包装器摘要统计
+	Adapter          StepStats            // L3 LLM 适配器生成统计
+	Routes           StepStats            // L4 通用前端路由发现统计（按路由计）
+	Contracts        StepStats            // L4 通用前端契约抽取统计（按 operation 计）
 }
 
 // StepStats 前端内一个 LLM 步骤的统计。
@@ -81,7 +84,20 @@ type Stats struct {
 	Routes           int // 抽取的路由数（展开前）
 	RoutesResolved   int // 可生成 operation 的路由数
 	RoutesUnresolved int // 仍未解析的路由数
+	RoutesUnique     int // 按 HTTP method + path 去重后的 operation 身份数
+	RoutesCollapsed  int // 因 method + path 相同而折叠的注册数
 	SinkSites        int // 事实构造阶段产出的事实数
+}
+
+// RouteIssue describes one route registration that could not become an OpenAPI operation.
+type RouteIssue struct {
+	Method  string `json:"method,omitempty"`
+	Path    string `json:"path,omitempty"`
+	RawPath string `json:"raw_path,omitempty"`
+	Handler string `json:"handler,omitempty"`
+	File    string `json:"file,omitempty"`
+	Line    int    `json:"line,omitempty"`
+	Reason  string `json:"reason"`
 }
 
 // OpFailure 单个 operation 分析失败（被隔离，不影响其它 operation）。
@@ -177,6 +193,15 @@ type Check struct {
 
 // Service 仓库内的一个服务。
 type Service struct {
-	Name string `json:"name"` // 服务名（gen --service 取值）
-	Dir  string `json:"dir"`  // 入口目录（仓库相对路径）
+	Name       string   `json:"name"`                 // 服务名（gen --service 取值）
+	Dir        string   `json:"dir"`                  // 入口目录（仓库相对路径）
+	Entrypoint string   `json:"entrypoint,omitempty"` // 服务入口符号或文件
+	Evidence   []string `json:"evidence,omitempty"`   // 服务识别依据
+}
+
+type ServiceManifest struct {
+	Name       string   `json:"name,omitempty"`
+	Root       string   `json:"root,omitempty"`
+	Entrypoint string   `json:"entrypoint,omitempty"`
+	Evidence   []string `json:"evidence,omitempty"`
 }

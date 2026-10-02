@@ -13,9 +13,12 @@ import (
 // 输入全部是静态管线已算出的证据：LLM 只负责把静态够不到的缺口转成结构化事实，
 // 产出由 engine 在代码图上逐条复核（字段/错误码必须能在切片源码里找到出处）。
 type GapTask struct {
-	Method string   `json:"method"` // HTTP 方法，如 POST
-	Path   string   `json:"path"`   // OpenAPI 路径，如 /ipo/v1/OrderCreate
-	Gaps   []string `json:"gaps"`   // 缺口描述（静态管线原文）
+	Source        string   `json:"source,omitempty"`        // static|openapi|runtime|documentation
+	Operation     string   `json:"operation,omitempty"`     // stable operation identity
+	AllowedFields []string `json:"allowedFields,omitempty"` // fields the model may fill
+	Method        string   `json:"method"`                  // HTTP 方法，如 POST
+	Path          string   `json:"path"`                    // OpenAPI 路径，如 /ipo/v1/OrderCreate
+	Gaps          []string `json:"gaps"`                    // 缺口描述（静态管线原文）
 	// Sources 调用图切片源码（handler → service → 错误/数据来源），按相关性排序并受体积上限约束。
 	Sources []SourceSnippet `json:"sources"`
 	// DynamicErrorSites 值流不可反推的错误来源点「表达式@file:line」（错误缺口的精确定位）。

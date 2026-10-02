@@ -82,7 +82,7 @@ var stringLiteral = regexp.MustCompile("\"([^\"]*)\"|'([^']*)'|`([^`]*)`")
 var pathParam = regexp.MustCompile(`:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)(?::[^}]*)?\}|<(?:[A-Za-z_]\w*:)?([A-Za-z_]\w*)>`)
 
 // validMethods 允许的 HTTP 方法。
-var validMethods = map[string]bool{"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true, "HEAD": true, "OPTIONS": true}
+var validMethods = map[string]bool{"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true, "HEAD": true, "OPTIONS": true, "TRACE": true}
 
 // validIn 参数位置取值。
 var validIn = map[string]bool{"query": true, "path": true, "header": true, "cookie": true}
@@ -140,7 +140,25 @@ func (*Frontend) Analyze(ctx context.Context, req frontend.Request) (*frontend.A
 		return nil, fmt.Errorf("%w: %w", frontend.ErrConfig, ErrNeedsLLM)
 	}
 	end := req.Stage("scan")
-	prog, err := NewProgram(req.RepoDir)
+	serviceRoot := req.Manifest.Root
+	if serviceRoot == "" {
+		serviceRoot = req.ServiceRoot
+	}
+	if req.Service != "" && serviceRoot == "" {
+		return nil, fmt.Errorf("%w: generic service %q requires --service-root", frontend.ErrConfig, req.Service)
+	}
+	root := req.RepoDir
+	if serviceRoot != "" {
+		if filepath.IsAbs(serviceRoot) {
+			root = serviceRoot
+		} else {
+			root = filepath.Join(req.RepoDir, serviceRoot)
+		}
+	}
+	if info, statErr := os.Stat(root); statErr != nil || !info.IsDir() {
+		return nil, fmt.Errorf("%w: service root %q is not a readable directory", frontend.ErrConfig, root)
+	}
+	prog, err := NewProgram(root)
 	if err == nil && len(prog.Files()) == 0 {
 		err = fmt.Errorf("no source files found")
 	}
@@ -164,6 +182,8 @@ func (*Frontend) Analyze(ctx context.Context, req frontend.Request) (*frontend.A
 	end()
 	an.Routes = rst
 	an.Stats.Routes, an.Stats.RoutesResolved = rst.Attempted, len(routes)
+	an.Stats.RoutesUnique = len(routes)
+	an.Stats.RoutesCollapsed = max(0, rst.Attempted-rst.Rejected-len(routes))
 	req.Log.Info("通用前端路由发现完成", "files", len(cands), "routes", len(routes), "rejected", rst.Rejected, "failed", rst.Failed)
 
 	end = req.Stage("llm-contracts")
@@ -394,7 +414,11 @@ func extract(ctx context.Context, req frontend.Request, prog *Program, routes []
 		for _, s := range src {
 			o.text += s.Code + "\n"
 		}
-		o.contract, o.err = infer.ExtractContract(ctx, req.Provider, infer.ContractTask{Method: r.method, Path: r.path, Sources: src}, tools)
+		o.contract, o.err = infer.ExtractContract(ctx, req.Provider, infer.ContractTask{
+			Source: "generic", Operation: r.method + " " + r.path,
+			AllowedFields: []string{"params", "requestBody", "responses"},
+			Method:        r.method, Path: r.path, Sources: src,
+		}, tools)
 		outs[i] = o
 	})
 	var st frontend.StepStats

@@ -2,6 +2,7 @@ package infer
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -32,5 +33,27 @@ func TestResolveGapsFallsBackWhenToolTurnsExhausted(t *testing.T) {
 	}
 	if len(res.ErrorSites) != 1 || res.ErrorSites[0].Kind != SiteKindUncoded {
 		t.Fatalf("unexpected resolution: %+v", res)
+	}
+}
+
+func TestGapRequestCarriesUnifiedMetadata(t *testing.T) {
+	task := GapTask{
+		Source:        "static",
+		Operation:     "POST /orders",
+		AllowedFields: []string{"response.error_codes", "response.schema"},
+		Method:        "POST",
+		Path:          "/orders",
+		Gaps:          []string{"response.error_codes"},
+	}
+	req, err := GapRequest("system", task, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got GapTask
+	if err := json.Unmarshal([]byte(req.Prompt), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.Source != task.Source || got.Operation != task.Operation || len(got.AllowedFields) != 2 {
+		t.Fatalf("metadata was not preserved: %+v", got)
 	}
 }

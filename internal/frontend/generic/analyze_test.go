@@ -1,8 +1,12 @@
 package generic
 
 import (
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/specforge/specforge/internal/infer"
 )
 
 // TestNormalizePath 各框架路径参数写法归一为 OpenAPI {name}。
@@ -21,6 +25,25 @@ func TestNormalizePath(t *testing.T) {
 		if got != want.path || !reflect.DeepEqual(params, want.params) {
 			t.Errorf("normalizePath(%q) = %q %v, want %q %v", in, got, params, want.path, want.params)
 		}
+	}
+}
+
+func TestVerifyRouteAllowsTraceButNotConnect(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "routes.js")
+	if err := os.WriteFile(file, []byte("router.trace('/events', traceEvents)\nfunction traceEvents() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prog, err := NewProgram(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trace, err := verifyRoute(prog, file, infer.DiscoveredRoute{Method: "TRACE", Path: "/events", Handler: "traceEvents", Line: 1})
+	if err != nil || trace.method != "TRACE" {
+		t.Fatalf("TRACE route = %+v, error = %v", trace, err)
+	}
+	if _, err := verifyRoute(prog, file, infer.DiscoveredRoute{Method: "CONNECT", Path: "/events", Handler: "traceEvents", Line: 1}); err == nil {
+		t.Fatal("CONNECT cannot be represented as an OpenAPI Path Item operation")
 	}
 }
 

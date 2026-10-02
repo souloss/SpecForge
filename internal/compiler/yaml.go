@@ -264,6 +264,12 @@ func writeSchema(w func(string, ...interface{}), b *strings.Builder, sc *schema.
 	if sc.Format != "" && !sc.Nullable {
 		w("%sformat: %s\n", pad, sc.Format)
 	}
+	if sc.ContentEncoding != "" {
+		w("%scontentEncoding: %s\n", pad, quoteIfNeeded(sc.ContentEncoding))
+	}
+	if sc.ContentMediaType != "" {
+		w("%scontentMediaType: %s\n", pad, quoteIfNeeded(sc.ContentMediaType))
+	}
 	if sc.Description != "" {
 		w("%sdescription: %s\n", pad, quoteIfNeeded(sc.Description))
 	}
@@ -476,10 +482,24 @@ func writeDiscoveredBody(w func(string, ...interface{}), p4 string, r ResponseOu
 		}
 	}
 	if len(variants) == 1 && variants[0].Raw && !variants[0].hasData() {
+		if !r.HasBody {
+			return
+		}
+		contentType := r.ContentType
+		if contentType == "" {
+			contentType = "application/json"
+		}
+		w("%scontent:\n", p4)
+		w("%s  %s:\n", p4, quoteIfNeeded(contentType))
+		w("%s    schema: {}\n", p4)
 		return
 	}
 	w("%scontent:\n", p4)
-	w("%s  application/json:\n", p4)
+	contentType := r.ContentType
+	if contentType == "" {
+		contentType = "application/json"
+	}
+	w("%s  %s:\n", p4, quoteIfNeeded(contentType))
 	w("%s    schema:\n", p4)
 	p5 := p4 + "      "
 	if len(variants) == 1 {

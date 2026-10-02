@@ -62,7 +62,7 @@ func (*Frontend) Services(repo string) []frontend.Service {
 	svcs, _ := loader.ListServices(repo)
 	out := make([]frontend.Service, 0, len(svcs))
 	for _, s := range svcs {
-		out = append(out, frontend.Service{Name: s.Name, Dir: s.Dir})
+		out = append(out, frontend.Service{Name: s.Name, Dir: s.Dir, Entrypoint: s.Entrypoint, Evidence: s.Evidence})
 	}
 	return out
 }

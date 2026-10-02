@@ -654,9 +654,9 @@ func (b *ContractPayloadBuilder) syntheticEnvelopeFact(env slicing.SyntheticEnve
 			sc.Required = append(sc.Required, f.Key)
 		}
 	}
-	ev := facts.Evidence{File: b.evFile, StartLine: b.route.Line, EndLine: b.route.Line, BlobSHA: b.blob}
+	ev := facts.NewEvidence(facts.SourceStatic, b.evFile, b.route.Line, b.route.Line, b.blob, "")
 	if sym := b.g.Sym(env.Fn); sym != nil {
-		ev = facts.Evidence{File: sym.File, StartLine: sym.Line, EndLine: sym.Line, BlobSHA: b.g.FileHashOf(sym.File)}
+		ev = facts.NewEvidence(facts.SourceStatic, sym.File, sym.Line, sym.Line, b.g.FileHashOf(sym.File), "")
 	}
 	return &facts.Fact{
 		ID: "schema:" + env.ID, Kind: facts.KindSchema, Value: facts.SchemaPayload{Schema: sc},

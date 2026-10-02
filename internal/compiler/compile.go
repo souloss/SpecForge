@@ -37,20 +37,23 @@ type Document struct {
 
 // Operation 一个 operation 的最终形态（渲染器输入，也是 operations.json / explain --json 的机器契约）。
 type Operation struct {
-	Method      string        `json:"method"`       // HTTP 方法（大写）
-	Path        string        `json:"path"`         // OpenAPI 路径模板
-	OperationID string        `json:"operation_id"` // operationId
-	Summary     string        `json:"summary"`      // 一行摘要（godoc 或 LLM 增强）
-	Description string        `json:"description"`  // 补充描述
-	Tags        []string      `json:"tags"`         // 分组标签
-	Params      []ParamOut    `json:"params"`       // 参数（稳定排序）
-	Body        *BodyOut      `json:"body"`         // 请求体；nil = 无
-	Responses   []ResponseOut `json:"responses"`    // 响应（按状态码排序）
-	Security    []string      `json:"security"`     // 安全方案名
-	Confidence  float64       `json:"confidence"`   // 置信度 0~1
-	Unknowns    []string      `json:"unknowns"`     // 未解析项（缺口）
-	Evidence    []string      `json:"evidence"`     // 证据「标签 file:line」
-	Stale       bool          `json:"stale"`        // 证据已过期（保留字段）
+	Method      string                `json:"method"`       // HTTP 方法（大写）
+	Path        string                `json:"path"`         // OpenAPI 路径模板
+	State       string                `json:"state"`        // Contract Graph 聚合状态
+	OperationID string                `json:"operation_id"` // operationId
+	Summary     string                `json:"summary"`      // 一行摘要（godoc 或 LLM 增强）
+	Description string                `json:"description"`  // 补充描述
+	Tags        []string              `json:"tags"`         // 分组标签
+	Params      []ParamOut            `json:"params"`       // 参数（稳定排序）
+	Body        *BodyOut              `json:"body"`         // 请求体；nil = 无
+	Responses   []ResponseOut         `json:"responses"`    // 响应（按状态码排序）
+	Security    []string              `json:"security"`     // 安全方案名
+	Confidence  float64               `json:"confidence"`   // 置信度 0~1
+	Unknowns    []string              `json:"unknowns"`     // 未解析项（缺口）
+	Evidence    []string              `json:"evidence"`     // 证据「标签 file:line」
+	Sources     []string              `json:"sources"`      // 参与决策的证据来源
+	Diagnostics []contract.Diagnostic `json:"diagnostics,omitempty"`
+	Stale       bool                  `json:"stale"` // 证据已过期（保留字段）
 }
 
 // ParamOut 输出参数。
@@ -77,6 +80,7 @@ type BodyOut struct {
 // ResponseOut 响应行（同状态码的多条信封码合并为一行）。
 type ResponseOut struct {
 	Status        string   `json:"status"`         // HTTP 状态码
+	ContentType   string   `json:"content_type"`   // 响应媒体类型
 	Codes         []int    `json:"codes"`          // 信封码集合（enum）
 	HasUnresolved bool     `json:"has_unresolved"` // 是否存在未解析的错误行
 	HasDynamic    bool     `json:"has_dynamic"`    // 是否存在业务码取自运行时值的错误行（码集合不封闭）
@@ -213,7 +217,7 @@ func Compile(in Input) (*Document, error) {
 	for opKey, cp := range contractByOp {
 		method, path := splitOpKey(opKey)
 		op := Operation{
-			Method: method, Path: path,
+			Method: method, Path: path, State: "verified",
 			OperationID: cp.OperationID,
 			Tags:        cp.Tags,
 			Unknowns:    append([]string(nil), cp.Gaps...), // 静态缺口（报告逐 operation 展示）
@@ -250,9 +254,12 @@ func Compile(in Input) (*Document, error) {
 			st := fmt.Sprintf("%d", r.Status)
 			g := respGroups[st]
 			if g == nil {
-				g = &ResponseOut{Status: st, HasBody: r.HasBody}
+				g = &ResponseOut{Status: st, ContentType: r.ContentType, HasBody: r.HasBody}
 				respGroups[st] = g
 				respOrder = append(respOrder, st)
+			}
+			if g.ContentType == "" {
+				g.ContentType = r.ContentType
 			}
 			code, msg := -1, ""
 			if r.Envelope != nil {
@@ -260,7 +267,10 @@ func Compile(in Input) (*Document, error) {
 			}
 			if r.Raw {
 				// 原生写出（无业务信封）：信封码无意义，描述取 HTTP 状态文本（错误分支注明）。
-				desc := statusText(r.Status)
+				desc := r.Description
+				if desc == "" {
+					desc = statusText(r.Status)
+				}
 				if r.Failure {
 					desc += errorBranchSuffix
 				}
@@ -325,9 +335,35 @@ func Compile(in Input) (*Document, error) {
 		op.Security = cp.Security
 		// 置信度: contract 事实的 confidence（由 engine 计算）
 		if f := factByID[opKey]; f != nil {
+			op.State = f.Status
+			if in.Graph != nil {
+				if graphOp := in.Graph.Operations[contract.OperationKey(method, path)]; graphOp != nil {
+					op.Diagnostics = append([]contract.Diagnostic(nil), graphOp.Diagnostics...)
+					if len(op.Sources) == 0 {
+						for _, ev := range graphOp.Evidence {
+							if ev.Source != "" {
+								op.Sources = appendUniqStr(op.Sources, string(ev.Source))
+							}
+						}
+					}
+				}
+			}
 			op.Confidence = f.Confidence
 			for _, ev := range f.Evidence {
-				op.Evidence = appendUniqStr(op.Evidence, fmt.Sprintf("%s %s:%d", evidenceLabel(ev), ev.File, ev.StartLine))
+				label := evidenceLabel(ev)
+				source := ev.Source
+				if source == "" {
+					source = string(f.Source)
+				}
+				if source != "" {
+					op.Sources = appendUniqStr(op.Sources, source)
+					label = source + ":" + label
+				}
+				location := ev.File
+				if ev.StartLine > 0 {
+					location = fmt.Sprintf("%s:%d", ev.File, ev.StartLine)
+				}
+				op.Evidence = appendUniqStr(op.Evidence, fmt.Sprintf("%s %s", label, location))
 			}
 		}
 		d.Operations = append(d.Operations, op)
@@ -478,7 +514,7 @@ func writeShape(b *strings.Builder, sc *schema.Schema, depth int) {
 		b.WriteString("not:")
 		writeShape(b, sc.Not, depth+1)
 	}
-	fmt.Fprintf(b, "t:%s;f:%s;nb:%v;n:%v;ad:%v;", sc.Type, sc.Format, sc.NoBody, sc.Nullable, sc.Additional)
+	fmt.Fprintf(b, "t:%s;f:%s;ce:%s;cmt:%s;nb:%v;n:%v;ad:%v;", sc.Type, sc.Format, sc.ContentEncoding, sc.ContentMediaType, sc.NoBody, sc.Nullable, sc.Additional)
 	if len(sc.Enum) > 0 {
 		b.WriteString("e:" + strings.Join(sc.Enum, "|") + ";")
 	}
@@ -584,6 +620,8 @@ func methodOrder(m string) int {
 		return 5
 	case "options":
 		return 6
+	case "trace":
+		return 7
 	}
 	return 9
 }

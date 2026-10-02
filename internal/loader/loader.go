@@ -7,6 +7,7 @@
 package loader
 
 import (
+	"context"
 	"fmt"
 	"go/parser"
 	"go/token"
@@ -23,6 +24,7 @@ type Service struct {
 	Name       string // 服务名，如 "service-ipo"
 	Dir        string // 相对仓库根的目录
 	Entrypoint string // main 函数所在包
+	Evidence   []string
 }
 
 // Loaded 仓库加载结果：包集合 + 服务清单。
@@ -32,10 +34,22 @@ type Loaded struct {
 	Services []Service
 	Pkgs     []*packages.Package
 	Fset     *token.FileSet
+	Errors   []string // package loading diagnostics retained for actionable config errors
 }
 
 // LoadRepo 加载整个仓库。dir 必须包含 go.mod。
 func LoadRepo(dir string) (*Loaded, error) {
+	return LoadRepoContext(context.Background(), dir)
+}
+
+// LoadRepoContext loads repository packages and stops when ctx is canceled.
+func LoadRepoContext(ctx context.Context, dir string) (*Loaded, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -46,6 +60,7 @@ func LoadRepo(dir string) (*Loaded, error) {
 	// 不开 NeedDeps：分析只需仓库内包的语法与类型信息，依赖包走编译器导出数据即可。
 	// 开 NeedDeps 会把全部三方依赖从源码解析+类型检查（实测内存 ×6、耗时 ×2~5），产物不变。
 	cfg := &packages.Config{
+		Context: ctx,
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedSyntax |
 			packages.NeedTypes | packages.NeedTypesInfo | packages.NeedTypesSizes |
 			packages.NeedImports | packages.NeedModule,
@@ -56,6 +71,9 @@ func LoadRepo(dir string) (*Loaded, error) {
 	pkgs, err := packages.Load(cfg, "./...")
 	if err != nil {
 		return nil, fmt.Errorf("load packages: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	var errs []string
 	for _, p := range pkgs {
@@ -68,10 +86,13 @@ func LoadRepo(dir string) (*Loaded, error) {
 	// 容错：只要有类型信息就继续（设计文档 §10.1 tree-sitter 容错解析的对偶）。
 	// 完全无法加载时才报错。
 	if len(pkgs) == 0 {
-		return nil, fmt.Errorf("no packages loaded: %v", strings.Join(errs, "; "))
+		if len(errs) == 0 {
+			return nil, fmt.Errorf("no packages loaded (go list returned no package roots)")
+		}
+		return nil, fmt.Errorf("no packages loaded: %s", strings.Join(errs, "; "))
 	}
 
-	l := &Loaded{Root: abs, Pkgs: pkgs, Fset: pkgs[0].Fset}
+	l := &Loaded{Root: abs, Pkgs: pkgs, Fset: pkgs[0].Fset, Errors: append([]string(nil), errs...)}
 	for _, p := range pkgs {
 		if p.Module != nil && p.Module.Path != "" {
 			l.Module = p.Module.Path
@@ -98,7 +119,7 @@ func detectServices(pkgs []*packages.Package) []Service {
 		if name == "" || name == "main" {
 			name = p.PkgPath
 		}
-		out = append(out, Service{Name: name, Dir: p.PkgPath, Entrypoint: p.PkgPath})
+		out = append(out, Service{Name: name, Dir: p.PkgPath, Entrypoint: p.PkgPath, Evidence: []string{"main package " + p.PkgPath}})
 	}
 	return out
 }
@@ -149,6 +170,21 @@ func (l *Loaded) ServiceFilter(name string) []*packages.Package {
 	return out
 }
 
+// HasService reports whether a named main package was discovered. Callers use
+// this before ServiceFilter so a typo cannot silently become a whole-repository
+// analysis.
+func (l *Loaded) HasService(name string) bool {
+	if name == "" {
+		return true
+	}
+	for _, service := range l.Services {
+		if service.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // pkgByPath 在包集合中按 import path 查找包。
 func pkgByPath(pkgs []*packages.Package, path string) *packages.Package {
 	for _, p := range pkgs {
@@ -191,7 +227,7 @@ func ListServices(root string) ([]Service, error) {
 		seen[dir] = true
 		rel, _ := filepath.Rel(root, dir)
 		name := strings.TrimPrefix(filepath.Base(dir), "cmd-")
-		out = append(out, Service{Name: name, Dir: filepath.ToSlash(rel)})
+		out = append(out, Service{Name: name, Dir: filepath.ToSlash(rel), Entrypoint: filepath.ToSlash(rel), Evidence: []string{"main package at " + filepath.ToSlash(rel) + ".go"}})
 		return nil
 	})
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
