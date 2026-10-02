@@ -195,6 +195,7 @@ func (lp *llmPhase) prepare(it *gapItem) {
 	it.sl = lp.slice(it.handler, sites)
 	method, path := opMethodPath(it.f.ID)
 	it.task = infer.GapTask{
+		Source: "static", Operation: method + " " + path, AllowedFields: []string{"response.error_codes", "response.error_sites", "response.schema"},
 		Method: method, Path: path, Gaps: it.cp.Gaps,
 		Sources: it.sl.snippets, DynamicErrorSites: sites,
 	}
@@ -729,7 +730,7 @@ func (lp *llmPhase) lineEvidence(file string, line int, label string) facts.Evid
 	if line >= 1 && line <= len(lines) {
 		quote = strings.TrimSpace(lines[line-1])
 	}
-	return facts.Evidence{File: file, StartLine: line, EndLine: line, BlobSHA: lp.prog.FileHash(file), Quote: label + " ← " + quote}
+	return facts.NewEvidence(facts.SourceLLM, file, line, line, lp.prog.FileHash(file), label+" ← "+quote)
 }
 
 // lookupCode codeRef → (全限定符号, 目录条目)。末段名在目录中有歧义时拒绝（不猜包）。

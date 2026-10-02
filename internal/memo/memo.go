@@ -36,6 +36,14 @@ var skipDirs = map[string]bool{".git": true, ".specforge": true, "vendor": true,
 // 取 <repo>/.specforge/profile.yaml，不存在记 "default-profile"）+ LLM 运行模式（llmKey）+
 // 仓库内全部源码文件（isSource 由语言前端判定）的内容哈希（按相对路径排序）。
 func Fingerprint(repoDir, service, profilePath, engineVersion, llmKey string, isSource func(name string) bool) (string, error) {
+	return FingerprintWithInputs(repoDir, service, profilePath, engineVersion, llmKey, nil, isSource)
+}
+
+// FingerprintWithInputs extends the repository fingerprint with external input
+// files such as an existing OpenAPI document or runtime observation log.
+// Paths are normalized and content-addressed so changing an input invalidates
+// the run memo without making the external file part of the source scan.
+func FingerprintWithInputs(repoDir, service, profilePath, engineVersion, llmKey string, inputs []string, isSource func(name string) bool) (string, error) {
 	h := sha256.New()
 	for _, part := range []string{formatVersion, engineVersion, service, llmKey} {
 		io.WriteString(h, part+"\x00")
@@ -83,6 +91,23 @@ func Fingerprint(repoDir, service, profilePath, engineVersion, llmKey string, is
 	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
 	for _, f := range files {
 		io.WriteString(h, f.rel+"\x00"+f.hash+"\x00")
+	}
+	var extra []string
+	for _, input := range inputs {
+		abs, err := filepath.Abs(input)
+		if err != nil {
+			return "", err
+		}
+		b, err := os.ReadFile(abs)
+		if err != nil {
+			return "", err
+		}
+		sum := sha256.Sum256(b)
+		extra = append(extra, filepath.ToSlash(abs)+"\x00"+hex.EncodeToString(sum[:]))
+	}
+	sort.Strings(extra)
+	for _, item := range extra {
+		io.WriteString(h, "external\x00"+item+"\x00")
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }

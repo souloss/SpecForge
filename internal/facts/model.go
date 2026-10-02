@@ -38,6 +38,11 @@ type Evidence struct {
 	EndLine   int    `yaml:"endLine"`
 	BlobSHA   string `yaml:"blobSha"`
 	Quote     string `yaml:"quote,omitempty"`
+	Source    string `yaml:"source,omitempty"`
+}
+
+func NewEvidence(source FactSource, file string, startLine, endLine int, blobSHA, quote string) Evidence {
+	return Evidence{File: file, StartLine: startLine, EndLine: endLine, BlobSHA: blobSHA, Quote: quote, Source: string(source)}
 }
 
 // Fact 一条事实。
@@ -154,11 +159,13 @@ type BodyFact struct {
 
 // ResponseFact 响应矩阵行（status × envelope × schema，设计文档 §4.2）。
 type ResponseFact struct {
-	Status     int       `yaml:"status"`
-	Envelope   *Envelope `yaml:"envelope,omitempty"`
-	SchemaType string    `yaml:"schemaType,omitempty"`
-	HasBody    bool      `yaml:"hasBody"`
-	Sink       string    `yaml:"sink"`
+	Status      int       `yaml:"status"`
+	Description string    `yaml:"description,omitempty"`
+	ContentType string    `yaml:"contentType,omitempty"`
+	Envelope    *Envelope `yaml:"envelope,omitempty"`
+	SchemaType  string    `yaml:"schemaType,omitempty"`
+	HasBody     bool      `yaml:"hasBody"`
+	Sink        string    `yaml:"sink"`
 	// Source 该行的事实来源：空 = static；"llm" = 由 LLM 兜底采集补齐。
 	Source string `yaml:"source,omitempty"`
 	// ErrSource 错误行的来源证据（「表达式@file:line」逗号分隔）：未解析行为不可反推点（供 LLM 兜底定位），

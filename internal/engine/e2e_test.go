@@ -129,6 +129,18 @@ func TestRunMemoHit(t *testing.T) {
 	}
 }
 
+func TestRunContractGraphCacheHit(t *testing.T) {
+	factsDir, out1, out2 := t.TempDir(), t.TempDir(), t.TempDir()
+	r1, err := Run(context.Background(), Config{RepoDir: sampleRepo, OutDir: out1, FactCacheDir: filepath.Join(factsDir, "facts.sqlite")})
+	if err != nil || r1.GraphCached {
+		t.Fatalf("first run graph cache state: cached=%v err=%v", r1 != nil && r1.GraphCached, err)
+	}
+	r2, err := Run(context.Background(), Config{RepoDir: sampleRepo, OutDir: out2, FactCacheDir: filepath.Join(factsDir, "facts.sqlite")})
+	if err != nil || !r2.GraphCached {
+		t.Fatalf("second run should hit graph cache: cached=%v err=%v", r2 != nil && r2.GraphCached, err)
+	}
+}
+
 // TestRunLLMCallCache LLM 调用缓存：同一代码第二次运行不再调用模型（memo 关闭，只测调用级缓存）。
 func TestRunLLMCallCache(t *testing.T) {
 	cacheDir := t.TempDir()

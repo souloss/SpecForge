@@ -114,7 +114,7 @@ func summarizeWrapper(g *codegraph.Graph, fnID string, writers map[string]adapte
 		}
 		callee, _ := codegraph.ResolveCallee(call, info)
 		w, ok := writers[callee]
-		if !ok || w.BodyArg >= len(call.Args) {
+		if !ok || w.BodyArg < 0 || w.BodyArg >= len(call.Args) {
 			return true
 		}
 		if f, ok := flowOf(g, call.Args[w.BodyArg], info, params, fd.Body); ok {

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/specforge/specforge/internal/compiler"
+	"github.com/specforge/specforge/internal/contract"
 	"github.com/specforge/specforge/internal/memo"
 	"github.com/specforge/specforge/internal/openapi"
 )
@@ -22,7 +23,24 @@ func renderReport(doc *compiler.Document, res *Result) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# SpecForge 置信度报告\n\n")
 	fmt.Fprintf(&b, "- operations: %d, schema types: %d\n", len(doc.Operations), len(doc.Schemas))
+	fmt.Fprintf(&b, "- cache: run memo=%v, contract graph snapshot=%v\n", res.Cached, res.GraphCached)
 	fmt.Fprintf(&b, "- Contract Graph conflicts: %d, unknown schemas: %d\n", res.Conflicts, res.UnknownSchemas)
+	states := map[string]int{}
+	sources := map[string]int{}
+	for _, operation := range doc.Operations {
+		states[operation.State]++
+		for _, source := range operation.Sources {
+			sources[source]++
+		}
+	}
+	fmt.Fprintf(&b, "- operation states: %s\n", stableCounts(states))
+	fmt.Fprintf(&b, "- evidence sources: %s\n", stableCounts(sources))
+	if len(res.GraphDiagnostics) > 0 {
+		fmt.Fprintf(&b, "- Contract Graph diagnostics: %d\n", len(res.GraphDiagnostics))
+		for _, diagnostic := range res.GraphDiagnostics {
+			fmt.Fprintf(&b, "  - %s: %s\n", diagnostic.Code, diagnostic.Message)
+		}
+	}
 	fmt.Fprintf(&b, "- 低置信 operation (<%.1f): %d\n", lowConfThreshold, res.LowConf)
 	if len(res.Gaps) > 0 {
 		fmt.Fprintf(&b, "- 静态缺口 operation: %d（LLM 兜底后仍有缺口: %d）\n", len(res.Gaps), res.RemainingGaps)
@@ -91,6 +109,19 @@ func renderReport(doc *compiler.Document, res *Result) string {
 	return b.String()
 }
 
+func stableCounts(values map[string]int) string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%d", key, values[key]))
+	}
+	return strings.Join(parts, ", ")
+}
+
 // writeOpOverview 全量 operation 概览表：每个接口的置信度、成功响应体与可静态定出的信封码，
 // 高置信接口不进明细也能在报告中核对。
 func writeOpOverview(b *strings.Builder, doc *compiler.Document) {
@@ -140,6 +171,10 @@ func operationsJSON(doc *compiler.Document) ([]byte, error) {
 	return json.MarshalIndent(OperationsFile{SchemaVersion: SchemaVersion, Operations: doc.Operations}, "", "  ")
 }
 
+func graphJSON(graph *contract.Graph) ([]byte, error) {
+	return graph.MarshalStable()
+}
+
 // ReadOperations 读取 gen 产出的 operations.json（校验契约版本）。
 func ReadOperations(outDir string) (*OperationsFile, error) {
 	b, err := os.ReadFile(filepath.Join(outDir, operationsFile))
@@ -160,7 +195,7 @@ func ReadOperations(outDir string) (*OperationsFile, error) {
 }
 
 // memoArtifacts memo 条目包含的产物（缺任一视为未命中）。
-var memoArtifacts = []string{specFile, reportFile, operationsFile, summaryFile}
+var memoArtifacts = []string{specFile, reportFile, operationsFile, contractFile, summaryFile}
 
 // loadMemo 命中时把产物写回 outDir 并返回摘要回填的 Result。
 func loadMemo(store *memo.Store, fp, outDir string) (*Result, bool) {

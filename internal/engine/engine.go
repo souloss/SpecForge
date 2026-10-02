@@ -21,6 +21,9 @@ import (
 	"time"
 
 	"github.com/specforge/specforge/internal/compiler"
+	"github.com/specforge/specforge/internal/contract"
+	"github.com/specforge/specforge/internal/docsource"
+	"github.com/specforge/specforge/internal/factcache"
 	"github.com/specforge/specforge/internal/facts"
 	"github.com/specforge/specforge/internal/frontend"
 	"github.com/specforge/specforge/internal/frontend/generic"
@@ -28,6 +31,7 @@ import (
 	"github.com/specforge/specforge/internal/infer"
 	"github.com/specforge/specforge/internal/memo"
 	"github.com/specforge/specforge/internal/openapi"
+	"github.com/specforge/specforge/internal/runtime"
 	"github.com/specforge/specforge/internal/schema"
 )
 
@@ -39,10 +43,23 @@ const Version = "0.5.0"
 type Config struct {
 	RepoDir     string // 目标仓库根（含 go.mod）
 	Service     string // 服务过滤名；空 = 全仓全部服务
+	ServiceRoot string // 可选服务源码根（相对 RepoDir 或绝对路径，主要用于 generic 前端）
 	ProfilePath string // 约定画像文件；空 = <repo>/.specforge/profile.yaml 或内置默认
 	OutDir      string // 产物目录；空 = <repo>/.specforge/out
+	// OpenAPIFiles 是额外的已有 OpenAPI 契约输入。它们在编译前导入
+	// Contract Graph，并保留 document/jsonPath 证据。
+	OpenAPIFiles []string
+	// RuntimeFiles are redacted JSONL observation inputs.
+	RuntimeFiles []string
+	// DocumentationFiles are structured human-authored contract inputs.
+	DocumentationFiles []string
+	// Quality gates applied after all sources are merged.
+	FailOnConflict   bool
+	FailOnUnresolved bool
+	MinConfidence    float64
 	// MemoDir 运行级 memo 缓存目录；空 = 禁用（每次全量重算）。
-	MemoDir string
+	MemoDir      string
+	FactCacheDir string // optional SQLite normalized graph cache
 	// LLMCacheDir LLM 调用缓存目录（内容寻址 + 读集校验）；空 = 禁用。
 	LLMCacheDir string
 	// Provider 可选 LLM 供应方；非 nil 时对静态缺口做档位2/3 兜底采集。
@@ -119,37 +136,42 @@ type OpFailure = frontend.OpFailure
 
 // Result 一次运行的统计与产物（CLI、--json 与 memo 摘要共用；Doc/FactsList 不序列化）。
 type Result struct {
-	Service          string           `json:"service"`           // 服务名（全仓模式为模块路径）
-	Repo             string           `json:"repo"`              // 仓库目录
-	Fingerprint      string           `json:"fingerprint"`       // 输入指纹（memo 键）
-	Cached           bool             `json:"cached"`            // 命中运行级 memo（本次未重新分析）
-	Packages         int              `json:"packages"`          // 分析的包数
-	Symbols          int              `json:"symbols"`           // 符号数
-	CallEdges        int              `json:"call_edges"`        // 调用边数
-	Routes           int              `json:"routes"`            // 抽取的路由数（展开前）
-	RoutesResolved   int              `json:"routes_resolved"`   // 可生成 operation 的路由数（展开/模板化后）
-	RoutesUnresolved int              `json:"routes_unresolved"` // 仍未解析的路由数
-	Operations       int              `json:"operations"`        // 输出的 operation 数
-	SchemaTypes      int              `json:"schema_types"`      // schema 类型数
-	SinkSites        int              `json:"sink_sites"`        // 事实构造阶段产出的事实数（旧口径，保留兼容）
-	Facts            int              `json:"facts"`             // 通过证据闸门的事实数
-	Dropped          int              `json:"dropped"`           // 证据闸门丢弃的事实数
-	DroppedIDs       []string         `json:"dropped_ids"`       // 被丢弃事实的 ID（报告列出，便于排查证据缺失）
-	LowConf          int              `json:"low_confidence"`    // 低置信 operation 数
-	Gaps             []string         `json:"gaps"`              // LLM 兜底前的静态缺口（"METHOD /path: gap1; gap2"）
-	RemainingGaps    int              `json:"remaining_gaps"`    // 最终仍有缺口的 operation 数
-	Conflicts        int              `json:"conflicts"`         // Contract Graph 中保留的候选冲突数
-	UnknownSchemas   int              `json:"unknown_schemas"`   // 显式未知 schema 数
-	OpFailures       []OpFailure      `json:"op_failures"`       // 分析失败被隔离的 operation
-	LLM              llmStats         `json:"llm"`               // LLM 兜底统计
-	LLMCalls         int              `json:"llm_calls"`         // 实际发生的模型调用次数（缓存命中不计）
-	LLMUsage         infer.Usage      `json:"llm_usage"`         // 实际 token 用量
-	LLMCache         infer.CacheStats `json:"llm_cache"`         // LLM 调用缓存统计
-	Stages           []Stage          `json:"stages"`            // 各阶段耗时
-	ElapsedMs        int64            `json:"elapsed_ms"`        // 总耗时
-	OutDir           string           `json:"out_dir"`           // 产物目录
-	Spec             string           `json:"spec"`              // openapi.yaml 路径
-	Report           string           `json:"report"`            // report.md 路径
+	Service          string                `json:"service"`           // 服务名（全仓模式为模块路径）
+	Repo             string                `json:"repo"`              // 仓库目录
+	Fingerprint      string                `json:"fingerprint"`       // 输入指纹（memo 键）
+	Cached           bool                  `json:"cached"`            // 命中运行级 memo（本次未重新分析）
+	GraphCached      bool                  `json:"graph_cached"`      // 命中 SQLite Contract Graph 快照
+	Packages         int                   `json:"packages"`          // 分析的包数
+	Symbols          int                   `json:"symbols"`           // 符号数
+	CallEdges        int                   `json:"call_edges"`        // 调用边数
+	Routes           int                   `json:"routes"`            // 抽取的路由数（展开前）
+	RoutesResolved   int                   `json:"routes_resolved"`   // 可生成 operation 的路由数（展开/模板化后）
+	RoutesUnresolved int                   `json:"routes_unresolved"` // 仍未解析的路由数
+	RoutesUnique     int                   `json:"routes_unique"`     // method + path 去重后的 operation 身份数
+	RoutesCollapsed  int                   `json:"routes_collapsed"`  // 重复 method + path 注册折叠数
+	UnresolvedRoutes []frontend.RouteIssue `json:"unresolved_routes"`
+	Operations       int                   `json:"operations"`      // 输出的 operation 数
+	SchemaTypes      int                   `json:"schema_types"`    // schema 类型数
+	SinkSites        int                   `json:"sink_sites"`      // 事实构造阶段产出的事实数（旧口径，保留兼容）
+	Facts            int                   `json:"facts"`           // 通过证据闸门的事实数
+	Dropped          int                   `json:"dropped"`         // 证据闸门丢弃的事实数
+	DroppedIDs       []string              `json:"dropped_ids"`     // 被丢弃事实的 ID（报告列出，便于排查证据缺失）
+	LowConf          int                   `json:"low_confidence"`  // 低置信 operation 数
+	Gaps             []string              `json:"gaps"`            // LLM 兜底前的静态缺口（"METHOD /path: gap1; gap2"）
+	RemainingGaps    int                   `json:"remaining_gaps"`  // 最终仍有缺口的 operation 数
+	Conflicts        int                   `json:"conflicts"`       // Contract Graph 中保留的候选冲突数
+	UnknownSchemas   int                   `json:"unknown_schemas"` // 显式未知 schema 数
+	GraphDiagnostics []contract.Diagnostic `json:"graph_diagnostics,omitempty"`
+	OpFailures       []OpFailure           `json:"op_failures"` // 分析失败被隔离的 operation
+	LLM              llmStats              `json:"llm"`         // LLM 兜底统计
+	LLMCalls         int                   `json:"llm_calls"`   // 实际发生的模型调用次数（缓存命中不计）
+	LLMUsage         infer.Usage           `json:"llm_usage"`   // 实际 token 用量
+	LLMCache         infer.CacheStats      `json:"llm_cache"`   // LLM 调用缓存统计
+	Stages           []Stage               `json:"stages"`      // 各阶段耗时
+	ElapsedMs        int64                 `json:"elapsed_ms"`  // 总耗时
+	OutDir           string                `json:"out_dir"`     // 产物目录
+	Spec             string                `json:"spec"`        // openapi.yaml 路径
+	Report           string                `json:"report"`      // report.md 路径
 
 	Doc       *compiler.Document `json:"-"` // 编译产物（缓存命中时为 nil）
 	FactsList []*facts.Fact      `json:"-"` // 全部事实（缓存命中时为 nil）
@@ -183,6 +205,7 @@ const (
 	specFile       = "openapi.yaml"    // OpenAPI 产物
 	reportFile     = "report.md"       // 置信度报告
 	operationsFile = "operations.json" // operation 级证据视图（explain 与 agent 消费）
+	contractFile   = "contract.json"   // 规范化 Contract Graph（候选、来源与诊断）
 	summaryFile    = "summary.json"    // 运行摘要（memo 命中时回填 Result）
 )
 
@@ -208,7 +231,9 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 
 	// 0. 运行级 memo：输入指纹未变直接复用上次产物，跳过整个分析管线。
 	end := timer.begin("fingerprint")
-	fp, err := memo.Fingerprint(cfg.RepoDir, cfg.Service, cfg.ProfilePath, engineBuildKey()+"|"+fe.Name(), llmKeyOf(cfg), fe.IsSource)
+	inputs := append(append(append([]string(nil), cfg.OpenAPIFiles...), cfg.RuntimeFiles...), cfg.DocumentationFiles...)
+	qualityKey := fmt.Sprintf("quality:conflict=%v:unresolved=%v:min=%.6f:service-root=%s", cfg.FailOnConflict, cfg.FailOnUnresolved, cfg.MinConfidence, cfg.ServiceRoot)
+	fp, err := memo.FingerprintWithInputs(cfg.RepoDir, cfg.Service, cfg.ProfilePath, engineBuildKey()+"|"+fe.Name()+"|"+qualityKey, llmKeyOf(cfg), inputs, fe.IsSource)
 	end()
 	if err != nil {
 		return nil, err
@@ -228,7 +253,8 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 
 	// 1-5. 语言前端：摄入 → 程序模型 → 路由 → 契约/响应/schema 事实（前端内部阶段各自计时）。
 	an, err := fe.Analyze(ctx, frontend.Request{
-		RepoDir: cfg.RepoDir, Service: cfg.Service, ProfilePath: cfg.ProfilePath,
+		RepoDir: cfg.RepoDir, Service: cfg.Service, ServiceRoot: cfg.ServiceRoot,
+		Manifest: frontend.ServiceManifest{Name: cfg.Service, Root: cfg.ServiceRoot}, ProfilePath: cfg.ProfilePath,
 		Provider: provider, LearnProfile: cfg.LearnProfile, Concurrency: cfg.LLMConcurrency, Log: log, Stage: timer.begin,
 	})
 	if err != nil {
@@ -237,6 +263,8 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	res.Service, res.OpFailures = an.Service, an.OpFailures
 	res.Packages, res.Symbols, res.CallEdges = an.Stats.Packages, an.Stats.Symbols, an.Stats.CallEdges
 	res.Routes, res.RoutesResolved, res.RoutesUnresolved = an.Stats.Routes, an.Stats.RoutesResolved, an.Stats.RoutesUnresolved
+	res.RoutesUnique, res.RoutesCollapsed = an.Stats.RoutesUnique, an.Stats.RoutesCollapsed
+	res.UnresolvedRoutes = append([]frontend.RouteIssue{}, an.UnresolvedRoutes...)
 	res.SinkSites = an.Stats.SinkSites
 	res.LLM.Wrappers, res.LLM.Adapter, res.LLM.Routes, res.LLM.Contracts = an.Wrappers, an.Adapter, an.Routes, an.Contracts
 	factList := an.Facts
@@ -279,7 +307,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	end()
 
 	// 8. 确定性编译
-	end = timer.begin("compile")
+	compileEnd := timer.begin("compile")
 	schemaFacts := map[string]*schema.Schema{}
 	for _, f := range factList {
 		if f.Kind == facts.KindSchema {
@@ -291,7 +319,83 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	res.SchemaTypes = len(schemaFacts)
 	res.FactsList, res.Facts = factList, len(factList)
 	graph := graphFromFacts(factList)
+	graphCached := false
+	factStore, factCacheErr := factcache.Open(cfg.FactCacheDir)
+	if factCacheErr != nil {
+		return nil, fmt.Errorf("open fact cache: %w", factCacheErr)
+	}
+	defer factStore.Close()
+	if cachedGraph, hit, cacheErr := factStore.Load(fp, engineBuildKey()); cacheErr != nil {
+		return nil, fmt.Errorf("load fact cache: %w", cacheErr)
+	} else if hit {
+		graph = cachedGraph
+		graphCached = true
+		res.GraphCached = true
+	}
+	if !graphCached && len(cfg.OpenAPIFiles) > 0 {
+		ingestEnd := timer.begin("ingest-openapi")
+		for _, path := range cfg.OpenAPIFiles {
+			documentGraph, importErr := openapi.Import(path)
+			if importErr != nil {
+				ingestEnd()
+				return nil, fmt.Errorf("%w: import OpenAPI %q: %v", ErrConfig, path, importErr)
+			}
+			mergeContractGraphs(graph, documentGraph)
+		}
+		ingestEnd()
+	}
+	if !graphCached && len(cfg.RuntimeFiles) > 0 {
+		ingestEnd := timer.begin("ingest-runtime")
+		for _, path := range cfg.RuntimeFiles {
+			observationGraph, importErr := runtime.ImportObservations(path)
+			if importErr != nil {
+				ingestEnd()
+				return nil, fmt.Errorf("%w: import runtime observations %q: %v", ErrConfig, path, importErr)
+			}
+			mergeContractGraphs(graph, observationGraph)
+		}
+		ingestEnd()
+	}
+	if !graphCached && len(cfg.DocumentationFiles) > 0 {
+		ingestEnd := timer.begin("ingest-documentation")
+		for _, path := range cfg.DocumentationFiles {
+			documentationGraph, importErr := docsource.Import(path)
+			if importErr != nil {
+				ingestEnd()
+				return nil, fmt.Errorf("%w: import documentation %q: %v", ErrConfig, path, importErr)
+			}
+			mergeContractGraphs(graph, documentationGraph)
+		}
+		ingestEnd()
+	}
+	markGraphStates(graph)
+	if err := factStore.SaveWithRoot(fp, engineBuildKey(), graph, cfg.RepoDir); err != nil {
+		return nil, fmt.Errorf("save fact cache: %w", err)
+	}
 	res.Conflicts, res.UnknownSchemas = graphStats(graph)
+	res.GraphDiagnostics = contract.ValidateGraph(graph)
+	conflictDiagnostics, unresolvedDiagnostics := 0, 0
+	for _, diagnostic := range res.GraphDiagnostics {
+		if strings.Contains(diagnostic.Code, "conflict") {
+			conflictDiagnostics++
+		}
+		if strings.Contains(diagnostic.Code, "unresolved") || strings.Contains(diagnostic.Code, "unknown") || strings.Contains(diagnostic.Code, "missing") {
+			unresolvedDiagnostics++
+		}
+	}
+	if cfg.FailOnConflict && (res.Conflicts > 0 || conflictDiagnostics > 0) {
+		return nil, fmt.Errorf("contract graph validation failed: %d conflicts", res.Conflicts)
+	}
+	if cfg.FailOnUnresolved && (res.UnknownSchemas > 0 || res.RoutesUnresolved > 0 || graphHasGaps(graph) || unresolvedDiagnostics > 0) {
+		return nil, fmt.Errorf("contract graph validation failed: unresolved routes, schemas, or operation gaps remain")
+	}
+	if cfg.MinConfidence > 0 {
+		for _, operation := range graph.Operations {
+			if operation != nil && operation.Confidence < cfg.MinConfidence {
+				return nil, fmt.Errorf("contract graph validation failed: operation %s confidence %.3f is below %.3f", operation.Key, operation.Confidence, cfg.MinConfidence)
+			}
+		}
+	}
 	for _, f := range factList {
 		// 按 operation 计：schema 事实会随引用它的每个 operation 重复出现，按事实计会虚高
 		if f.Kind == facts.KindContract && f.Confidence < lowConfThreshold {
@@ -310,7 +414,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	}
 	res.Doc, res.Operations = doc, len(doc.Operations)
 	specYAML, err := compiler.RenderYAML(doc)
-	end()
+	compileEnd()
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +426,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	}
 	defer generated.Close()
 	if diagnostics := generated.Validate(); len(diagnostics) > 0 {
-		return nil, fmt.Errorf("generated OpenAPI validation failed: %s", formatOpenAPIDiagnostics(diagnostics))
+		return nil, fmt.Errorf("generated OpenAPI validation failed (framework %s, %d packages, %d routes, %d resolved, %d operations): %s", an.Framework, an.Stats.Packages, an.Stats.Routes, an.Stats.RoutesResolved, len(doc.Operations), formatOpenAPIDiagnostics(diagnostics))
 	}
 
 	// 9. 写产物 + memo
@@ -332,7 +436,11 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	artifacts := map[string][]byte{specFile: specYAML, reportFile: []byte(report), operationsFile: opsJSON}
+	graphJSON, err := graphJSON(graph)
+	if err != nil {
+		return nil, err
+	}
+	artifacts := map[string][]byte{specFile: specYAML, reportFile: []byte(report), operationsFile: opsJSON, contractFile: graphJSON}
 	if err := writeArtifacts(outDir, artifacts); err != nil {
 		return nil, err
 	}
