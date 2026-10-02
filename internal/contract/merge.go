@@ -15,7 +15,11 @@ func Resolve[T any](candidates []Candidate[T]) (Candidate[T], []Candidate[T]) {
 	}
 	retained := append([]Candidate[T](nil), candidates...)
 	sort.SliceStable(retained, func(i, j int) bool {
-		return candidatePriority(retained[i]) > candidatePriority(retained[j])
+		left, right := candidatePriority(retained[i]), candidatePriority(retained[j])
+		if left != right {
+			return left > right
+		}
+		return candidateKey(retained[i]) < candidateKey(retained[j])
 	})
 	resolved := retained[0]
 	for _, candidate := range retained[1:] {
@@ -55,7 +59,36 @@ func candidatePriority[T any](candidate Candidate[T]) float64 {
 		StatusInconclusive: 1,
 		StatusUnresolved:   0,
 	}
-	return status[candidate.Status] + candidate.Confidence
+	return sourcePriority(candidate.Evidence, candidate.Status)*10 + status[candidate.Status] + candidate.Confidence
+}
+
+// sourcePriority is the explicit cross-source ordering used only to choose the
+// representative candidate when values are equivalent. Different values still
+// remain a conflict; source priority never hides disagreement.
+func sourcePriority(evidence []Evidence, status CandidateStatus) float64 {
+	best := 0.0
+	for _, item := range evidence {
+		value := map[EvidenceSource]float64{
+			SourceCode:          5,
+			SourceRuntime:       4,
+			SourceOpenAPI:       3,
+			SourceDocumentation: 2,
+			SourceHuman:         2,
+			SourceLLM:           1,
+		}[item.Source]
+		if value > best {
+			best = value
+		}
+	}
+	if best == 0 {
+		best = map[CandidateStatus]float64{
+			StatusVerified: 5,
+			StatusObserved: 4,
+			StatusDeclared: 3,
+			StatusInferred: 1,
+		}[status]
+	}
+	return best
 }
 
 func strongestStatus[T any](candidates []Candidate[T]) CandidateStatus {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 type EvidenceSource string
@@ -15,6 +16,7 @@ const (
 	SourceOpenAPI       EvidenceSource = "openapi"
 	SourceRuntime       EvidenceSource = "runtime"
 	SourceDocumentation EvidenceSource = "documentation"
+	SourceHuman         EvidenceSource = "human"
 	SourceLLM           EvidenceSource = "llm"
 )
 
@@ -159,6 +161,8 @@ type Schema struct {
 	AnyOf                []*Schema          `json:"any_of,omitempty"`
 	Not                  *Schema            `json:"not,omitempty"`
 	Nullable             bool               `json:"nullable,omitempty"`
+	ContentEncoding      string             `json:"content_encoding,omitempty"`
+	ContentMediaType     string             `json:"content_media_type,omitempty"`
 	Enum                 []any              `json:"enum,omitempty"`
 	Format               string             `json:"format,omitempty"`
 	Default              any                `json:"default,omitempty"`
@@ -176,7 +180,34 @@ func New() *Graph {
 }
 
 func OperationKey(method, path string) string {
-	return method + " " + path
+	return NormalizeMethod(method) + " " + NormalizePath(path)
+}
+
+func NormalizeMethod(method string) string { return strings.ToUpper(strings.TrimSpace(method)) }
+
+// NormalizePath keeps operation identity stable across common source/document
+// formatting differences without changing parameter semantics.
+func NormalizePath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return path
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	path = strings.ReplaceAll(path, "//", "/")
+	if len(path) > 1 {
+		path = strings.TrimRight(path, "/")
+	}
+	return path
+}
+
+func NormalizeSchemaRef(ref string) string {
+	ref = strings.TrimSpace(ref)
+	ref = strings.TrimPrefix(ref, "[]")
+	ref = strings.TrimPrefix(ref, "#/components/schemas/")
+	ref = strings.TrimPrefix(ref, "components/schemas/")
+	return ref
 }
 
 func (g *Graph) AddOperation(op *Operation) error {

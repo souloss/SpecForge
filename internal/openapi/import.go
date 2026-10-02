@@ -36,6 +36,21 @@ func ImportBytes(data []byte, sourcePath string) (*contract.Graph, error) {
 }
 
 func importDocument(doc *Document, sourcePath string) (*contract.Graph, error) {
+	if diagnostics := doc.Validate(); len(diagnostics) > 0 {
+		messages := make([]string, 0, len(diagnostics))
+		for _, diagnostic := range diagnostics {
+			location := diagnostic.Path
+			if diagnostic.Line > 0 {
+				location = fmt.Sprintf("%s:%d:%d", sourcePath, diagnostic.Line, diagnostic.Column)
+			}
+			message := diagnostic.Message
+			if location != "" {
+				message = location + ": " + message
+			}
+			messages = append(messages, message)
+		}
+		return nil, fmt.Errorf("OpenAPI document failed validation: %s", strings.Join(messages, "; "))
+	}
 	model, err := doc.document.BuildV3Model()
 	if err != nil {
 		return nil, fmt.Errorf("build OpenAPI model for import: %w", err)
@@ -58,12 +73,14 @@ func importDocument(doc *Document, sourcePath string) (*contract.Graph, error) {
 			if operation == nil {
 				continue
 			}
-			key := contract.OperationKey(strings.ToUpper(method), path)
+			method = contract.NormalizeMethod(method)
+			path = contract.NormalizePath(path)
+			key := contract.OperationKey(method, path)
 			op := &contract.Operation{
-				Key: key, Path: path, Method: strings.ToUpper(method),
+				Key: key, Path: path, Method: method,
 				OperationID: operation.OperationId, Summary: operation.Summary,
 				Description: operation.Description, Tags: append([]string(nil), operation.Tags...),
-				State:      contract.OperationDocumentOnly,
+				State: contract.OperationDocumentOnly, Confidence: 0.95,
 				Parameters: map[string][]contract.Candidate[contract.Parameter]{},
 				Responses:  map[string][]contract.Candidate[contract.Response]{},
 			}
@@ -99,10 +116,11 @@ func importDocument(doc *Document, sourcePath string) (*contract.Graph, error) {
 					if response == nil {
 						continue
 					}
-					item := contract.Response{Status: status, Description: response.Description}
+					item := contract.Response{Status: status, Description: response.Description, Raw: true}
 					contentType, media := firstMedia(response.Content)
 					item.ContentType = contentType
 					if media != nil {
+						item.HasBody = true
 						item.Schema = registerSchema(graph, key+":response:"+status, media.Schema)
 					}
 					jsonPath := "$.paths[" + quotePath(path) + "]." + strings.ToLower(method) + ".responses[" + quotePath(status) + "]"
@@ -185,6 +203,8 @@ func importSchema(proxy *base.SchemaProxy, stack map[string]bool) *contract.Sche
 	}
 	result.Types = append(result.Types, schema.Type...)
 	result.Format = schema.Format
+	result.ContentEncoding = schema.ContentEncoding
+	result.ContentMediaType = schema.ContentMediaType
 	result.Description = schema.Description
 	result.Required = append(result.Required, schema.Required...)
 	result.ReadOnly = schema.ReadOnly != nil && *schema.ReadOnly

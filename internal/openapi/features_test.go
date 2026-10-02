@@ -131,3 +131,35 @@ func TestImportBuildsContractGraphWithRefsAndResponses(t *testing.T) {
 		t.Fatalf("response reference was not retained: %+v", op.Responses["200"])
 	}
 }
+
+func TestImportRejectsInvalidOpenAPIDocument(t *testing.T) {
+	if _, err := ImportBytes([]byte("openapi: 3.1.0\n"), "invalid.yaml"); err == nil || !strings.Contains(err.Error(), "failed validation") {
+		t.Fatalf("ImportBytes error = %v, want validation failure", err)
+	}
+}
+
+func TestImportPreservesJSONSchemaContentKeywords(t *testing.T) {
+	input := `openapi: 3.1.0
+info: {title: binary, version: '1'}
+paths:
+  /download:
+    get:
+      responses:
+        '200':
+          description: binary body
+          content:
+            application/octet-stream:
+              schema:
+                contentEncoding: base64
+                contentMediaType: application/octet-stream
+`
+	graph, err := ImportBytes([]byte(input), "binary.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := graph.Operations["GET /download"].Responses["200"][0].Value
+	schema := graph.Schemas[response.Schema]
+	if schema == nil || schema.ContentEncoding != "base64" || schema.ContentMediaType != "application/octet-stream" {
+		t.Fatalf("JSON Schema content keywords were lost: response=%+v schema=%+v", response, schema)
+	}
+}

@@ -8,7 +8,19 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	validatorerrors "github.com/pb33f/libopenapi-validator/errors"
 )
+
+func TestDiagnosticsPreserveValidationSubtype(t *testing.T) {
+	diagnostics := diagnosticsFromValidator(false, []*validatorerrors.ValidationError{{
+		ValidationType: "schema", ValidationSubType: "invalid_type", Message: "invalid document", Reason: "expected object",
+		SchemaValidationErrors: []*validatorerrors.SchemaValidationFailure{{Reason: "unexpected property", FieldPath: "$.extra", KeywordLocation: "/properties/extra"}},
+	}}, "fallback")
+	if len(diagnostics) != 1 || diagnostics[0].Code != "schema.invalid_type" || diagnostics[0].Message != "invalid document: expected object; unexpected property at $.extra (schema /properties/extra)" {
+		t.Fatalf("diagnostics lost validator detail: %+v", diagnostics)
+	}
+}
 
 const validDocument = `openapi: 3.1.0
 info:

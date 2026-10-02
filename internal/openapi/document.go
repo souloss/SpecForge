@@ -156,9 +156,27 @@ func diagnosticsFromValidator(valid bool, errs []*validatorerrors.ValidationErro
 		if code == "" {
 			code = fallback
 		}
+		if issue.ValidationSubType != "" {
+			code += "." + issue.ValidationSubType
+		}
 		message := strings.TrimSpace(issue.Message)
 		if issue.Reason != "" {
 			message = strings.TrimSpace(message + ": " + issue.Reason)
+		}
+		for _, failure := range issue.SchemaValidationErrors {
+			if failure == nil {
+				continue
+			}
+			detail := strings.TrimSpace(failure.Reason)
+			if failure.FieldPath != "" {
+				detail += " at " + failure.FieldPath
+			}
+			if failure.KeywordLocation != "" {
+				detail += " (schema " + failure.KeywordLocation + ")"
+			}
+			if detail != "" {
+				message = strings.TrimSpace(message + "; " + detail)
+			}
 		}
 		out = append(out, Diagnostic{Code: code, Message: message, Path: issue.SpecPath, Line: issue.SpecLine, Column: issue.SpecCol})
 	}
