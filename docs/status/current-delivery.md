@@ -1,6 +1,6 @@
 # SpecForge 当前交付说明
 
-本文记录仓库当前代码的可运行能力。长期架构和产品规划见 [`DESIGN.md`](DESIGN.md)，面向使用者的安装和工作流见 [`README.md`](README.md)。
+本文记录仓库当前代码的可运行能力。长期架构和产品规划见 [`design-v2.md`](../architecture/design-v2.md)，面向使用者的安装和工作流见 [`README.md`](../../README.md)。
 
 ## 交付范围
 
@@ -16,6 +16,9 @@
 - libopenapi OpenAPI 边界：本地引用解析、文档规范校验、Overlay 应用后 reload 校验、OpenAPI 文档 Diff 和 Arazzo 工作流解析。
 - libopenapi-validator HTTP 验证边界：请求、响应和文档诊断转换为稳定的 SpecForge 结果；运行时验证不覆盖未访问接口。
 - Contract Graph 核心模型：多来源 Candidate、Evidence、冲突、未知 Schema 和显式 operation 状态。
+- `gen --openapi` 可将一个或多个已有 OpenAPI 文档导入 Contract Graph；`gen --runtime` 可摄入脱敏 JSONL observation，并保留 document/runtime 证据。
+- `gen --documentation` 可摄入结构化 YAML/JSON 人工事实；它只接受明确的 operation、response 和字段，不解释自由文本。
+- Contract Graph 编译前校验支持路径参数、参数位置、响应状态码、未知 schema 和候选冲突；`--fail-on-conflict`、`--fail-on-unresolved`、`--min-confidence` 可作为 CI 闸门。
 - 通用源码前端：通过 LLM 发现非 Go 项目路由和契约，并对模型输出做源码核对。
 - LLM 缺口补全、约定画像学习、语义增强、未登记 Go 框架适配器学习和内容寻址缓存。
 - `--json` 机器契约、结构化退出码和 `eval --fail-under` CI 质量闸门。
@@ -29,6 +32,7 @@
 | `openapi.yaml` | OpenAPI 3.1 文档 |
 | `report.md` | 置信度、缺口、失败 operation 和证据总览 |
 | `operations.json` | schema version 1 的 operation 级证据接口 |
+| `contract.json` | 规范化 Contract Graph，包含候选、来源、状态和诊断 |
 
 仓库内还会按需生成：
 
@@ -36,6 +40,7 @@
 - `.specforge/adapters/*.json`：经源码签名复核的 LLM 学习适配器。
 - `.specforge/cache/memo/`：完整运行缓存。
 - `.specforge/cache/llm/`：按 prompt 和工具读集校验的 LLM 调用缓存。
+- `.specforge/cache/facts.sqlite`：可选 Contract Graph 快照和 operation 到证据文件的依赖索引。
 
 ## 使用与验证
 
@@ -69,9 +74,10 @@ Go 静态前端没有 LLM 也能运行；不能静态确定的字段会保留为
 
 - 默认 Go 前端只在仓库根目录存在 `go.mod` 时自动选择；可用 `--repo` 指向模块根。
 - 通用前端依赖模型发现路由和契约，置信度上限为 0.6，且必须通过源码核对。
-- 运行级缓存是 memo 和文件缓存，不是 SQLite 事实库；基于 readSet 的反向失效传播仍是后续路线。
+- 运行级缓存包含 memo、LLM 文件缓存和可选 SQLite Contract Graph 缓存；基于 readSet 的 operation 级反向失效传播仍是后续增强。
 - Java、Python、Node 尚无静态语言前端；Express 样本用于通用前端回归。
-- 尚未提供进程级流量探针、PR 评论机器人或 MCP Server；HTTP 验证器可由调用方提供已捕获的请求/响应样本。
+- 尚未提供进程级流量探针、PR 评论机器人或 MCP Server；runtime 摄入目前要求调用方提供脱敏 JSONL observation，HTTP 验证器仍可直接验证已捕获的请求/响应样本。
+- 安全与隐私治理不属于当前交付范围；进程级 runtime 探针明确剔除。
 - 旧设计文档中的 Fiber-only、P0-only 和 `specforge/` 嵌套目录描述是历史背景；以本文件和 README 的当前实现说明为准。
 
 ## 版本与兼容性

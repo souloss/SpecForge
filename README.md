@@ -32,6 +32,7 @@ SpecForge 把静态分析、调用图、类型合成和确定性编译组合成�
 | `openapi.yaml` | 确定性渲染的 OpenAPI 3.1 文档 |
 | `report.md` | 总览、低置信 operation、缺口和证据位置 |
 | `operations.json` | 稳定的 operation 级契约和证据视图，供 `ops`、`explain` 和 Agent 消费 |
+| `contract.json` | 规范化 Contract Graph，包含候选、来源和诊断 |
 
 运行级缓存默认写入 `<repo>/.specforge/cache/`：`memo/` 缓存完整运行产物，`llm/` 缓存单次模型调用并校验模型实际读取的源码。缓存不含认证信息。
 
@@ -45,6 +46,8 @@ go build -o specforge ./cmd/specforge
 
 # 检查工具链、仓库和画像
 ./specforge doctor --repo path/to/repo
+# read-only/shared checkout: keep cache outside the repository
+./specforge doctor --repo path/to/repo --cache-dir /tmp/specforge-cache
 
 # 生成 OpenAPI、报告和 operation 证据
 ./specforge gen --repo path/to/repo
@@ -54,6 +57,15 @@ go build -o specforge ./cmd/specforge
 
 # 使用仓库约定画像（默认会自动读取 .specforge/profile.yaml）
 ./specforge gen --repo . --profile .specforge/profile.yaml
+
+# 摄入已有 OpenAPI 与脱敏 runtime JSONL（参数可重复）
+./specforge gen --repo . --openapi docs/api/openapi.yaml --runtime observations.jsonl
+
+# 摄入结构化人工契约事实（YAML/JSON）
+./specforge gen --repo . --documentation docs/api-facts.yaml
+
+# CI quality gates
+./specforge gen --repo . --fail-on-conflict --fail-on-unresolved --min-confidence 0.8
 
 # validate an existing OpenAPI document (resolves local refs)
 ./specforge verify --spec .specforge/out/openapi.yaml
@@ -145,7 +157,8 @@ go run ./cmd/specforge eval \
 
 ## 设计与路线图
 
-- [`DESIGN.md`](DESIGN.md)：Fact 生命周期、证据协议、编译器、LLM 编排和增量引擎设计。
-- [`DELIVERY.md`](DELIVERY.md)：当前仓库的实现状态、交付内容、验证命令和已知边界。
+- [`docs/architecture/design-v2.md`](docs/architecture/design-v2.md)：Fact 生命周期、证据协议、编译器、LLM 编排和增量引擎设计。
+- [`docs/status/current-delivery.md`](docs/status/current-delivery.md)：当前仓库的实现状态、交付内容、验证命令和已知边界。
+- [`docs/README.md`](docs/README.md)：文档目录和各文档的职责说明。
 
-当前版本是全量分析 + 运行级 memo/LLM 缓存。SQLite 事实库、readSet 反向索引和失效传播仍属于后续增量引擎路线；Java、Python、Node 的静态前端以及运行时探针也尚未作为内置能力交付。
+当前版本是全量分析 + 运行级 memo/LLM 缓存，并提供可选的 SQLite Contract Graph 快照缓存；按 readSet 的 operation 级反向失效传播仍属于后续增量引擎路线。Java、Python、Node 的静态前端以及进程级运行时探针尚未作为内置能力交付。
