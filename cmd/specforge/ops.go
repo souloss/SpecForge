@@ -48,6 +48,8 @@ type opRow struct {
 	Method     string   `json:"method"`      // HTTP 方法
 	Path       string   `json:"path"`        // 路径模板
 	Confidence float64  `json:"confidence"`  // 置信度
+	State      string   `json:"state"`       // Contract Graph 状态
+	Sources    []string `json:"sources"`     // 参与决策的来源
 	Summary    string   `json:"summary"`     // 摘要
 	Unknowns   []string `json:"unknowns"`    // 未解析项
 	Body       string   `json:"body"`        // 请求体 schema（无则空）
@@ -58,7 +60,8 @@ type opRow struct {
 // newOpsCmd ops：列出 gen 产出的全部 operation（可按置信度/缺口过滤）。
 func newOpsCmd(a *app) *cobra.Command {
 	var of outputFlags
-	var lowOnly, gapsOnly bool
+	var lowOnly, gapsOnly, observedOnly, conflictOnly bool
+	var source string
 	cmd := &cobra.Command{
 		Use:   "ops",
 		Short: "List generated operations with confidence and open gaps",
@@ -80,7 +83,7 @@ Operations below 0.8 are the ones listed in report.md.`,
 			rows := make([]opRow, 0, len(ops))
 			for i := range ops {
 				op := &ops[i]
-				if (lowOnly && op.Confidence >= lowConfidenceLine) || (gapsOnly && len(op.Unknowns) == 0) {
+				if (lowOnly && op.Confidence >= lowConfidenceLine) || (gapsOnly && len(op.Unknowns) == 0) || (observedOnly && op.State != "observed_only") || (conflictOnly && op.State != "conflict") || (source != "" && !contains(op.Sources, source)) {
 					continue
 				}
 				rows = append(rows, rowOf(op))
@@ -92,12 +95,15 @@ Operations below 0.8 are the ones listed in report.md.`,
 	of.register(cmd)
 	cmd.Flags().BoolVar(&lowOnly, "low-confidence", false, "only operations with confidence below 0.8")
 	cmd.Flags().BoolVar(&gapsOnly, "gaps", false, "only operations with unresolved gaps")
+	cmd.Flags().BoolVar(&observedOnly, "observed-only", false, "only runtime observed-only operations")
+	cmd.Flags().BoolVar(&conflictOnly, "conflicts", false, "only operations with source conflicts")
+	cmd.Flags().StringVar(&source, "source", "", "only operations containing a source: source|openapi|runtime|documentation|llm")
 	return cmd
 }
 
 // rowOf operation → ops 行。
 func rowOf(op *compiler.Operation) opRow {
-	r := opRow{Method: op.Method, Path: op.Path, Confidence: op.Confidence, Summary: op.Summary,
+	r := opRow{Method: op.Method, Path: op.Path, Confidence: op.Confidence, State: op.State, Sources: op.Sources, Summary: op.Summary,
 		Unknowns: op.Unknowns, Body: bodyLabel(op.Body), ErrorCodes: []int{}}
 	for _, resp := range op.Responses {
 		if s := responseLabel(resp); s != "" && r.Response == "" {
@@ -110,6 +116,15 @@ func rowOf(op *compiler.Operation) opRow {
 		}
 	}
 	return r
+}
+
+func contains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 // bodyLabel 请求体的简短描述（信封时显示「信封{字段: 业务体}」）。

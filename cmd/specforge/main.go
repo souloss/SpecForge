@@ -53,15 +53,21 @@ const exitCodeHelp = `Exit codes:
   10  degraded: LLM calls or operation analyses failed; outputs still written (gen --fail-on-degraded)
   20  LLM budget exhausted with gaps left; outputs still written (gen --fail-on-degraded)
   30  configuration/input error: no go.mod, invalid profile, --llm without credentials, missing gen output
-  40  quality gate failed (eval --fail-under)`
+  40  quality gate failed (eval --fail-under)
+  130 operation canceled by the user or caller`
 
 // jsonContractHelp 根命令帮助中的机器模式说明。
 const jsonContractHelp = `Machine mode (--json):
   stdout carries exactly one JSON object; logs never go to stdout.
     {"schema_version":"1","command":"gen","ok":true,"data":{...}}
     {"schema_version":"1","command":"gen","ok":false,"error":{"code":"config_invalid","message":"...","hint":"...","exit_code":30}}
+  gen route counts distinguish registrations from operation identities:
+    routes_resolved = registrations ready for static contract analysis;
+    routes_unique = known method/path identities, including routes whose handlers are unresolved;
+    routes_collapsed = extra registrations sharing a method/path identity;
+    unresolved_routes = source-located route diagnostics (an empty array when none remain).
   error.code values: invalid_args, config_invalid, llm_not_configured, not_found, internal_error,
-  determinism_failed, quality_gate_failed, llm_degraded, llm_budget_exhausted.`
+  determinism_failed, quality_gate_failed, llm_degraded, llm_budget_exhausted, canceled.`
 
 // cliError 带退出码与 error_code 的命令错误（人类通道 Message + Hint，机器通道 Code + Exit）。
 type cliError struct {
@@ -131,7 +137,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 		cmd = root
 	}
 	var ce *cliError
-	if err != nil && !errors.As(err, &ce) {
+	if errors.Is(err, context.Canceled) {
+		ce = newErr(exitCanceled, codeCanceled, "operation canceled", "")
+	} else if err != nil && !errors.As(err, &ce) {
 		ce = newErr(exitUsage, codeInvalidArgs, err.Error(), "run '"+cmd.CommandPath()+" --help' for usage")
 	}
 	if a.json {

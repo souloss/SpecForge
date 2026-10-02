@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -67,21 +68,27 @@ const envHelp = `Environment:
 
 // genOpts gen 命令选项。
 type genOpts struct {
-	repo, service, profile, out string // 输入仓库、服务过滤、画像文件、产物目录
-	frontend                    string // 语言前端名；空 = 按仓库自动识别
-	cacheDir                    string // 缓存根目录（空 = <repo>/.specforge/cache）
-	noCache                     bool   // 禁用全部缓存
-	llm                         bool   // 启用 LLM 兜底
-	llmBudget                   int    // 未命中缓存的兜底调用上限
-	llmConcurrency              int    // LLM 并发数
-	learnProfile                bool   // LLM 画像学习
-	enrich                      bool   // LLM 语义增强
-	failOnDegraded              bool   // 降级/预算耗尽时以非 0 退出（CI 闸门）
-	logLevel                    string // 日志级别
-	logFormat                   string // 日志格式
-	quiet                       bool   // 只输出错误日志
-	legacyMemo                  string // 旧版 --memo（隐藏兼容）
-	legacyVerbose               bool   // 旧版 --verbose（隐藏兼容，等价 --log-level=debug）
+	repo, service, serviceRoot, profile, out string   // 输入仓库、服务过滤、服务源码根、画像文件、产物目录
+	openapi                                  []string // 已有 OpenAPI 契约，可重复指定
+	runtime                                  []string // 脱敏 JSONL runtime observation，可重复指定
+	documentation                            []string // 结构化人工契约，可重复指定
+	frontend                                 string   // 语言前端名；空 = 按仓库自动识别
+	cacheDir                                 string   // 缓存根目录（空 = <repo>/.specforge/cache）
+	noCache                                  bool     // 禁用全部缓存
+	llm                                      bool     // 启用 LLM 兜底
+	llmBudget                                int      // 未命中缓存的兜底调用上限
+	llmConcurrency                           int      // LLM 并发数
+	learnProfile                             bool     // LLM 画像学习
+	enrich                                   bool     // LLM 语义增强
+	failOnDegraded                           bool     // 降级/预算耗尽时以非 0 退出（CI 闸门）
+	failOnConflict                           bool     // Contract Graph 存在冲突时失败
+	failOnUnresolved                         bool     // Contract Graph 存在未解析项时失败
+	minConfidence                            float64  // operation 最低置信度
+	logLevel                                 string   // 日志级别
+	logFormat                                string   // 日志格式
+	quiet                                    bool     // 只输出错误日志
+	legacyMemo                               string   // 旧版 --memo（隐藏兼容）
+	legacyVerbose                            bool     // 旧版 --verbose（隐藏兼容，等价 --log-level=debug）
 }
 
 // newGenCmd gen：分析仓库并生成 openapi.yaml / report.md / operations.json。
@@ -107,6 +114,7 @@ Outputs (in --out, default <repo>/.specforge/out):
 Caching (in --cache-dir, default <repo>/.specforge/cache):
   memo/  whole-run cache: unchanged sources + profile + engine + LLM settings reuse all outputs
   llm/   per-call LLM cache keyed by prompt content; tool reads are replayed against the current code
+  facts.sqlite  normalized Contract Graph snapshots and operation dependency tokens
          and a changed read invalidates the entry, so only operations whose code changed are re-asked
 
 LLM gap filling (--llm):
@@ -144,6 +152,9 @@ LLM gap filling (--llm):
 			cfg.Logger = log
 			res, err := engine.Run(cmd.Context(), cfg)
 			if err != nil {
+				if errors.Is(err, context.Canceled) {
+					return newErr(exitCanceled, codeCanceled, "operation canceled", "")
+				}
 				if errors.Is(err, engine.ErrConfig) {
 					return newErr(exitConfig, codeConfigInvalid, err.Error(), "point --repo at a project root (Go module, or any source tree with --llm for the generic frontend) and make sure the profile is valid YAML ('specforge doctor' checks both)")
 				}
@@ -160,9 +171,13 @@ LLM gap filling (--llm):
 	f.SortFlags = false // 帮助按注册顺序分组展示：Input → Output → LLM → CI → Logging
 	f.StringVar(&o.repo, "repo", ".", "repository root; must contain go.mod")
 	f.StringVar(&o.service, "service", "", "only analyze the service whose main package is cmd/<name> (names: 'specforge doctor'); empty = whole repository")
+	f.StringVar(&o.serviceRoot, "service-root", "", "generic frontend source root relative to --repo; empty = whole repository")
 	f.StringVar(&o.profile, "profile", "", "convention profile YAML: sinks, auth middleware, wildcard expansion (default: <repo>/.specforge/profile.yaml if present, else built-in defaults + auto-discovery)")
 	f.StringVar(&o.frontend, "frontend", "", "language frontend: go | generic (default: auto-detect; 'generic' is the LLM-only frontend for unsupported languages, needs --llm)")
-	setGroup(f, groupInput, "repo", "service", "profile", "frontend")
+	f.StringArrayVar(&o.openapi, "openapi", nil, "existing OpenAPI document to ingest; repeat for multiple documents")
+	f.StringArrayVar(&o.runtime, "runtime", nil, "redacted JSONL runtime observations to ingest; repeat for multiple files")
+	f.StringArrayVar(&o.documentation, "documentation", nil, "structured documentation facts to ingest; repeat for multiple files")
+	setGroup(f, groupInput, "repo", "service", "service-root", "profile", "frontend", "openapi", "runtime", "documentation")
 
 	f.StringVarP(&o.out, "out", "o", "", "output directory (default: <repo>/.specforge/out)")
 	f.StringVar(&o.cacheDir, "cache-dir", "", "cache root holding memo/ and llm/ (default: <repo>/.specforge/cache)")
@@ -177,7 +192,10 @@ LLM gap filling (--llm):
 	setGroup(f, groupLLM, "llm", "llm-budget", "llm-concurrency", "llm-enrich", "llm-learn-profile")
 
 	f.BoolVar(&o.failOnDegraded, "fail-on-degraded", false, "exit 10 if LLM calls or operation analyses failed, 20 if the LLM budget left gaps (outputs are still written)")
-	setGroup(f, groupCI, "fail-on-degraded")
+	f.BoolVar(&o.failOnConflict, "fail-on-conflict", false, "fail if merged source candidates disagree")
+	f.BoolVar(&o.failOnUnresolved, "fail-on-unresolved", false, "fail if unresolved routes, schemas, or operation gaps remain")
+	f.Float64Var(&o.minConfidence, "min-confidence", 0, "fail if any operation confidence is below this value (0 disables the gate)")
+	setGroup(f, groupCI, "fail-on-degraded", "fail-on-conflict", "fail-on-unresolved", "min-confidence")
 
 	f.StringVar(&o.logLevel, "log-level", "", "error|warn|info|debug (default: info on a terminal, warn otherwise)")
 	f.StringVar(&o.logFormat, "log-format", formatText, "text|json")
@@ -233,8 +251,15 @@ func (o *genOpts) config() (engine.Config, error) {
 	if o.llmBudget < 0 || o.llmConcurrency < 0 {
 		return engine.Config{}, newErr(exitUsage, codeInvalidArgs, "--llm-budget and --llm-concurrency must be >= 0", "")
 	}
+	if o.minConfidence < 0 || o.minConfidence > 1 {
+		return engine.Config{}, newErr(exitUsage, codeInvalidArgs, "--min-confidence must be between 0 and 1", "")
+	}
+	if o.service != "" && o.frontend == "generic" && o.serviceRoot == "" {
+		return engine.Config{}, newErr(exitUsage, codeInvalidArgs, "--service-root is required with --frontend generic --service", "point --service-root at the service source directory")
+	}
 	cfg := engine.Config{
-		RepoDir: o.repo, Service: o.service, ProfilePath: o.profile, OutDir: o.out,
+		RepoDir: o.repo, Service: o.service, ServiceRoot: o.serviceRoot, ProfilePath: o.profile, OutDir: o.out, OpenAPIFiles: append([]string(nil), o.openapi...), RuntimeFiles: append([]string(nil), o.runtime...), DocumentationFiles: append([]string(nil), o.documentation...),
+		FailOnConflict: o.failOnConflict, FailOnUnresolved: o.failOnUnresolved, MinConfidence: o.minConfidence,
 		LLMBudget: o.llmBudget, LLMConcurrency: o.llmConcurrency,
 		LearnProfile: o.learnProfile, Enrich: o.enrich,
 	}
@@ -248,6 +273,7 @@ func (o *genOpts) config() (engine.Config, error) {
 	if root := o.cacheRoot(); root != "" {
 		cfg.MemoDir = filepath.Join(root, memoSubdir)
 		cfg.LLMCacheDir = filepath.Join(root, llmSubdir)
+		cfg.FactCacheDir = filepath.Join(root, "facts.sqlite")
 	}
 	if o.llm || o.learnProfile || o.enrich {
 		cfg.Provider = infer.NewProviderFromEnv()
@@ -301,9 +327,18 @@ func printGenSummary(w io.Writer, r *engine.Result) {
 	cache := ""
 	if r.Cached {
 		cache = "  (run cache hit)"
+	} else if r.GraphCached {
+		cache = "  (Contract Graph cache hit)"
 	}
 	fmt.Fprintf(w, "specforge %s — %s%s\n", Version, r.Service, cache)
-	fmt.Fprintf(w, "  routes        %d extracted, %d resolved, %d unresolved\n", r.Routes, r.RoutesResolved, r.RoutesUnresolved)
+	fmt.Fprintf(w, "  routes        %d extracted, %d resolved, %d unique, %d collapsed, %d unresolved\n", r.Routes, r.RoutesResolved, r.RoutesUnique, r.RoutesCollapsed, r.RoutesUnresolved)
+	for _, issue := range r.UnresolvedRoutes {
+		location := issue.File
+		if issue.Line > 0 {
+			location = fmt.Sprintf("%s:%d", issue.File, issue.Line)
+		}
+		fmt.Fprintf(w, "                unresolved %s %s (%s: %s)\n", issue.Method, issue.RawPath, location, issue.Reason)
+	}
 	fmt.Fprintf(w, "  operations    %d   schemas %d   facts %d (dropped by evidence gate: %d)\n", r.Operations, r.SchemaTypes, r.Facts, r.Dropped)
 	fmt.Fprintf(w, "  confidence    %d low-confidence operations, %d with remaining gaps\n", r.LowConf, r.RemainingGaps)
 	if r.LLM.Attempted > 0 || r.LLM.Enriched > 0 || r.LLMCache.Hits+r.LLMCache.Misses > 0 {

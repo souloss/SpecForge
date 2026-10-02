@@ -75,6 +75,31 @@ func TestExitCodes(t *testing.T) {
 	}
 }
 
+func TestCanceledCommandExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout, stderr bytes.Buffer
+	code := run(ctx, []string{"gen", "--repo", sampleRepo, "--no-cache", "--json"}, &stdout, &stderr)
+	env := decodeEnvelope(t, stdout.String())
+	err, _ := env["error"].(map[string]any)
+	if code != exitCanceled || env["ok"] != false || err["code"] != codeCanceled || err["exit_code"].(float64) != exitCanceled {
+		t.Fatalf("exit=%d env=%v stderr=%q", code, env, stderr.String())
+	}
+}
+
+func TestGenRejectsInvalidOpenAPIInputAsConfigError(t *testing.T) {
+	spec := filepath.Join(t.TempDir(), "invalid.yaml")
+	if err := os.WriteFile(spec, []byte("openapi: 3.1.0\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, _ := runCLI(t, "gen", "--repo", sampleRepo, "--openapi", spec, "--no-cache", "--json")
+	env := decodeEnvelope(t, out)
+	err, _ := env["error"].(map[string]any)
+	if code != exitConfig || err["code"] != codeConfigInvalid || !strings.Contains(err["message"].(string), "failed validation") {
+		t.Fatalf("exit=%d env=%v", code, env)
+	}
+}
+
 // TestErrorEnvelope 失败时 --json 输出 ok=false 与 error.code/exit_code。
 func TestErrorEnvelope(t *testing.T) {
 	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
@@ -95,13 +120,23 @@ func TestGenOpsExplainJSON(t *testing.T) {
 	outDir := t.TempDir()
 	code, out, _ := runCLI(t, "gen", "--repo", sampleRepo, "--json", "--no-cache", "-o", outDir)
 	env := decodeEnvelope(t, out)
-	if code != exitOK || env["ok"] != true || env["data"].(map[string]any)["operations"].(float64) != 10 {
+	data, _ := env["data"].(map[string]any)
+	if code != exitOK || env["ok"] != true || data["operations"].(float64) != 10 {
 		t.Fatalf("gen exit %d env %v", code, env)
+	}
+	if data["routes_unique"] == nil || data["routes_collapsed"] == nil {
+		t.Fatalf("gen JSON is missing operation identity counts: %v", data)
+	}
+	if unresolved, ok := data["unresolved_routes"].([]any); !ok || len(unresolved) != 0 {
+		t.Fatalf("gen JSON unresolved_routes = %v, want an empty array", data["unresolved_routes"])
 	}
 	code, out, _ = runCLI(t, "ops", "-o", outDir, "--json")
 	env = decodeEnvelope(t, out)
 	if rows, ok := env["data"].([]any); code != exitOK || !ok || len(rows) != 10 {
 		t.Fatalf("ops exit %d env %v", code, env)
+	}
+	if row, ok := env["data"].([]any)[0].(map[string]any); !ok || row["state"] == nil || row["sources"] == nil {
+		t.Fatalf("ops row must expose graph state and sources: %v", env["data"])
 	}
 	code, out, _ = runCLI(t, "explain", "post", "/ipo/v1/OrderCheck", "-o", outDir, "--json")
 	env = decodeEnvelope(t, out)
@@ -123,6 +158,70 @@ func TestOpsFilters(t *testing.T) {
 	if !strings.Contains(all, "10 of 10 operations") || strings.Contains(low, "10 of 10") {
 		t.Fatalf("filters not applied:\n%s\n%s", all, low)
 	}
+	code, _, errs := runCLI(t, "ops", "-o", outDir, "--conflicts")
+	if code != exitOK || errs != "" {
+		t.Fatalf("conflict filter failed: %d %s", code, errs)
+	}
+	code, _, errs = runCLI(t, "ops", "-o", outDir, "--source", "source")
+	if code != exitOK || errs != "" {
+		t.Fatalf("source filter failed: %d %s", code, errs)
+	}
+}
+
+func TestCacheStatsIncludesFactStore(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "facts.sqlite"), []byte("sqlite"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, out, errs := runCLI(t, "cache", "stats", "--cache-dir", dir, "--json")
+	if code != exitOK || errs != "" {
+		t.Fatalf("cache stats failed: %d %s", code, errs)
+	}
+	env := decodeEnvelope(t, out)
+	data, ok := env["data"].(map[string]any)
+	if !ok || data["facts"] == nil {
+		t.Fatalf("cache stats missing facts entry: %v", env)
+	}
+	facts, ok := data["facts"].(map[string]any)
+	if !ok || facts["entries"].(float64) != 1 || facts["bytes"].(float64) != 6 {
+		t.Fatalf("unexpected facts stats: %v", data["facts"])
+	}
+}
+
+func TestDoctorUsesExternalCacheDir(t *testing.T) {
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+	code, out, _ := runCLI(t, "doctor", "--repo", sampleRepo, "--cache-dir", cacheDir, "--json")
+	env := decodeEnvelope(t, out)
+	data, _ := env["data"].(map[string]any)
+	checks, _ := data["checks"].([]any)
+	for _, item := range checks {
+		check, _ := item.(map[string]any)
+		if check["name"] == "cache" && check["ok"] != true {
+			t.Fatalf("external cache dir was rejected: %v", check)
+		}
+	}
+	if code == exitOK {
+		return
+	}
+	// The sample may still fail an unrelated environment check; cache itself must pass.
+	if len(checks) == 0 {
+		t.Fatalf("doctor returned no checks: %v", env)
+	}
+}
+
+func TestContractGraphArtifact(t *testing.T) {
+	outDir := genSample(t)
+	b, err := os.ReadFile(filepath.Join(outDir, "contract.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var graph map[string]any
+	if err := json.Unmarshal(b, &graph); err != nil {
+		t.Fatalf("contract.json is not JSON: %v", err)
+	}
+	if graph["operations"] == nil || graph["schemas"] == nil {
+		t.Fatalf("contract graph artifact missing stable sections: %v", graph)
+	}
 }
 
 // TestEvalGate --fail-under 未达标返回 40，且 --json 仍只输出一个信封（含指标与闸门结论）。
@@ -134,7 +233,7 @@ func TestEvalGate(t *testing.T) {
 		t.Fatalf("perfect spec should pass the gate, exit %d", code)
 	}
 	empty := filepath.Join(t.TempDir(), "empty.yaml")
-	os.WriteFile(empty, []byte("openapi: 3.1.0\npaths: {}\n"), 0o644)
+	os.WriteFile(empty, []byte("openapi: 3.1.0\ninfo:\n  title: Empty contract\n  version: 1.0.0\npaths: {}\n"), 0o644)
 	code, out, _ := runCLI(t, "eval", "--truth", truth, "--spec", empty, "--fail-under", "0.9", "--json")
 	env := decodeEnvelope(t, out)
 	data, _ := env["data"].(map[string]any)

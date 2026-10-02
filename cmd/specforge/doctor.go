@@ -25,7 +25,7 @@ type doctorResult struct {
 
 // newDoctorCmd doctor：检查运行环境与仓库前提（不调用 LLM、不写产物）。
 func newDoctorCmd(a *app) *cobra.Command {
-	var repo string
+	var repo, cacheDir string
 	cmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check toolchain, repository, profile and LLM configuration; list services",
@@ -42,10 +42,10 @@ func newDoctorCmd(a *app) *cobra.Command {
 It also lists the services found in the repository (main packages); these are the names
 accepted by 'gen --service'. Exits 30 if any check fails.`,
 		Example: `  specforge doctor
-  specforge doctor --repo ../sample-ipo --json`,
+  specforge doctor --repo ../sample-ipo --cache-dir /tmp/specforge-cache --json`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			res := doctorResult{OK: true, Checks: runChecks(repo), Services: []frontend.Service{}}
+			res := doctorResult{OK: true, Checks: runChecks(repo, cacheDir), Services: []frontend.Service{}}
 			if fe, err := engine.DetectFrontend(repo); err == nil {
 				res.Language = fe.Name()
 				if d, ok := fe.(frontend.Diagnoser); ok {
@@ -67,6 +67,7 @@ accepted by 'gen --service'. Exits 30 if any check fails.`,
 		},
 	}
 	cmd.Flags().StringVar(&repo, "repo", ".", "repository root")
+	cmd.Flags().StringVar(&cacheDir, "cache-dir", "", "cache root (default: <repo>/.specforge/cache)")
 	return cmd
 }
 
@@ -87,7 +88,7 @@ func printDoctor(w io.Writer, res doctorResult) {
 }
 
 // runChecks 语言无关的检查：LLM 凭据与缓存目录（语言相关检查由前端的 Diagnoser 提供）。
-func runChecks(repo string) []frontend.Check {
+func runChecks(repo, cacheDir string) []frontend.Check {
 	var out []frontend.Check
 	if infer.Configured() {
 		base := os.Getenv("ANTHROPIC_BASE_URL")
@@ -98,7 +99,10 @@ func runChecks(repo string) []frontend.Check {
 	} else {
 		out = append(out, frontend.Check{Name: "llm", OK: true, Detail: "not configured (offline mode; set ANTHROPIC_AUTH_TOKEN to enable --llm)"})
 	}
-	cache := defaultCacheRoot(repo)
+	cache := cacheDir
+	if cache == "" {
+		cache = defaultCacheRoot(repo)
+	}
 	if err := os.MkdirAll(cache, 0o755); err != nil {
 		out = append(out, frontend.Check{Name: "cache", Detail: cache + " not writable: " + err.Error()})
 	} else {

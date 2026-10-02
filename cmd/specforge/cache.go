@@ -22,12 +22,13 @@ func newCacheCmd(a *app) *cobra.Command {
 	}
 	cmd := &cobra.Command{
 		Use:   "cache",
-		Short: "Inspect or clear the run cache and the LLM call cache",
-		Long: `SpecForge keeps two caches under <repo>/.specforge/cache (override with --cache-dir):
+		Short: "Inspect or clear the run, graph, and LLM caches",
+		Long: `SpecForge keeps three cache layers under <repo>/.specforge/cache (override with --cache-dir):
 
   memo/  whole-run cache: one entry per input fingerprint (sources, profile, engine, LLM settings)
          holding all outputs; the 16 most recently used entries are kept.
   llm/   one file per LLM request; reused as long as the prompt and the code the model read are unchanged.
+  facts.sqlite  normalized Contract Graph and operation dependency index.
 
 Both are safe to delete at any time; the next 'gen' simply recomputes (clearing llm/ costs tokens).
 The directory contains no credentials and can be shared across checkouts or cached in CI.`,
@@ -41,7 +42,7 @@ The directory contains no credentials and can be shared across checkouts or cach
 
 	stats := &cobra.Command{
 		Use:   "stats",
-		Short: "Show entry counts and disk usage of both caches",
+		Short: "Show entry counts and disk usage of all caches",
 		Example: `  specforge cache stats
   specforge cache stats --cache-dir /ci/cache/specforge --json`,
 		Args: cobra.NoArgs,
@@ -50,12 +51,15 @@ The directory contains no credentials and can be shared across checkouts or cach
 				"cache_dir": root(),
 				memoSubdir:  statDir(filepath.Join(root(), memoSubdir)),
 				llmSubdir:   statDir(filepath.Join(root(), llmSubdir)),
+				"facts":     fileStats(filepath.Join(root(), "facts.sqlite")),
 			}
 			a.emit(res, func(w io.Writer) {
 				m, l := res[memoSubdir].(dirStats), res[llmSubdir].(dirStats)
+				f := res["facts"].(dirStats)
 				fmt.Fprintf(w, "cache %s\n", root())
 				fmt.Fprintf(w, "  memo  %d entries  %s\n", m.Entries, humanBytes(m.Bytes))
 				fmt.Fprintf(w, "  llm   %d entries  %s\n", l.Entries, humanBytes(l.Bytes))
+				fmt.Fprintf(w, "  facts %d file       %s\n", f.Entries, humanBytes(f.Bytes))
 			})
 			return nil
 		},
@@ -135,6 +139,14 @@ func statDir(dir string) dirStats {
 		return nil
 	})
 	return st
+}
+
+func fileStats(path string) dirStats {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return dirStats{}
+	}
+	return dirStats{Entries: 1, Bytes: info.Size()}
 }
 
 // byteUnit 字节换算基数。
