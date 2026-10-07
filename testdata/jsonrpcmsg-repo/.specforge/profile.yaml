@@ -1,0 +1,4 @@
+# 约定画像：JSON-RPC 信封变体（error.msg + service 层组装信封 + 中间件剥壳）。
+# 无 response_sinks：自动发现 code.WriteResponse / code.BuildBaseResponse 包装器。
+framework: gofiber/v2
+error_codes_source: code

@@ -1,0 +1,20 @@
+# 约定画像：JSON-RPC 2.0 信封 + X-retcode 头（对应 sample-ipo 的真实约定）。
+#
+# 注意：不声明 response_sinks——让引擎自动发现 code.Response / code.WriteResponse
+# 两个包装器（其函数体写入命名结构体 BaseResp / ErrResponse / 裸 data），
+# 从而还原真实的「成功 jsonrpc/result 信封 vs 裸写 data」两形态。
+framework: gofiber/v2
+auth_middleware:
+  getUserRelation:
+    header: X-uin
+    scheme: apiKey
+    required: true
+  permissionCheck:
+    header: X-uin
+    scheme: apiKey
+    required: true
+    scope_arg: 0
+path_conventions:
+  wildcard_expansion:
+    "/ipo/v*": ["/ipo/v1"]
+error_codes_source: code
