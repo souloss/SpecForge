@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "properties": {
+    "errorCodes": {"type": "array", "items": {"type": "object",
+      "properties": {"codeRef": {"type": "string"}, "status": {"type": "integer"}},
+      "required": ["codeRef"]}},
+    "exhaustive": {"type": "boolean"},
+    "errorSites": {"type": "array", "items": {"type": "object",
+      "properties": {"site": {"type": "string"}, "kind": {"enum": ["catalog", "dynamic", "uncoded"]},
+        "codeRefs": {"type": "array", "items": {"type": "string"}}},
+      "required": ["site", "kind"]}},
+    "shapes": {"type": "array", "items": {"type": "object",
+      "properties": {"gap": {"type": "string"}, "shape": {"$ref": "#/$defs/node"}},
+      "required": ["gap", "shape"]}}
+  },
+  "$defs": {"node": {"type": "object",
+    "properties": {
+      "type": {"enum": ["object", "array", "string", "integer", "number", "boolean"]},
+      "properties": {"type": "array", "items": {"type": "object",
+        "properties": {"name": {"type": "string"}, "required": {"type": "boolean"}, "shape": {"$ref": "#/$defs/node"}},
+        "required": ["name", "shape"]}},
+      "items": {"$ref": "#/$defs/node"}},
+    "required": ["type"]}}
+}

@@ -69,32 +69,6 @@ type ProposedWriter struct {
 	StatusArg int    `json:"statusArg"` // 状态码实参下标；-1 = 无
 }
 
-// adapterSystemPrompt L3 适配器生成的 system prompt。
-const adapterSystemPrompt = "You write a declarative adapter for a Go web framework so that a static analyzer can " +
-	"extract HTTP routes and contracts. From the framework's exported API, identify: router types (types whose " +
-	"methods register routes), the grouping method that returns a sub-router with a path prefix, the route " +
-	"registration methods and their HTTP verbs, the argument index of the handler in those calls (the path is " +
-	"argument 0; -1 means the last argument), and request/response primitives on the handler's context type: " +
-	"JSON body binding, struct binding of query/path/header params, single parameter readers (the argument index " +
-	"of the parameter name), and JSON response writers (argument index of the body and of the status code, -1 if " +
-	"none). Use symbols exactly as <package path>.<Func> or <package path>.<Type>.<Method>. Only use APIs present " +
-	"in the digest. Include only primitives that exist in the digest; omit a list rather than guess. " +
-	"Respond with a single JSON object with EXACTLY this structure (example for a hypothetical package " +
-	"example.com/webkit; replace every value with the real framework's):\n" + adapterExample + "\n"
-
-// adapterExample 输出结构示例（虚构框架，防止模型照抄答案；只示范字段形状）。
-const adapterExample = `{
-  "name": "webkit",
-  "routerTypes": ["example.com/webkit.Server", "example.com/webkit.RouteGroup"],
-  "groupMethod": "Group",
-  "verbs": {"Get": "GET", "Post": "POST", "Put": "PUT", "Delete": "DELETE"},
-  "handlerArg": 1,
-  "bodyBinders": [{"symbol": "example.com/webkit.Ctx.DecodeBody", "arg": 0}],
-  "structBinders": [{"symbol": "example.com/webkit.Ctx.DecodeQuery", "arg": 0, "in": "query", "tagKey": "query"}],
-  "paramReaders": [{"symbol": "example.com/webkit.Ctx.PathValue", "in": "path", "nameArg": 0, "type": "string"}],
-  "writers": [{"symbol": "example.com/webkit.Ctx.WriteJSON", "bodyArg": 1, "statusArg": 0}]
-}`
-
 // ProposeAdapter 让 LLM 提出适配器声明（结构校验在此，符号与签名复核在前端）。离线返回 ErrNoProvider。
 func ProposeAdapter(ctx context.Context, p Provider, task AdapterTask) (*AdapterProposal, error) {
 	if p == nil {
@@ -105,7 +79,7 @@ func ProposeAdapter(ctx context.Context, p Provider, task AdapterTask) (*Adapter
 		return nil, fmt.Errorf("infer: marshal adapter task: %w", err)
 	}
 	var out AdapterProposal
-	err = completeJSON(ctx, p, Request{System: adapterSystemPrompt, Prompt: string(ev)}, func(raw []byte) error {
+	err = completeJSON(ctx, p, Request{System: prompt("adapter.system.md") + prompt("adapter.example.json") + "\n", Prompt: string(ev)}, func(raw []byte) error {
 		out = AdapterProposal{}
 		if err := json.Unmarshal(extractJSON(raw), &out); err != nil {
 			return fmt.Errorf("infer: adapter proposal invalid: %w", err)

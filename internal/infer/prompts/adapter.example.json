@@ -1,0 +1,11 @@
+{
+  "name": "webkit",
+  "routerTypes": ["example.com/webkit.Server", "example.com/webkit.RouteGroup"],
+  "groupMethod": "Group",
+  "verbs": {"Get": "GET", "Post": "POST", "Put": "PUT", "Delete": "DELETE"},
+  "handlerArg": 1,
+  "bodyBinders": [{"symbol": "example.com/webkit.Ctx.DecodeBody", "arg": 0}],
+  "structBinders": [{"symbol": "example.com/webkit.Ctx.DecodeQuery", "arg": 0, "in": "query", "tagKey": "query"}],
+  "paramReaders": [{"symbol": "example.com/webkit.Ctx.PathValue", "in": "path", "nameArg": 0, "type": "string"}],
+  "writers": [{"symbol": "example.com/webkit.Ctx.WriteJSON", "bodyArg": 1, "statusArg": 0}]
+}

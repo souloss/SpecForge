@@ -16,19 +16,13 @@ func LearnProfile(ctx context.Context, p Provider, sampleOps []SampleOp) (*Profi
 	if p == nil {
 		return nil, ErrNoProvider
 	}
-	system := "You are analyzing a Go+Fiber repository to learn its API conventions. " +
-		"Given sample operations and code evidence, identify the RESPONSE SINK symbols " +
-		"(functions that write the HTTP response, e.g. code.WriteResponse), the AUTH " +
-		"MIDDLEWARE (functions wrapping routes for auth), and the response ENVELOPE " +
-		"(the wrapper object around business data). Use fully-qualified symbol IDs exactly as they " +
-		"appear in the evidence symbols. Only report symbols that appear in the evidence. " +
-		"Respond with a single JSON object matching this schema:"
+	system := prompt("learn-profile.system.md") + prompt("learn-profile.schema.json")
 
 	ev, err := json.Marshal(sampleOps)
 	if err != nil {
 		return nil, fmt.Errorf("infer: marshal sample ops: %w", err)
 	}
-	resp, err := p.Complete(ctx, Request{System: system + "\n" + learnProfileSchema, Prompt: string(ev)})
+	resp, err := p.Complete(ctx, Request{System: system + "\n", Prompt: string(ev)})
 	if err != nil {
 		return nil, err
 	}
@@ -78,45 +72,3 @@ type EnvelopeCandidate struct {
 	DataSlot    string            `json:"dataSlot"`
 	SuccessCode int               `json:"successCode"`
 }
-
-// learnProfileSchema 画像候选的输出 schema。
-const learnProfileSchema = `{
-  "type": "object",
-  "properties": {
-    "framework": {"type": "string"},
-    "responseSinks": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "symbol": {"type": "string"},
-          "signature": {"type": "string"},
-          "dataSlot": {"type": "integer"},
-          "errSlot": {"type": "integer"},
-          "status": {"type": "integer"}
-        },
-        "required": ["symbol"]
-      }
-    },
-    "authMiddleware": {
-      "type": "object",
-      "additionalProperties": {
-        "type": "object",
-        "properties": {
-          "header": {"type": "string"},
-          "scheme": {"type": "string"},
-          "required": {"type": "boolean"}
-        }
-      }
-    },
-    "envelope": {
-      "type": "object",
-      "properties": {
-        "type": {"type": "string"},
-        "properties": {"type": "object"},
-        "dataSlot": {"type": "string"},
-        "successCode": {"type": "integer"}
-      }
-    }
-  }
-}`

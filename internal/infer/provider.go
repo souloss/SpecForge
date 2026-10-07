@@ -93,13 +93,6 @@ const (
 	enrichDescriptionMaxLen = 600
 )
 
-// enrichSystemPrompt 语义增强 system prompt：只产出描述，禁止结构性信息。
-const enrichSystemPrompt = "You are an API documentation writer. Given the handler source code of one HTTP " +
-	"operation, write a concise summary (one line, same language as code comments if any, otherwise English) " +
-	"and an optional short description of what the operation does. Never mention or invent structural facts " +
-	"(fields, types, status codes, error codes) — only purpose. Respond as JSON: " +
-	`{"summary": string, "description": string}`
-
 // Enrichment 语义增强产出（F8：只含描述，不含任何结构性事实）。
 type Enrichment struct {
 	Summary     string `json:"summary"`     // 一行摘要
@@ -113,7 +106,7 @@ func EnrichOperation(ctx context.Context, p Provider, op, evidence string) (*Enr
 		return nil, ErrNoProvider
 	}
 	resp, err := p.Complete(ctx, Request{
-		System: enrichSystemPrompt,
+		System: prompt("enrich.system.md"),
 		Prompt: fmt.Sprintf("operation: %s\nsource:\n%s\n", op, evidence),
 	})
 	if err != nil {

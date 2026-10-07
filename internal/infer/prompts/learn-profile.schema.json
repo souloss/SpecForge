@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "properties": {
+    "framework": {"type": "string"},
+    "responseSinks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "symbol": {"type": "string"},
+          "signature": {"type": "string"},
+          "dataSlot": {"type": "integer"},
+          "errSlot": {"type": "integer"},
+          "status": {"type": "integer"}
+        },
+        "required": ["symbol"]
+      }
+    },
+    "authMiddleware": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "header": {"type": "string"},
+          "scheme": {"type": "string"},
+          "required": {"type": "boolean"}
+        }
+      }
+    },
+    "envelope": {
+      "type": "object",
+      "properties": {
+        "type": {"type": "string"},
+        "properties": {"type": "object"},
+        "dataSlot": {"type": "string"},
+        "successCode": {"type": "integer"}
+      }
+    }
+  }
+}

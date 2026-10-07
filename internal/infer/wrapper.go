@@ -37,16 +37,6 @@ type WrapperField struct {
 	Type   string `json:"type"`   // string/integer/number/boolean/object/array（data 键可填 object）
 }
 
-// wrapperSystemPrompt L2 包装器摘要的 system prompt（固定前缀）。
-const wrapperSystemPrompt = "You analyze one helper function of a Go HTTP service that writes a JSON response. " +
-	"Static analysis could not determine how its parameters end up in the response body. Using the function " +
-	"source and the helpers it calls, report: which parameter index carries the business data (dataParam, -1 if " +
-	"none), which carries the error (errParam, -1 if none), every top-level JSON key of the written body with its " +
-	"source (data / err / other) and type, and integer business codes that are literal constants on the success " +
-	"and failure branches. Only report keys that literally appear in the source. Respond with a single JSON " +
-	`object: {"dataParam":int,"errParam":int,"fields":[{"key":string,"source":string,"type":string}],` +
-	`"successCode":int?,"failureCode":int?}`
-
 // SummarizeWrapper 对一个包装器做一次 LLM 摘要（结构校验在此，语义复核在前端）。离线返回 ErrNoProvider。
 func SummarizeWrapper(ctx context.Context, p Provider, task WrapperTask) (*WrapperSummary, error) {
 	if p == nil {
@@ -57,7 +47,7 @@ func SummarizeWrapper(ctx context.Context, p Provider, task WrapperTask) (*Wrapp
 		return nil, fmt.Errorf("infer: marshal wrapper task: %w", err)
 	}
 	var out WrapperSummary
-	err = completeJSON(ctx, p, Request{System: wrapperSystemPrompt, Prompt: string(ev)}, func(raw []byte) error {
+	err = completeJSON(ctx, p, Request{System: prompt("wrapper.system.md"), Prompt: string(ev)}, func(raw []byte) error {
 		out = WrapperSummary{DataParam: -1, ErrParam: -1}
 		if err := json.Unmarshal(extractJSON(raw), &out); err != nil {
 			return fmt.Errorf("infer: wrapper summary output invalid: %w", err)
