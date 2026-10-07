@@ -28,7 +28,7 @@ func TestResolveGapsFallsBackWhenToolTurnsExhausted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(p.reqs) != 2 || len(p.reqs[1].Tools) != 0 || !strings.HasSuffix(p.reqs[1].Prompt, noToolsPrompt) {
+	if len(p.reqs) != 2 || len(p.reqs[1].Tools) != 0 || !strings.HasSuffix(p.reqs[1].Prompt, prompt("no-tools.append.md")) {
 		t.Fatalf("expected a tool-less retry with the fallback note, got %d requests", len(p.reqs))
 	}
 	if len(res.ErrorSites) != 1 || res.ErrorSites[0].Kind != SiteKindUncoded {

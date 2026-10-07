@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 )
 
 // GapTask 一次兜底采集任务（档位2 单次调用 / 档位3 工具循环，设计文档 §3.3）。
@@ -34,6 +35,9 @@ type GapTask struct {
 	// ErrorCatalog 错误码目录子集：仅含常量名在本 operation 切片源码中出现过的条目（按符号排序）。
 	// 与复核口径一致（不在切片中出现的码必被拒绝），既省 token 又消除不可能的答案。
 	ErrorCatalog []ErrorCodeItem `json:"errorCatalog,omitempty"`
+	// Rejections 上一轮 self-correct 被复核拒绝的条目（「条目 → 原因」短行）：
+	// 非空时 GapRequest 会把 self-correct 回执追加到 prompt，让模型只修正被拒项。
+	Rejections []string `json:"rejections,omitempty"`
 }
 
 // SourceSnippet 一段函数源码证据。
@@ -111,11 +115,25 @@ type ResolvedShape struct {
 	Shape *ShapeNode `json:"shape"` // 形状树
 }
 
-// ShapeNode 形状树节点（JSON Schema 的子集）。
+// ShapeNode 形状树节点（JSON Schema 的子集，含约束透传）。
+//
+// 约束字段对应 schema.Schema 的同名字段（typeschema 的合成器已产出它们）：
+// 通用前端从 Pydantic Field/validator tag/Literal 里读出的约束在此透传，
+// 由 verify.Shape 逐项核对「字面量须出现在源码中」后落入最终 schema。
 type ShapeNode struct {
 	Type       string      `json:"type"`                 // object/array/string/integer/number/boolean
 	Properties []ShapeProp `json:"properties,omitempty"` // object 的字段
 	Items      *ShapeNode  `json:"items,omitempty"`      // array 的元素
+	Format     string      `json:"format,omitempty"`     // date-time/int64/double/byte...
+	Enum       []string    `json:"enum,omitempty"`       // 枚举取值（字符串化）
+	Pattern    string      `json:"pattern,omitempty"`    // 正则（字符串约束）
+	Nullable   bool        `json:"nullable,omitempty"`   // 是否可空（Optional/指针）
+	Min        *float64    `json:"min,omitempty"`        // 数值下限
+	Max        *float64    `json:"max,omitempty"`        // 数值上限
+	MinLen     *int        `json:"minLength,omitempty"`  // 字符串/集合最小长度
+	MaxLen     *int        `json:"maxLength,omitempty"`  // 字符串/集合最大长度
+	MinItems   *int        `json:"minItems,omitempty"`   // 数组最少元素数
+	MaxItems   *int        `json:"maxItems,omitempty"`   // 数组最多元素数
 }
 
 // ShapeProp object 的一个字段。
@@ -133,59 +151,12 @@ type ResolvedError struct {
 	Msg     string `json:"msg,omitempty"`    // 模型报的说明（仅参考，以目录为准）
 }
 
-// gapOutputSchema GapResolution 的 JSON Schema（内嵌 system prompt：实测三方网关在
-// structured-output 模式下会把全 optional schema 合法地输出成空对象，内嵌则按语义作答）。
-const gapOutputSchema = `{
-  "type": "object",
-  "properties": {
-    "errorCodes": {"type": "array", "items": {"type": "object",
-      "properties": {"codeRef": {"type": "string"}, "status": {"type": "integer"}},
-      "required": ["codeRef"]}},
-    "exhaustive": {"type": "boolean"},
-    "errorSites": {"type": "array", "items": {"type": "object",
-      "properties": {"site": {"type": "string"}, "kind": {"enum": ["catalog", "dynamic", "uncoded"]},
-        "codeRefs": {"type": "array", "items": {"type": "string"}}},
-      "required": ["site", "kind"]}},
-    "shapes": {"type": "array", "items": {"type": "object",
-      "properties": {"gap": {"type": "string"}, "shape": {"$ref": "#/$defs/node"}},
-      "required": ["gap", "shape"]}}
-  },
-  "$defs": {"node": {"type": "object",
-    "properties": {
-      "type": {"enum": ["object", "array", "string", "integer", "number", "boolean"]},
-      "properties": {"type": "array", "items": {"type": "object",
-        "properties": {"name": {"type": "string"}, "required": {"type": "boolean"}, "shape": {"$ref": "#/$defs/node"}},
-        "required": ["name", "shape"]}},
-      "items": {"$ref": "#/$defs/node"}},
-    "required": ["type"]}}
-}`
-
-// gapRules 档位2/3 共用的任务规则（system prompt 固定前缀）。
-const gapRules = "You are an API contract extractor for a Go HTTP service. You receive one operation's " +
-	"call-graph source slice and a list of gaps that static analysis could not resolve. Produce ONLY facts " +
-	"that close those gaps and that are directly supported by the source.\n" +
-	"Rules:\n" +
-	"1. Error codes: only use symbols from the task's errorCatalog. A code is valid only if its constant is " +
-	"actually returned/propagated on some path of this operation's source. Prefer errCandidates (already " +
-	"observed in the slice). Look at dynamicErrorSites to see where statically-untraceable errors originate.\n" +
-	"2. Set exhaustive=true only if every error this operation can return is a catalog constant you listed " +
-	"(no pass-through of downstream/dynamic codes). If unsure, false.\n" +
-	"3. Shapes: for every entry in shapeGaps, read the source to find what value is actually placed at that " +
-	"schema path and describe it as a shape tree (nested objects/arrays allowed, max depth 4). Every field name " +
-	"must appear literally in the source (string literal, struct tag or field name); dataCandidates lists keys " +
-	"already found statically. Never invent a field.\n" +
-	"4. Error sites: for EVERY entry in dynamicErrorSites (its surrounding source is in siteContexts), add an " +
-	"errorSites item that copies the site string verbatim and classifies the error value reaching the response " +
-	"from there: \"catalog\" if it only ever carries catalog constants (list them in codeRefs, same rules as 1), " +
-	"\"dynamic\" if its business code is taken from a runtime value (a field of an upstream response, an error " +
-	"passed through from another service, channel, struct field or function value that carries a code), " +
-	"\"uncoded\" if it carries no business code at all (errors.New, fmt.Errorf, library/IO/unmarshal errors). " +
-	"Follow the value to where it is produced when the context is not enough.\n" +
-	"5. If a gap cannot be closed from the evidence, leave it out. Omission is always better than guessing.\n" +
-	"Respond with a single JSON object matching this schema (no prose, no comments):\n" + gapOutputSchema + "\n"
+// gapSystemPrompt 档位2/3 的 system prompt：只含固定规则，全仓所有 operation 共享同一前缀（利于网关前缀缓存）。
+// 规则在 prompts/gap.system.md，输出 schema 在 prompts/gap.schema.json。
+func gapSystemPrompt() string { return prompt("gap.system.md") + prompt("gap.schema.json") + "\n" }
 
 // GapSystemPrompt 档位2/3 的 system prompt：只含固定规则，全仓所有 operation 共享同一前缀（利于网关前缀缓存）。
-func GapSystemPrompt() string { return gapRules }
+func GapSystemPrompt() string { return gapSystemPrompt() }
 
 // SortCatalog 错误码目录按符号排序（任务 JSON 确定，调用缓存可命中）。
 func SortCatalog(items []ErrorCodeItem) []ErrorCodeItem {
@@ -220,6 +191,14 @@ func ResolveGaps(ctx context.Context, p Provider, system string, task GapTask, t
 	return &out, nil
 }
 
+// selfCorrectNote 渲染拒绝回执（reasons 为「条目 → 原因」短行，空列表返回空串）。
+func selfCorrectNote(reasons []string) string {
+	if len(reasons) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(prompt("self-correct.append.md"), strings.Join(reasons, "\n"))
+}
+
 // completeJSON 发送请求并用 parse 解析输出：provider 不支持工具、或工具循环用尽轮数时退回单次调用
 // （后者提示模型凭已给证据作答）；输出不合法时带上解析错误重试一次（不再开工具），仍失败返回错误由上层降级。
 func completeJSON(ctx context.Context, p Provider, req Request, parse func([]byte) error) error {
@@ -230,7 +209,7 @@ func completeJSON(ctx context.Context, p Provider, req Request, parse func([]byt
 		resp, err = p.Complete(ctx, req)
 	case errors.Is(err, ErrToolBudgetExhausted):
 		req.Tools, req.MaxTurns = nil, 0
-		req.Prompt += noToolsPrompt
+		req.Prompt += prompt("no-tools.append.md")
 		resp, err = p.Complete(ctx, req)
 	}
 	if err != nil {
@@ -241,22 +220,15 @@ func completeJSON(ctx context.Context, p Provider, req Request, parse func([]byt
 		return nil
 	}
 	req.Tools, req.MaxTurns = nil, 0
-	req.Prompt += fmt.Sprintf(repairPromptFmt, perr)
+	req.Prompt += fmt.Sprintf(prompt("repair.template.md"), perr)
 	if resp, err = p.Complete(ctx, req); err != nil {
 		return err
 	}
 	return parse(resp.Text)
 }
 
-// noToolsPrompt 工具轮数用尽后退回单次调用的追加提示。
-const noToolsPrompt = "\n\nTools are no longer available. Answer now from the sources and siteContexts above; " +
-	"omit anything you cannot support from them."
-
-// repairPromptFmt 输出修复重试的追加提示（%v 为上次的解析错误）。
-const repairPromptFmt = "\n\nYour previous reply could not be parsed (%v). Reply again with ONLY the JSON object, " +
-	"double-quoted keys, no comments, no trailing commas."
-
 // GapRequest 兜底任务 → 模型请求（ResolveGaps 发送的首个请求；上层据此预查缓存以分配预算）。
+// task.Rejections 非空时把 self-correct 回执追加到 prompt，其余部分不变（复用同一缓存键前缀）。
 func GapRequest(system string, task GapTask, tools []ToolSpec) (Request, error) {
 	ev, err := json.MarshalIndent(task, "", " ")
 	if err != nil {
@@ -266,6 +238,7 @@ func GapRequest(system string, task GapTask, tools []ToolSpec) (Request, error) 
 	if len(tools) > 0 {
 		req.Tools, req.MaxTurns = tools, defaultToolTurns
 	}
+	req.Prompt += selfCorrectNote(task.Rejections)
 	return req, nil
 }
 
