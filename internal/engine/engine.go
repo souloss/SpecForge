@@ -72,6 +72,12 @@ type Config struct {
 	LearnProfile bool
 	// Enrich 用 LLM 为无 godoc 的 operation 生成 summary/description（F8），需 Provider。
 	Enrich bool
+	// Critic 用独立 LLM 对照源码审查每个 operation 的契约完整性（missing 参数/响应/状态/信封），
+	// 需 Provider；产出过 verify 后作为 LLM 候选事实合并，不擅自改静态事实。
+	Critic bool
+	// RaiseConfidence 允许 critic 二次确认且证据完整时提升 LLM 事实核对强度（突破 text 0.6 顶）；
+	// 保守默认关闭。
+	RaiseConfidence bool
 	// Logger 进度与诊断日志（nil = 丢弃）；CLI 按 -v 级别配置输出到 stderr。
 	Logger *slog.Logger
 	// Frontend 语言前端；nil = 按仓库自动识别（见 frontends）。
@@ -150,6 +156,10 @@ type Result struct {
 	RoutesUnique     int                   `json:"routes_unique"`     // method + path 去重后的 operation 身份数
 	RoutesCollapsed  int                   `json:"routes_collapsed"`  // 重复 method + path 注册折叠数
 	UnresolvedRoutes []frontend.RouteIssue `json:"unresolved_routes"`
+	// MissedRoutes 通用前端 recall 守卫的疑似遗漏路由（只进报告/CI，不进 spec）。
+	MissedRoutes []frontend.RouteIssue `json:"missed_routes"`
+	// RuntimeOrphans runtime 观察到、但静态/文档来源从未出现的 route（recall 补采信号，只进报告）。
+	RuntimeOrphans   []string              `json:"runtime_orphans,omitempty"`
 	Operations       int                   `json:"operations"`      // 输出的 operation 数
 	SchemaTypes      int                   `json:"schema_types"`    // schema 类型数
 	SinkSites        int                   `json:"sink_sites"`      // 事实构造阶段产出的事实数（旧口径，保留兼容）
@@ -265,6 +275,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	res.Routes, res.RoutesResolved, res.RoutesUnresolved = an.Stats.Routes, an.Stats.RoutesResolved, an.Stats.RoutesUnresolved
 	res.RoutesUnique, res.RoutesCollapsed = an.Stats.RoutesUnique, an.Stats.RoutesCollapsed
 	res.UnresolvedRoutes = append([]frontend.RouteIssue{}, an.UnresolvedRoutes...)
+	res.MissedRoutes = append([]frontend.RouteIssue{}, an.MissedRoutes...)
 	res.SinkSites = an.Stats.SinkSites
 	res.LLM.Wrappers, res.LLM.Adapter, res.LLM.Routes, res.LLM.Contracts = an.Wrappers, an.Adapter, an.Routes, an.Contracts
 	factList := an.Facts
@@ -274,6 +285,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	// 6. LLM 兜底（档位2/3）+ 语义增强：显式启用才执行；离线时缺口保持 unknown，绝不编造。
 	if provider != nil {
 		lp := newLLMPhase(an.Program, an.Catalog, an.SuccessCode, provider, log)
+		lp.raiseConf = cfg.RaiseConfidence
 		if len(res.Gaps) > 0 {
 			end = timer.begin("llm-gaps")
 			var llmSchemas []*facts.Fact
@@ -289,6 +301,13 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 			enriched := lp.enrichOperations(ctx, factList, an.Handlers, cfg.LLMConcurrency)
 			res.LLM.Enriched = len(enriched)
 			factList = append(factList, enriched...)
+			end()
+		}
+		if cfg.Critic {
+			end = timer.begin("llm-critic")
+			criticFacts, cs := lp.criticizeOperations(ctx, factList, an.Handlers, cfg.LLMConcurrency)
+			res.LLM.Critic = cs
+			factList = append(factList, criticFacts...)
 			end()
 		}
 		if ur, ok := provider.(infer.UsageReporter); ok {
@@ -352,6 +371,7 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 				ingestEnd()
 				return nil, fmt.Errorf("%w: import runtime observations %q: %v", ErrConfig, path, importErr)
 			}
+			res.RuntimeOrphans = collectRuntimeOrphans(graph, observationGraph)
 			mergeContractGraphs(graph, observationGraph)
 		}
 		ingestEnd()
@@ -527,7 +547,7 @@ func llmKeyOf(cfg Config) string {
 	if cfg.Provider == nil {
 		return "offline"
 	}
-	return fmt.Sprintf("llm:%s:budget=%d:learn=%v:enrich=%v", cfg.Provider.Name(), cfg.LLMBudget, cfg.LearnProfile, cfg.Enrich)
+	return fmt.Sprintf("llm:%s:budget=%d:learn=%v:enrich=%v:critic=%v:raise=%v", cfg.Provider.Name(), cfg.LLMBudget, cfg.LearnProfile, cfg.Enrich, cfg.Critic, cfg.RaiseConfidence)
 }
 
 // vcsRevisionKey / vcsModifiedKey 构建信息中的 VCS 设置键。

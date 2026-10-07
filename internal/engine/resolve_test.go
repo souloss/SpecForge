@@ -478,3 +478,123 @@ func hasUnresolved(cp facts.ContractPayload) bool {
 	}
 	return false
 }
+
+// scriptedProvider 按调用次序返回预设答案的 Provider（self-correct 测试用），记录每次请求 prompt。
+type scriptedProvider struct {
+	answers []string // 第 i 次调用返回 answers[i]（越界回最后一个）
+	reqs    []infer.Request
+}
+
+func (s *scriptedProvider) Name() string { return "scripted" }
+func (s *scriptedProvider) Complete(_ context.Context, req infer.Request) (infer.Response, error) {
+	s.reqs = append(s.reqs, req)
+	i := len(s.reqs) - 1
+	if i >= len(s.answers) {
+		i = len(s.answers) - 1
+	}
+	return infer.Response{Text: []byte(s.answers[i])}, nil
+}
+
+// TestSelfCorrectRetriesRejectedCodes self-correct：首轮幻觉码被拒后，把拒绝回执喂回模型重答，
+// 第二轮答对则被采纳；provider 收到两次调用，第二次 prompt 含拒绝回执。
+func TestSelfCorrectRetriesRejectedCodes(t *testing.T) {
+	dir := t.TempDir()
+	must(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module m\n\ngo 1.21\n"), 0o644))
+	must(t, os.MkdirAll(filepath.Join(dir, "svc"), 0o755))
+	must(t, os.WriteFile(filepath.Join(dir, "svc", "svc.go"), []byte(fixtureSrc), 0o644))
+	l, err := loader.LoadRepo(dir)
+	must(t, err)
+	g, err := codegraph.Build(l.Pkgs, l.Fset)
+	must(t, err)
+	g.SetRoot(l.Root)
+	catalog := map[string]frontend.ErrorCode{
+		"m/svc.ErrA": {Symbol: "m/svc.ErrA", Code: 1001, Msg: "a"},
+		"m/svc.ErrB": {Symbol: "m/svc.ErrB", Code: 1002, Msg: "b"},
+	}
+	p := &scriptedProvider{answers: []string{
+		`{"errorCodes":[{"codeRef":"m/svc.ErrFake"}]}`, // 首轮：幻觉码 → 拒
+		`{"errorCodes":[{"codeRef":"m/svc.ErrA"}]}`,    // 二轮：答对 → 采纳
+	}}
+	lp := newLLMPhase(golang.NewProgram(g), catalog, 0, p, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sl := lp.slice("m/svc.Handler", nil)
+	it := gapItem{cp: unresolvedPayload(), handler: "m/svc.Handler", sl: sl,
+		task: infer.GapTask{Method: "GET", Path: "/x", Gaps: []string{facts.GapErrorUnresolved}}}
+	out := lp.resolveOne(context.Background(), it)
+	if out.err != nil {
+		t.Fatal(out.err)
+	}
+	if len(p.reqs) != 2 {
+		t.Fatalf("provider calls = %d, want 2 (self-correct retried)", len(p.reqs))
+	}
+	if !strings.Contains(p.reqs[1].Prompt, "ErrFake") {
+		t.Fatalf("second prompt should carry the rejection receipt, got:\n%s", p.reqs[1].Prompt)
+	}
+	if out.accepted != 1 || out.rejected != 0 {
+		t.Fatalf("accepted=%d rejected=%d, want 1/0", out.accepted, out.rejected)
+	}
+	var got *facts.ResponseFact
+	for i := range out.cp.Responses {
+		if out.cp.Responses[i].Envelope.Code == 1001 {
+			got = &out.cp.Responses[i]
+		}
+	}
+	if got == nil || got.Source != "llm" {
+		t.Fatalf("ErrA not written back after self-correct: %+v", out.cp.Responses)
+	}
+}
+
+// criticProvider 返回预设 critic 输出的 Provider（critic 测试用）。
+type criticProvider struct{ out string }
+
+func (c *criticProvider) Name() string { return "critic" }
+func (c *criticProvider) Complete(_ context.Context, _ infer.Request) (infer.Response, error) {
+	return infer.Response{Text: []byte(c.out)}, nil
+}
+
+// TestCriticAddsMissingResponse critic 补上 executor 漏掉的 404 分支（shape 字段须在源码里出现）。
+func TestCriticAddsMissingResponse(t *testing.T) {
+	lp := fixturePhase(t)
+	// Data() 的 map 字面量含 "total" 字符串键；以 Data 为 handler，critic 报的字段名 "total" 能在源码中找到。
+	cp := facts.ContractPayload{OperationID: "data", Responses: []facts.ResponseFact{{Status: 200, Envelope: &facts.Envelope{Code: 0}}}}
+	it := criticItem{key: "GET /x", cp: cp, handler: "m/svc.Data"}
+	sl := lp.slice("m/svc.Data", nil)
+	accepted := lp.applyCriticFindings(it, &infer.CriticResult{Findings: []infer.CriticFinding{
+		{Kind: "missing_response", Status: 404, Error: true, Shape: &infer.ShapeNode{Type: "object", Properties: []infer.ShapeProp{{Name: "total", Shape: &infer.ShapeNode{Type: "integer"}}}}},
+	}}, sl)
+	if len(accepted) != 2 { // 一份 schema 事实 + 一份 contract 事实
+		t.Fatalf("accepted facts = %d, want 2", len(accepted))
+	}
+	var contractFact *facts.Fact
+	for _, f := range accepted {
+		if f.Kind == facts.KindContract {
+			contractFact = f
+		}
+	}
+	if contractFact == nil {
+		t.Fatal("no contract fact from critic")
+	}
+	got, _ := contractFact.Contract()
+	found404 := false
+	for _, r := range got.Responses {
+		if r.Status == 404 && r.Failure && r.Source == "llm" {
+			found404 = true
+		}
+	}
+	if !found404 {
+		t.Fatalf("404 critic response not merged: %+v", got.Responses)
+	}
+}
+
+// TestCriticRejectsHallucinatedField critic 报的字段名不在源码里：整条 finding 被弃。
+func TestCriticRejectsHallucinatedField(t *testing.T) {
+	lp := fixturePhase(t)
+	cp := facts.ContractPayload{OperationID: "data", Responses: []facts.ResponseFact{{Status: 200, Envelope: &facts.Envelope{Code: 0}}}}
+	it := criticItem{key: "GET /x", cp: cp, handler: "m/svc.Data"}
+	sl := lp.slice("m/svc.Data", nil)
+	accepted := lp.applyCriticFindings(it, &infer.CriticResult{Findings: []infer.CriticFinding{
+		{Kind: "missing_response", Status: 500, Error: true, Shape: &infer.ShapeNode{Type: "object", Properties: []infer.ShapeProp{{Name: "ghostField", Shape: &infer.ShapeNode{Type: "string"}}}}},
+	}}, sl)
+	if len(accepted) != 0 {
+		t.Fatalf("hallucinated critic finding must be rejected, got %d facts", len(accepted))
+	}
+}

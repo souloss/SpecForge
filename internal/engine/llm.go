@@ -59,6 +59,7 @@ type llmPhase struct {
 	log         *slog.Logger
 	successCode int                       // 信封成功码
 	schemas     map[string]*schema.Schema // 静态 schema 事实（类型 ID → schema）：形状缺口的基准
+	raiseConf   bool                      // 允许 critic 二次确认后提升核对强度（突破 text 0.6 顶）
 }
 
 // gapItem 待兜底的 operation：contract 事实 + 载荷副本 + 路由 + 预先组装好的任务。
@@ -81,6 +82,8 @@ type gapOutcome struct {
 	accepted int                   // 通过复核被采纳的事实数
 	rejected int                   // 未通过复核被丢弃的事实数
 	err      error                 // 调用失败（降级保持 unknown）
+	// rejections 本轮被复核拒绝的条目（「条目 → 原因」短行）：self-correct 重试的回执内容。
+	rejections []string
 }
 
 // llmStats LLM 兜底阶段统计（观测与退出码判定）。
@@ -99,6 +102,8 @@ type llmStats struct {
 	Routes frontend.StepStats `json:"routes"`
 	// Contracts L4 通用前端契约抽取统计（前端内执行）。
 	Contracts frontend.StepStats `json:"contracts"`
+	// Critic 自由审查采纳的候选事实数（过 verify 后）。
+	Critic criticStats `json:"critic"`
 }
 
 // newLLMPhase 构造 LLM 阶段上下文（错误码目录进 system prompt 的稳定前缀）。
@@ -245,7 +250,11 @@ func (lp *llmPhase) selectWithinBudget(ctx context.Context, items []gapItem, bud
 	return selected, skipped
 }
 
-// resolveOne 单个 operation：调用 → 在代码上复核产出 → 写回载荷副本。
+// resolveOne 单个 operation：调用 → 在代码上复核产出 → 若被拒则 self-correct 重试 → 写回载荷副本。
+//
+// self-correct 循环：把本轮复核拒绝的「条目 → 原因」回执放进 task.Rejections 重发
+// （infer.ResolveGaps/GapRequest 会据此追加回执片段），最多 selfCorrectRounds 轮；
+// 每轮在干净副本上重跑复核，写回顺序不变，结果确定。
 func (lp *llmPhase) resolveOne(ctx context.Context, it gapItem) gapOutcome {
 	if ctxDone(ctx) {
 		return gapOutcome{err: ctx.Err()}
@@ -254,6 +263,23 @@ func (lp *llmPhase) resolveOne(ctx context.Context, it gapItem) gapOutcome {
 	if err != nil {
 		return gapOutcome{err: err}
 	}
+	out := lp.applyResolution(res, it)
+	for rounds := 0; out.rejected > 0 && len(out.rejections) > 0 && rounds < selfCorrectRounds && !ctxDone(ctx); rounds++ {
+		it.task.Rejections = out.rejections
+		res, err = infer.ResolveGaps(ctx, lp.p, lp.system, it.task, it.tools)
+		if err != nil {
+			break // self-correct 调用失败不致命：保留上一轮已采纳的事实
+		}
+		out = lp.applyResolution(res, it)
+	}
+	return out
+}
+
+// selfCorrectRounds self-correct 的最大重试轮数（超出保留已有采纳，不进入病态循环）。
+const selfCorrectRounds = 1
+
+// applyResolution 一次 ResolveGaps 产出 → 复核 → gapOutcome（在干净副本上跑，可反复调用）。
+func (lp *llmPhase) applyResolution(res *infer.GapResolution, it gapItem) gapOutcome {
 	out := gapOutcome{cp: cloneContract(it.cp), minConf: 1}
 	lp.applyErrorCodes(&out, res, it.sl)
 	lp.applyShapes(&out, res.Shapes, it)
@@ -595,11 +621,10 @@ func (lp *llmPhase) applyErrorCodes(out *gapOutcome, r *infer.GapResolution, sl 
 			present[row.Envelope.CodeRef] = true
 		}
 	}
-	rejected := 0
+	before := out.rejected
 	for _, ec := range r.ErrorCodes {
 		if !lp.acceptCode(out, ec.CodeRef, base, sl, present) {
-			lp.logReject(out, "code "+ec.CodeRef, "not in catalog or not in slice")
-			rejected++
+			lp.reject(out, "code "+ec.CodeRef, "not in catalog or not in slice")
 		}
 	}
 	codeAccepted := out.accepted
@@ -614,8 +639,7 @@ func (lp *llmPhase) applyErrorCodes(out *gapOutcome, r *infer.GapResolution, sl 
 		key := siteKey(rs.Site)
 		sp, located := lp.locateSite(sl, rs.Site)
 		if _, known := pending[key]; !known || !located {
-			lp.logReject(out, "site "+rs.Site, "not a site of the unresolved row, or not in slice")
-			rejected++
+			lp.reject(out, "site "+rs.Site, "not a site of the unresolved row, or not in slice")
 			continue
 		}
 		switch rs.Kind {
@@ -625,16 +649,14 @@ func (lp *llmPhase) applyErrorCodes(out *gapOutcome, r *infer.GapResolution, sl 
 				ok = lp.acceptCode(out, ref, base, sl, present) && ok
 			}
 			if !ok {
-				lp.logReject(out, "site "+rs.Site, "catalog codes missing or rejected")
-				rejected++
+				lp.reject(out, "site "+rs.Site, "catalog codes missing or rejected")
 				continue
 			}
 		case infer.SiteKindDynamic, infer.SiteKindUncoded:
 			classified[rs.Kind] = append(classified[rs.Kind], rs.Site)
 			out.evidence = append(out.evidence, lp.lineEvidence(sp.file, sp.line, "llm:error-site "+rs.Kind))
 		default:
-			lp.logReject(out, "site "+rs.Site, "unknown kind "+rs.Kind)
-			rejected++
+			lp.reject(out, "site "+rs.Site, "unknown kind "+rs.Kind)
 			continue
 		}
 		pending[key] = false
@@ -657,7 +679,7 @@ func (lp *llmPhase) applyErrorCodes(out *gapOutcome, r *infer.GapResolution, sl 
 		out.accepted++
 		out.minConf = min(out.minConf, facts.VerificationCap(facts.VerifySymbol))
 	}
-	out.rejected += rejected
+	rejected := out.rejected - before
 
 	allSites := len(pending) > 0
 	for _, open := range pending {
@@ -670,9 +692,10 @@ func (lp *llmPhase) applyErrorCodes(out *gapOutcome, r *infer.GapResolution, sl 
 	facts.SortResponses(out.cp.Responses)
 }
 
-// reject 记一条被复核拒绝的 LLM 答案（计数 + 调试日志）。
+// reject 记一条被复核拒绝的 LLM 答案（计数 + 调试日志 + self-correct 回执）。
 func (lp *llmPhase) reject(out *gapOutcome, item, reason string) {
 	out.rejected++
+	out.rejections = append(out.rejections, "- "+item+": "+reason)
 	lp.logReject(out, item, reason)
 }
 
@@ -1059,6 +1082,152 @@ func (lp *llmPhase) enrichOperations(ctx context.Context, factList []*facts.Fact
 		}
 	}
 	return res
+}
+
+// ---- 自由审查（critic） -------------------------------------------------------
+
+// criticizeOperations 对每个 operation 用独立 LLM 对照源码审查契约完整性，
+// 发现（missing 参数/响应/状态/信封）过 verify 后作为 LLM 候选事实返回（合并进 Contract Graph，
+// 走既有冲突解析）。只补采、不改静态事实。返回过 verify 的候选事实与统计（供结果汇总）。
+func (lp *llmPhase) criticizeOperations(ctx context.Context, factList []*facts.Fact, handlers map[string]string, concurrency int) ([]*facts.Fact, criticStats) {
+	var items []criticItem
+	for _, f := range factList {
+		if f.Kind != facts.KindContract {
+			continue
+		}
+		cp, ok := f.Contract()
+		if !ok {
+			continue
+		}
+		key := strings.TrimPrefix(f.ID, "contract:")
+		if handlers[key] == "" {
+			continue
+		}
+		items = append(items, criticItem{cp: cp, handler: handlers[key], key: key})
+	}
+	out := make([][]*facts.Fact, len(items))
+	var attempted, accepted, rejected, failed atomic.Int64
+	runPool(ctx, len(items), concurrency, func(i int) {
+		defer func() {
+			if p := recover(); p != nil {
+				failed.Add(1)
+				lp.log.Error("critic panic，跳过", "op", items[i].key, "panic", p)
+			}
+		}()
+		it := items[i]
+		sl := lp.slice(it.handler, nil)
+		if len(sl.snippets) == 0 {
+			return
+		}
+		attempted.Add(1)
+		res, err := infer.Criticize(ctx, lp.p, criticTaskOf(it.key, it.cp), lp.tools)
+		if err != nil {
+			failed.Add(1)
+			lp.log.Debug("critic 失败", "op", it.key, "err", err)
+			return
+		}
+		acceptedFacts := lp.applyCriticFindings(it, res, sl)
+		accepted.Add(int64(len(acceptedFacts)))
+		rejected.Add(int64(len(res.Findings) - len(acceptedFacts)))
+		out[i] = acceptedFacts
+	})
+	var res []*facts.Fact
+	for _, facts := range out {
+		res = append(res, facts...)
+	}
+	lp.log.Info("critic 完成", "attempted", attempted.Load(), "accepted", accepted.Load(), "rejected", rejected.Load(), "failed", failed.Load())
+	return res, criticStats{
+		Attempted: int(attempted.Load()), Accepted: int(accepted.Load()),
+		Rejected: int(rejected.Load()), Failed: int(failed.Load()),
+	}
+}
+
+// criticStats 一次自由审查的统计（回填进 res.LLM.Critic）。
+type criticStats struct {
+	Attempted int `json:"attempted"` // 发起审查的 operation 数
+	Accepted  int `json:"accepted"`  // 过 verify 采纳的候选事实数
+	Rejected  int `json:"rejected"`  // 审查发现未过 verify 的条数
+	Failed    int `json:"failed"`    // 审查调用失败数
+}
+
+// criticItem 一次审查的对象：contract 载荷快照 + handler。
+type criticItem struct {
+	cp      facts.ContractPayload
+	handler string
+	key     string // "METHOD /path"
+}
+
+// criticTaskOf 把当前契约草稿摘要成审查输入（只给审查者「现状」，不含证据细节）。
+func criticTaskOf(key string, cp facts.ContractPayload) infer.CriticTask {
+	method, path := opMethodPath("contract:" + key)
+	task := infer.CriticTask{Operation: key, Method: method, Path: path}
+	for _, p := range cp.Params {
+		task.Contract.Params = append(task.Contract.Params, infer.CriticParam{In: p.In, Name: p.Name, Required: p.Required, Type: p.Type})
+	}
+	task.Contract.RequestBody = cp.RequestBody != nil
+	for _, r := range cp.Responses {
+		err := r.Envelope != nil && r.Envelope.Code != 0
+		task.Contract.Responses = append(task.Contract.Responses, infer.CriticResp{Status: r.Status, Error: err || r.Failure})
+	}
+	return task
+}
+
+// applyCriticFindings 逐条核对审查发现：名字/状态码须在源码出现、形状过 verify.Shape，
+// 通过者合成 LLM 契约事实（params/body/responses 各自进响应），证据=源码行。
+func (lp *llmPhase) applyCriticFindings(it criticItem, res *infer.CriticResult, sl sliceEvidence) []*facts.Fact {
+	text, tokens := lp.sliceText(sl)
+	cp := cloneContract(it.cp)
+	baseEv := []facts.Evidence{lp.lineEvidence(sl.snippets[0].File, sl.snippets[0].Line, "llm:critic")}
+	tagged := lp.taggedFields(sl)
+	var out []*facts.Fact
+	for _, f := range res.Findings {
+		switch f.Kind {
+		case "missing_param":
+			if !verify.ValidParamIn(f.In) || !verify.NameInSource(f.Name, text, tokens) {
+				continue
+			}
+			cp.Params = append(cp.Params, facts.ParamFact{In: f.In, Name: f.Name, Required: f.Required || f.In == "path", Type: verify.ScalarType(f.Type), Origin: "critic:llm"})
+		case "missing_response":
+			if !verify.ValidStatus(f.Status) {
+				continue
+			}
+			row := facts.ResponseFact{Status: f.Status, Raw: true, Failure: f.Error, Source: string(facts.SourceLLM), Sink: "critic"}
+			if f.Shape != nil {
+				sc, evs, err := lp.shapeSchema(f.Shape, text, tokens, tagged, sl)
+				if err != nil {
+					continue
+				}
+				id := llmShapePrefix + shapeHash(sc) + "/critic.Response" + strconv.Itoa(f.Status)
+				for i := range evs {
+					evs[i].File = lp.prog.AbsPath(evs[i].File)
+				}
+				out = append(out, &facts.Fact{ID: "schema:" + id, Kind: facts.KindSchema, Value: facts.SchemaPayload{Schema: sc}, Source: facts.SourceLLM, Confidence: facts.VerificationCap(facts.VerifyText), Verification: facts.VerifyText, Evidence: evs, Status: "verified"})
+				row.SchemaType, row.HasBody = id, true
+			}
+			cp.Responses = append(cp.Responses, row)
+		}
+	}
+	// 有采纳时以同 ID 生成一份 LLM contract 事实，合并进 Contract Graph（多候选，冲突解析决定）。
+	if len(cp.Params) > len(it.cp.Params) || len(cp.Responses) > len(it.cp.Responses) {
+		out = append(out, &facts.Fact{ID: "contract:" + it.key, Kind: facts.KindContract, Value: cp, Source: facts.SourceLLM, Confidence: lp.criticContractConfidence(), Verification: lp.criticVerification(), Evidence: baseEv, Status: "declared"})
+	}
+	return out
+}
+
+// criticContractConfidence critic 产出的 contract 事实置信度：raiseConf 时按 symbol 核对（0.7），否则 text（0.6）。
+func (lp *llmPhase) criticContractConfidence() float64 {
+	if lp.raiseConf {
+		return facts.VerificationCap(facts.VerifySymbol)
+	}
+	return facts.VerificationCap(facts.VerifyText)
+}
+
+// criticVerification 对应的核对强度标签。
+func (lp *llmPhase) criticVerification() string {
+	if lp.raiseConf {
+		return facts.VerifySymbol
+	}
+	return facts.VerifyText
 }
 
 // lastSeg 符号 ID 的末段（pkg.ErrX → ErrX）。

@@ -80,6 +80,8 @@ type genOpts struct {
 	llmConcurrency                           int      // LLM 并发数
 	learnProfile                             bool     // LLM 画像学习
 	enrich                                   bool     // LLM 语义增强
+	critic                                   bool     // LLM 自由审查（契约完整性）
+	raiseConfidence                          bool     // critic 确认后提升 LLM 事实置信度
 	failOnDegraded                           bool     // 降级/预算耗尽时以非 0 退出（CI 闸门）
 	failOnConflict                           bool     // Contract Graph 存在冲突时失败
 	failOnUnresolved                         bool     // Contract Graph 存在未解析项时失败
@@ -189,7 +191,9 @@ LLM gap filling (--llm):
 	f.IntVar(&o.llmConcurrency, "llm-concurrency", defaultLLMConcurrency, "parallel LLM calls; output is identical for any value")
 	f.BoolVar(&o.enrich, "llm-enrich", false, "let the LLM write summary/description for operations without doc comments")
 	f.BoolVar(&o.learnProfile, "llm-learn-profile", false, "let the LLM learn repo conventions from sample handlers; only fills profile entries that are missing")
-	setGroup(f, groupLLM, "llm", "llm-budget", "llm-concurrency", "llm-enrich", "llm-learn-profile")
+	f.BoolVar(&o.critic, "llm-critic", false, "let an independent LLM review each operation's contract against the source; findings pass verification before being merged")
+	f.BoolVar(&o.raiseConfidence, "llm-raise-confidence", false, "raise the confidence of LLM facts that the critic independently confirms (breaks the 0.6 text cap)")
+	setGroup(f, groupLLM, "llm", "llm-budget", "llm-concurrency", "llm-enrich", "llm-learn-profile", "llm-critic", "llm-raise-confidence")
 
 	f.BoolVar(&o.failOnDegraded, "fail-on-degraded", false, "exit 10 if LLM calls or operation analyses failed, 20 if the LLM budget left gaps (outputs are still written)")
 	f.BoolVar(&o.failOnConflict, "fail-on-conflict", false, "fail if merged source candidates disagree")
@@ -261,7 +265,7 @@ func (o *genOpts) config() (engine.Config, error) {
 		RepoDir: o.repo, Service: o.service, ServiceRoot: o.serviceRoot, ProfilePath: o.profile, OutDir: o.out, OpenAPIFiles: append([]string(nil), o.openapi...), RuntimeFiles: append([]string(nil), o.runtime...), DocumentationFiles: append([]string(nil), o.documentation...),
 		FailOnConflict: o.failOnConflict, FailOnUnresolved: o.failOnUnresolved, MinConfidence: o.minConfidence,
 		LLMBudget: o.llmBudget, LLMConcurrency: o.llmConcurrency,
-		LearnProfile: o.learnProfile, Enrich: o.enrich,
+		LearnProfile: o.learnProfile, Enrich: o.enrich, Critic: o.critic, RaiseConfidence: o.raiseConfidence,
 	}
 	if o.frontend != "" {
 		fe, err := engine.FrontendByName(o.frontend)
@@ -275,7 +279,7 @@ func (o *genOpts) config() (engine.Config, error) {
 		cfg.LLMCacheDir = filepath.Join(root, llmSubdir)
 		cfg.FactCacheDir = filepath.Join(root, "facts.sqlite")
 	}
-	if o.llm || o.learnProfile || o.enrich {
+	if o.llm || o.learnProfile || o.enrich || o.critic || o.raiseConfidence {
 		cfg.Provider = infer.NewProviderFromEnv()
 		if cfg.Provider == nil {
 			return cfg, newErr(exitConfig, codeLLMNotConfig, "LLM requested but no credentials configured",
