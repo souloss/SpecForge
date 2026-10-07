@@ -12,3 +12,6 @@
 
 # Go 工具链
 vendor/
+
+# specforge 运行级缓存（memo/llm/facts.sqlite，可重新生成）
+**/.specforge/cache/
