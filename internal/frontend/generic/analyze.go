@@ -46,12 +46,6 @@ const verifyWindow = 2
 // maxSliceSources 契约抽取任务中 handler 之外附带的被调函数源码数。
 const maxSliceSources = 8
 
-// minHTTPStatus / maxHTTPStatus 合法 HTTP 状态码范围。
-const (
-	minHTTPStatus = 100
-	maxHTTPStatus = 599
-)
-
 // defaultSuccessStatus LLM 未给出任何响应时的兜底成功状态码（并记缺口）。
 const defaultSuccessStatus = 200
 
@@ -83,12 +77,6 @@ var pathParam = regexp.MustCompile(`:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)(?::[^}]*)?\
 
 // validMethods 允许的 HTTP 方法。
 var validMethods = map[string]bool{"GET": true, "POST": true, "PUT": true, "DELETE": true, "PATCH": true, "HEAD": true, "OPTIONS": true, "TRACE": true}
-
-// validIn 参数位置取值。
-var validIn = map[string]bool{"query": true, "path": true, "header": true, "cookie": true}
-
-// scalarTypes 参数允许的基础类型。
-var scalarTypes = map[string]bool{"string": true, "integer": true, "number": true, "boolean": true}
 
 // Frontend L4 通用 LLM 前端：注册在所有静态前端之后，仓库有任意源码文件即匹配。
 type Frontend struct{}
@@ -186,6 +174,10 @@ func (*Frontend) Analyze(ctx context.Context, req frontend.Request) (*frontend.A
 	an.Stats.RoutesCollapsed = max(0, rst.Attempted-rst.Rejected-len(routes))
 	req.Log.Info("通用前端路由发现完成", "files", len(cands), "routes", len(routes), "rejected", rst.Rejected, "failed", rst.Failed)
 
+	// recall 守卫：正则扫出「疑似路由注册行」与已采纳路由的差集，报进 MissedRoutes 清单
+	// （不擅自进 spec）。这是 route recall 的确定性下界，防 LLM 漏报端点。
+	an.MissedRoutes = scanMissedRoutes(prog, cands, routes)
+
 	end = req.Stage("llm-contracts")
 	an.Facts, an.Contracts = extract(ctx, req, prog, routes, conc)
 	end()
@@ -257,6 +249,40 @@ func runPool(ctx context.Context, n, conc int, work func(i int)) {
 	}
 	close(jobs)
 	wg.Wait()
+}
+
+// scanMissedRoutes recall 守卫：把候选源码里所有「疑似路由注册行」与已采纳路由的
+// (file,line) 集合做差集，产出疑似遗漏清单（不进 spec）。
+//
+// 启发式：一行同时命中 verbHint（路由动词/装饰器）与 routeHint（以 / 开头的字符串字面量）。
+// 已经由 LLM 报出并经 verifyRoute 采纳的注册行不重复报。为避免正则误报污染产物，
+// 这里只产出 frontend.RouteIssue 清单，由 report/CLI/CI 消费，不生成 route 事实。
+func scanMissedRoutes(prog *Program, files []string, accepted []route) []frontend.RouteIssue {
+	seen := map[string]bool{} // "relPath:line" → 已采纳
+	for _, r := range accepted {
+		seen[fmt.Sprintf("%s:%d", prog.RelPath(r.file), r.line)] = true
+	}
+	var out []frontend.RouteIssue
+	for _, f := range files {
+		rel := prog.RelPath(f)
+		lines := prog.FileLines(f)
+		for i, line := range lines {
+			if !verbHint.MatchString(line) {
+				continue
+			}
+			lit := routeHint.FindString(line)
+			if lit == "" || seen[fmt.Sprintf("%s:%d", rel, i+1)] {
+				continue
+			}
+			out = append(out, frontend.RouteIssue{
+				File:    rel,
+				Line:    i + 1,
+				RawPath: strings.Trim(lit, `"'`),
+				Reason:  "route hint not reported by the LLM route discoverer",
+			})
+		}
+	}
+	return out
 }
 
 // discover 逐文件路由发现并核对；按 (method, path) 去重（先到先得，文件序确定）。
@@ -493,7 +519,7 @@ func buildFacts(prog *Program, r route, o opOutcome) ([]*facts.Fact, int) {
 	// 参数：位置/类型取封闭集合，名字须出现在切片源码中；路径参数以路由模板为准。
 	pathSeen := map[string]bool{}
 	for _, p := range c.Params {
-		if !validIn[p.In] || !verify.NameInSource(p.Name, o.text, tokens) {
+		if !verify.ValidParamIn(p.In) || !verify.NameInSource(p.Name, o.text, tokens) {
 			rejected++
 			continue
 		}
@@ -503,11 +529,26 @@ func buildFacts(prog *Program, r route, o opOutcome) ([]*facts.Fact, int) {
 			}
 			pathSeen[p.Name] = true
 		}
-		typ := p.Type
-		if !scalarTypes[typ] {
-			typ = "string"
+		typ := verify.ScalarType(p.Type)
+		// 参数级约束核对：enum/pattern 字面量须出现在源码；format 取封闭集合。
+		for _, v := range p.Enum {
+			if !verify.NameInSource(v, o.text, tokens) {
+				rejected++
+				continue
+			}
 		}
-		cp.Params = append(cp.Params, facts.ParamFact{In: p.In, Name: p.Name, Required: p.Required || p.In == "path", Type: typ, Origin: Name + ":llm"})
+		if p.Pattern != "" && !verify.NameInSource(p.Pattern, o.text, tokens) {
+			rejected++
+			continue
+		}
+		if p.Format != "" && !verify.ValidFormat(p.Format) {
+			rejected++
+			continue
+		}
+		cp.Params = append(cp.Params, facts.ParamFact{
+			In: p.In, Name: p.Name, Required: p.Required || p.In == "path", Type: typ,
+			Format: p.Format, Enum: p.Enum, Origin: Name + ":llm",
+		})
 	}
 	for _, name := range r.params {
 		if !pathSeen[name] {
@@ -531,7 +572,7 @@ func buildFacts(prog *Program, r route, o opOutcome) ([]*facts.Fact, int) {
 	seen := map[string]bool{}
 	for _, resp := range c.Responses {
 		key := strconv.Itoa(resp.Status) + strconv.FormatBool(resp.Error)
-		if resp.Status < minHTTPStatus || resp.Status > maxHTTPStatus || seen[key] {
+		if !verify.ValidStatus(resp.Status) || seen[key] {
 			rejected++
 			continue
 		}

@@ -60,3 +60,32 @@ func TestPathLiteralIn(t *testing.T) {
 		t.Fatal("suffix must fall on a segment boundary")
 	}
 }
+
+// TestScanMissedRoutes recall 守卫：LLM 漏报的注册行进疑似遗漏清单，已采纳的注册行不重复报。
+func TestScanMissedRoutes(t *testing.T) {
+	root := t.TempDir()
+	src := "router.get('/reported', a)\nrouter.get('/missed', b)\n" +
+		"function a() {}\nfunction b() {}\n" +
+		"const notARoute = '/api/plain-config-string';\n"
+	file := filepath.Join(root, "routes.js")
+	if err := os.WriteFile(file, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prog, err := NewProgram(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 已采纳 /reported@line1；/missed@line2 是漏报；plain-config 不是路由注册行（无动词）。
+	accepted := []route{{file: file, line: 1, path: "/reported"}}
+	missed := scanMissedRoutes(prog, []string{file}, accepted)
+	var got []int
+	for _, m := range missed {
+		got = append(got, m.Line)
+	}
+	if len(got) != 1 || got[0] != 2 {
+		t.Fatalf("missed lines = %v, want [2]; issues=%+v", got, missed)
+	}
+	if missed[0].RawPath != "/missed" {
+		t.Fatalf("missed rawPath = %q, want /missed", missed[0].RawPath)
+	}
+}
