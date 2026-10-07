@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -336,4 +337,20 @@ func hasConflict[T any](candidates []contract.Candidate[T]) bool {
 		}
 	}
 	return false
+}
+
+// collectRuntimeOrphans 报出 observation 里「静态/文档来源从未出现」的 route。
+// 只作为 recall 补采信号进报告（可能含走网关/其它服务的流量，不擅自进 spec）。
+func collectRuntimeOrphans(base, observed *contract.Graph) []string {
+	if observed == nil {
+		return nil
+	}
+	var out []string
+	for key := range observed.Operations {
+		if base == nil || base.Operations[key] == nil {
+			out = append(out, key)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

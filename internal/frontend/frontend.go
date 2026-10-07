@@ -61,11 +61,14 @@ type Analysis struct {
 	SuccessCode      int                  // 业务信封的成功码（无信封约定时为 0）
 	Stats            Stats                // 统计
 	UnresolvedRoutes []RouteIssue         // 未能生成 operation 的路由注册及原因
-	OpFailures       []OpFailure          // 分析失败被隔离的 operation
-	Wrappers         StepStats            // L2 LLM 包装器摘要统计
-	Adapter          StepStats            // L3 LLM 适配器生成统计
-	Routes           StepStats            // L4 通用前端路由发现统计（按路由计）
-	Contracts        StepStats            // L4 通用前端契约抽取统计（按 operation 计）
+	// MissedRoutes 通用前端 recall 守卫报出的「疑似遗漏路由」：候选源码里 LLM 未报出的路由注册行。
+	// 只进清单供报告/CI 审阅，不擅自进 spec（正则启发式可能误报 config 行）。
+	MissedRoutes []RouteIssue
+	OpFailures   []OpFailure // 分析失败被隔离的 operation
+	Wrappers     StepStats   // L2 LLM 包装器摘要统计
+	Adapter      StepStats   // L3 LLM 适配器生成统计
+	Routes       StepStats   // L4 通用前端路由发现统计（按路由计）
+	Contracts    StepStats   // L4 通用前端契约抽取统计（按 operation 计）
 }
 
 // StepStats 前端内一个 LLM 步骤的统计。

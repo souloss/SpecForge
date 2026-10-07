@@ -98,6 +98,20 @@ func renderReport(doc *compiler.Document, res *Result) string {
 		}
 		b.WriteString("\n")
 	}
+	if len(res.MissedRoutes) > 0 {
+		fmt.Fprintf(&b, "## 疑似遗漏路由（recall 守卫，未进 spec）(%d)\n\n", len(res.MissedRoutes))
+		for _, m := range res.MissedRoutes {
+			fmt.Fprintf(&b, "- %s:%d %s (%s)\n", m.File, m.Line, m.RawPath, m.Reason)
+		}
+		b.WriteString("\n")
+	}
+	if len(res.RuntimeOrphans) > 0 {
+		fmt.Fprintf(&b, "## runtime 观察到但契约未覆盖的 route（%d）\n\n", len(res.RuntimeOrphans))
+		for _, key := range res.RuntimeOrphans {
+			fmt.Fprintf(&b, "- %s\n", key)
+		}
+		b.WriteString("\n")
+	}
 	if len(res.DroppedIDs) > 0 {
 		fmt.Fprintf(&b, "## 证据闸门丢弃的事实 (%d)\n\n", len(res.DroppedIDs))
 		for _, id := range res.DroppedIDs {
