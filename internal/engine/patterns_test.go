@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -211,12 +212,62 @@ func TestFastAPIGeneric(t *testing.T) {
 	}
 }
 
+// TestFastAPIEmptyGraphGuard 空图守卫：LLM 全故障时路由已解析但产不出任何 operation，
+// 应显式报错而非静默产出空 spec（也防止把空图写进 fact cache 毒化后续运行）。
+func TestFastAPIEmptyGraphGuard(t *testing.T) {
+	repo := filepath.Join("..", "..", "testdata", "fastapi-repo")
+	_, err := Run(context.Background(), Config{
+		RepoDir:        repo,
+		OutDir:         t.TempDir(),
+		Provider:       &fastAPIProvider{failContracts: true},
+		Service:        "webui",
+		ServiceRoot:    "src/weave/webui",
+		LLMConcurrency: 3,
+	})
+	if err == nil {
+		t.Fatal("expected an error when no operations are produced")
+	}
+	if !strings.Contains(err.Error(), "no contract facts") && !strings.Contains(err.Error(), "contract graph is empty") {
+		t.Fatalf("error should identify the empty-graph failure, got: %v", err)
+	}
+}
+
+// TestFastAPIFailedRunDoesNotPoisonCache 失败运行（LLM 全故障）不得把空图写进 fact cache 毒化后续运行：
+// 第一次失败报错后，用同一 FactCacheDir 重跑（正常 provider）应照常产出 6 个 operation。
+func TestFastAPIFailedRunDoesNotPoisonCache(t *testing.T) {
+	repo := filepath.Join("..", "..", "testdata", "fastapi-repo")
+	factsDir := t.TempDir()
+	if _, err := Run(context.Background(), Config{
+		RepoDir: repo, OutDir: t.TempDir(), FactCacheDir: filepath.Join(factsDir, "facts.sqlite"),
+		Provider: &fastAPIProvider{failContracts: true},
+		Service:  "webui", ServiceRoot: "src/weave/webui", LLMConcurrency: 3,
+	}); err == nil {
+		t.Fatal("first (failed) run must error")
+	}
+	res, err := Run(context.Background(), Config{
+		RepoDir: repo, OutDir: t.TempDir(), FactCacheDir: filepath.Join(factsDir, "facts.sqlite"),
+		Provider: &fastAPIProvider{},
+		Service:  "webui", ServiceRoot: "src/weave/webui", LLMConcurrency: 3,
+	})
+	if err != nil {
+		t.Fatalf("second run after a failed run must succeed: %v", err)
+	}
+	if res.Operations < 5 {
+		t.Fatalf("second run operations = %d, want >= 5 (poisoned cache discarded them)", res.Operations)
+	}
+}
+
 // fastAPIProvider 脚本化 Provider：路由发现按文件返回预设，契约抽取按 operation 返回预设。
-type fastAPIProvider struct{}
+type fastAPIProvider struct {
+	failContracts bool // 契约抽取全部返回错误（模拟 LLM 全故障，走空图守卫）
+}
 
 func (p *fastAPIProvider) Name() string { return "fastapi-fixture" }
 
 func (p *fastAPIProvider) Complete(_ context.Context, req infer.Request) (infer.Response, error) {
+	if p.failContracts {
+		return infer.Response{}, errors.New("simulated LLM failure")
+	}
 	var task struct {
 		File   string `json:"file"`
 		Method string `json:"method"`

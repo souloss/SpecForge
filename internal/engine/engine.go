@@ -337,6 +337,12 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 	}
 	res.SchemaTypes = len(schemaFacts)
 	res.FactsList, res.Facts = factList, len(factList)
+	// 空图守卫：证据闸门刚丢弃过事实、或契约抽取有失败，且 Contract Graph 一个 operation 都没有，
+	// 说明契约/证据管线出了结构性错误（典型：证据路径口径不一致被闸门全弃，或 LLM 全部故障）。
+	// 继续只会产出空 spec，静默掩盖问题，这里直接报错。
+	if len(factList) == 0 && (res.Dropped > 0 || an.Contracts.Failed > 0) {
+		return nil, fmt.Errorf("analysis produced no contract facts (dropped=%d, contract failures=%d): evidence or extraction pipeline failed; see --log-level debug", res.Dropped, an.Contracts.Failed)
+	}
 	graph := graphFromFacts(factList)
 	graphCached := false
 	factStore, factCacheErr := factcache.Open(cfg.FactCacheDir)
@@ -389,8 +395,16 @@ func Run(ctx context.Context, cfg Config) (*Result, error) {
 		ingestEnd()
 	}
 	markGraphStates(graph)
-	if err := factStore.SaveWithRoot(fp, engineBuildKey(), graph, cfg.RepoDir); err != nil {
-		return nil, fmt.Errorf("save fact cache: %w", err)
+	// 空图守卫：路由已解析、或路由发现失败，但 Contract Graph 里一个 operation 都没有，说明契约/证据
+	// 管线出了结构性错误（典型：命中了被失败运行写入的空图 fact cache，或 LLM 全部故障）。此时产物会是
+	// 空 spec，静默产出会掩盖问题，直接报错；且不得把空图写回缓存继续毒化后续运行。
+	if len(graph.Operations) == 0 && (an.Stats.RoutesResolved > 0 || an.Routes.Failed > 0) {
+		return nil, fmt.Errorf("contract graph is empty (routes resolved=%d, discovery failures=%d): analysis produced no operations; clear --cache-dir and re-run", an.Stats.RoutesResolved, an.Routes.Failed)
+	}
+	if len(graph.Operations) > 0 {
+		if err := factStore.SaveWithRoot(fp, engineBuildKey(), graph, cfg.RepoDir); err != nil {
+			return nil, fmt.Errorf("save fact cache: %w", err)
+		}
 	}
 	res.Conflicts, res.UnknownSchemas = graphStats(graph)
 	res.GraphDiagnostics = contract.ValidateGraph(graph)

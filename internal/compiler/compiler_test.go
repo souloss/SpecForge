@@ -26,6 +26,18 @@ func TestCanonicalShapeDedup(t *testing.T) {
 	}
 }
 
+func TestRenderEmptyPaths(t *testing.T) {
+	// 空 Document（0 operation）必须渲染成 paths: {}，悬空的 `paths:` 会被 YAML 解析成 null 而违反 OpenAPI 3.1。
+	d := &Document{Title: "X API", Version: "1.0.0"}
+	b, err := RenderYAML(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), "paths:\n  {}\n") {
+		t.Fatalf("empty document must render an empty paths object, got:\n%s", b)
+	}
+}
+
 func TestPathLess(t *testing.T) {
 	// 路径分段字典序（设计文档 §8.5 规则 2）
 	if !pathLess("/a/b", "/a/c") {

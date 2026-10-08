@@ -50,13 +50,18 @@ func render(d *Document) ([]byte, error) {
 	}
 
 	w("paths:\n")
-	currentPath := ""
-	for _, op := range d.Operations {
-		if op.Path != currentPath {
-			currentPath = op.Path
-			w("  %s:\n", quoteIfNeeded(op.Path))
+	if len(d.Operations) == 0 {
+		// OpenAPI 3.1 要求 paths 为对象；无 operation 时输出空对象，避免 `paths:` 悬空被解析成 null。
+		w("  {}\n")
+	} else {
+		currentPath := ""
+		for _, op := range d.Operations {
+			if op.Path != currentPath {
+				currentPath = op.Path
+				w("  %s:\n", quoteIfNeeded(op.Path))
+			}
+			writeOperation(w, &b, op, 4)
 		}
-		writeOperation(w, &b, op, 4)
 	}
 
 	// components
