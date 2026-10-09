@@ -31,30 +31,7 @@ paths:
                         properties:
                           result:
                             $ref: '#/components/schemas/RoleListResp'
-                  - type: object
-                    properties:
-                      jsonrpc:
-                        type: string
-                      id:
-                        type: string
-                      error:
-                        type: [object, 'null']
-                        properties:
-                          code:
-                            type: integer
-                            format: int64
-                          msg:
-                            type: string
-                          data:
-                            description: interface{} passthrough
-                        required:
-                          - code
-                          - msg
-                          - data
-                    required:
-                      - jsonrpc
-                      - id
-                      - error
+                  - $ref: '#/components/schemas/ErrResponse'
   /permAdmin/v1/UserCreate:
     post:
       tags:
@@ -79,30 +56,7 @@ paths:
                         properties:
                           result:
                             $ref: '#/components/schemas/UserCreateResp'
-                  - type: object
-                    properties:
-                      jsonrpc:
-                        type: string
-                      id:
-                        type: string
-                      error:
-                        type: [object, 'null']
-                        properties:
-                          code:
-                            type: integer
-                            format: int64
-                          msg:
-                            type: string
-                          data:
-                            description: interface{} passthrough
-                        required:
-                          - code
-                          - msg
-                          - data
-                    required:
-                      - jsonrpc
-                      - id
-                      - error
+                  - $ref: '#/components/schemas/ErrResponse'
   /permAdmin/v1/RoleAssign:
     post:
       tags:
@@ -127,30 +81,7 @@ paths:
                         properties:
                           result:
                             $ref: '#/components/schemas/RoleAssignResp'
-                  - type: object
-                    properties:
-                      jsonrpc:
-                        type: string
-                      id:
-                        type: string
-                      error:
-                        type: [object, 'null']
-                        properties:
-                          code:
-                            type: integer
-                            format: int64
-                          msg:
-                            type: string
-                          data:
-                            description: interface{} passthrough
-                        required:
-                          - code
-                          - msg
-                          - data
-                    required:
-                      - jsonrpc
-                      - id
-                      - error
+                  - $ref: '#/components/schemas/ErrResponse'
 components:
   schemas:
     BaseResp:
