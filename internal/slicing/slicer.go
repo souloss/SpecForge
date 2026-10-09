@@ -214,6 +214,16 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 	if st, ok := s.constStatus(site); ok {
 		hit.Status = st
 	}
+	// 无显式状态码的裸写出（如 json.NewEncoder(w).Encode / w.Write）会随同函数内最近一次
+	// 常量 WriteHeader 归入该状态码行（wire 上首次 WriteHeader 生效，后写不覆盖）。
+	// http.Error 自身带常量 StatusArg，constStatus 已先取值，此处 w.StatusArg<0 才走兜底。
+	if pat.Raw {
+		if w, ok := s.writers[site.Callee]; ok && w.StatusArg < 0 {
+			if st, ok := s.statusConstInFunc(site.Caller, site.Line); ok {
+				hit.Status = st
+			}
+		}
+	}
 	if pat.ErrSlot == profile.NoSlot {
 		hit.Success = true // 无 err 槽：恒为成功写出
 	}
@@ -256,6 +266,10 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 				} else if isAnonStruct(refined) {
 					hit.DataInline = refined // 匿名结构体（如上游响应的 `Result struct{…}`）：结构静态确定
 					hit.HasBody = true
+				} else if refined != nil && isBasicSlice(refined) {
+					// any 槽反推出基础元素切片（[]string/[]int...）：按内联数组类型合成 array schema。
+					hit.DataInline = refined
+					hit.HasBody = true
 				} else {
 					hit.DataUnknown = true
 				}
@@ -265,6 +279,11 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 		if strings.HasPrefix(t, "[]") {
 			if elem := normalizeTypeID(strings.TrimPrefix(t, "[]")); elem != "" {
 				hit.DataTypeID = "[]" + elem
+				hit.HasBody = true
+				hit.DataUnknown = false
+			} else if st := s.sliceTypeOf(site, pat.DataSlot); st != nil && isBasicSlice(st) {
+				// []基础类型（[]string/[]int...）：无命名元素类型，内联合成 array schema。
+				hit.DataInline = st
 				hit.HasBody = true
 				hit.DataUnknown = false
 			}
@@ -280,6 +299,12 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 	if pat.Raw {
 		hit.ErrorBranch = s.inErrorBranch(site)
 		hit.ParamFed = s.paramFed(site, pat.DataSlot)
+	}
+	// Raw 写出器（http.Error、json.Encoder.Encode 等框架原生写出）的 data 实参静态类型就是唯一成功体真源：
+	// 当实参已带具体命名类型时清掉 DataUnknown（它可能由错误分支顺带置位），不掩盖已知成功体。
+	// 仅对成功行（非错误分支）生效：错误分支内 http.Error 的 data 是 error string，不应清位。
+	if pat.Raw && !hit.ErrorBranch && hit.DataTypeID != "" && hit.HasBody {
+		hit.DataUnknown = false
 	}
 
 	// ---- err 槽 ----
@@ -304,8 +329,10 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 		if !hit.Success && pat.ErrEnvelopeType != "" {
 			hit.EnvelopeType = pat.ErrEnvelopeType
 		}
-		if !hit.Success && pat.FailureCode != nil {
+		if !hit.Success && pat.FailureCode != nil && hit.ErrConstID == "" && len(hit.ErrConstIDs) == 0 {
 			// 包装器失败分支的信封码是常量（如 gin.H{"code": 500, ...}）：与 err 的具体值无关。
+			// 但若 err 已反推出具体错误码常量（如 `code.NewError(code.ErrUnauthorized, ...)`），
+			// 该常量比包装器的固定兜底码更精确，保留它而非用 FailureCode 覆盖。
 			hit.FixedCode = pat.FailureCode
 			hit.ErrConstID, hit.ErrConstIDs, hit.ErrUnresolved, hit.ErrSource = "", nil, false, ""
 			hit.uncodedAt, hit.dynamicAt = "", ""
@@ -690,6 +717,180 @@ func isAnonStruct(t types.Type) bool {
 	}
 	_, ok := types.Unalias(t).(*types.Struct)
 	return ok
+}
+
+// isBasicSlice 类型是否为「基础元素切片」（[]string/[]int/[]float64...）。
+// 这类切片没有命名元素类型可登记为 $ref，但可内联合成 array schema（值级收窄出口）。
+func isBasicSlice(t types.Type) bool {
+	sl, ok := types.Unalias(t).(*types.Slice)
+	if !ok {
+		return false
+	}
+	_, ok = types.Unalias(sl.Elem()).(*types.Basic)
+	return ok
+}
+
+// statusConstInFunc 所在函数内、写出点紧邻前一行（cl == line-1）的常量状态码写出
+// （裸 WriteHeader/HTTP 状态码）。用于把「w.WriteHeader(404); Encode(errbody)」这类
+// 状态码与响应体相邻写出的形态合并进同一错误状态码行。要求紧邻：避免把
+// `if err { http.Error(...); return }` 之后的成功 Encode 误并入错误状态码。
+func (s *Slicer) statusConstInFunc(caller string, line int) (int, bool) {
+	fd := s.g.FuncDeclOf(caller)
+	info := s.g.TypeInfoOfFunc(caller)
+	if fd == nil || fd.Body == nil || info == nil {
+		return 0, false
+	}
+	best, bestLine := 0, -1
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		callee, _ := codegraph.ResolveCallee(call, info)
+		w, ok := s.writers[callee]
+		if !ok || w.StatusArg == adapter.NoArg || w.StatusArg >= len(call.Args) {
+			return true
+		}
+		cl := s.g.Fset.Position(call.Pos()).Line
+		if cl != line-1 {
+			return true
+		}
+		tv, ok := info.Types[call.Args[w.StatusArg]]
+		if !ok || tv.Value == nil || tv.Value.Kind() != constant.Int {
+			return true
+		}
+		v, exact := constant.Int64Val(tv.Value)
+		if exact && cl > bestLine {
+			best, bestLine = int(v), cl
+		}
+		return true
+	})
+	return best, bestLine >= 0
+}
+
+// NarrowEnvelopeResult 沿 data 槽实参的调用链，把「服务层组装信封」的 result 槽收窄为具体业务体类型。
+// 适用于 `WriteResponse(c, nil, BuildBaseResponse(c, payload))` 这类形态：data 槽静态类型是
+// `*BaseResp`（命名类型，result 字段 any），不进 DataLiterals 收窄；这里跨进 BuildBaseResponse
+// 实现体，找到 `&BaseResp{..., Result: result}` 字面量的 Result 字段值（形参 result），再回到
+// 调用点取实参 payload 的类型。返回收窄后的业务体类型 ID、承载它的信封字段 JSON 名与信封类型 ID
+// （前端据此渲染 allOf[信封, {result: 业务体}]；无法收窄时返回空）。
+func (s *Slicer) NarrowEnvelopeResult(h SinkHit) (innerTypeID, dataFieldJSON, envTypeID string) {
+	pat, ok := s.prof.IsSink(h.Site.Callee)
+	if !ok || pat.DataSlot < 0 || pat.DataSlot >= len(h.Site.ArgExprs) {
+		return "", "", ""
+	}
+	call, ok := ast.Unparen(h.Site.ArgExprs[pat.DataSlot]).(*ast.CallExpr)
+	if !ok {
+		return "", "", ""
+	}
+	info := s.g.TypeInfoOfFunc(h.Site.Caller)
+	if info == nil {
+		return "", "", ""
+	}
+	callee, _ := codegraph.ResolveCallee(call, info)
+	if callee == "" {
+		return "", "", ""
+	}
+	// data 实参的静态类型必须是命名结构体，且有一个 any 字段（result 槽）。
+	t := info.TypeOf(call)
+	if t == nil {
+		return "", "", ""
+	}
+	if p, isPtr := t.(*types.Pointer); isPtr {
+		t = p.Elem()
+	}
+	envTypeID = codegraph.TypeIDOf(t)
+	ti := s.g.Type(envTypeID)
+	if ti == nil || !ti.IsStruct {
+		return "", "", ""
+	}
+	var anyField string // result 槽字段 Go 名
+	for _, f := range ti.Fields {
+		if f.Kind == "any" {
+			anyField = f.Name
+			dataFieldJSON = f.JSONName
+			break
+		}
+	}
+	if anyField == "" {
+		return "", "", ""
+	}
+	// 进 BuildBaseResponse 实现体，找 `&BaseResp{..., Result: <形参>}` 字面量里的 Result 值。
+	fd := s.g.FuncDeclOf(callee)
+	implInfo := s.g.TypeInfoOfFunc(callee)
+	if fd == nil || fd.Body == nil || implInfo == nil {
+		return "", "", ""
+	}
+	var resultExpr ast.Expr
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		lit, ok := n.(*ast.CompositeLit)
+		if !ok || resultExpr != nil {
+			return resultExpr == nil
+		}
+		lt := implInfo.TypeOf(lit)
+		if lt == nil {
+			return true
+		}
+		if p, isPtr := lt.(*types.Pointer); isPtr {
+			lt = p.Elem()
+		}
+		if codegraph.TypeIDOf(lt) != envTypeID {
+			return true
+		}
+		for _, el := range lit.Elts {
+			if kv, ok := el.(*ast.KeyValueExpr); ok {
+				if id, ok := kv.Key.(*ast.Ident); ok && id.Name == anyField {
+					resultExpr = kv.Value
+					break
+				}
+			}
+		}
+		return resultExpr == nil
+	})
+	if resultExpr == nil {
+		return "", "", ""
+	}
+	// result 字段值应是形参，回到调用点取对应实参类型。
+	id, isParam := ast.Unparen(resultExpr).(*ast.Ident)
+	if !isParam {
+		return "", "", ""
+	}
+	params := paramIndex(fd, implInfo)
+	idx, ok := params[implInfo.Uses[id]]
+	if !ok || idx >= len(call.Args) {
+		return "", "", ""
+	}
+	at := info.TypeOf(call.Args[idx])
+	if at == nil {
+		return "", "", ""
+	}
+	if p, isPtr := at.(*types.Pointer); isPtr {
+		at = p.Elem()
+	}
+	inner := codegraph.TypeIDOf(at)
+	if inner == "" || s.g.Type(inner) == nil {
+		return "", "", ""
+	}
+	return inner, dataFieldJSON, envTypeID
+}
+
+// sliceTypeOf 数据槽实参（切片变量/调用结果）经值流反推出的具体切片类型。
+// 用于「[]基础类型」这类没有命名元素类型、但可内联合成 array schema 的切片。
+func (s *Slicer) sliceTypeOf(site codegraph.CallSite, slot int) types.Type {
+	if slot < 0 || slot >= len(site.ArgExprs) || site.ArgExprs[slot] == nil {
+		return nil
+	}
+	var got types.Type
+	leaf := func(_ ast.Expr, t types.Type, _ *types.Info, _ map[string]bool) bool {
+		if t != nil && !types.IsInterface(t) {
+			got = t
+			return true
+		}
+		return false
+	}
+	c := &flowCtx{leaf: leaf, out: map[string]bool{}, visiting: map[string]bool{}}
+	s.flowValues(site.Caller, site.ArgExprs[slot], 0, c)
+	return got
 }
 
 // normalizeTypeID 类型串 → 可登记的命名类型 ID（去指针与泛型实参）；基础类型、切片、map、匿名类型返回空。

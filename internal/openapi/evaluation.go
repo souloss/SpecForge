@@ -55,6 +55,8 @@ type EvaluationSchema struct {
 	Nullable             bool
 	AdditionalProperties any
 	AllOf                []EvaluationSchema
+	OneOf                []EvaluationSchema
+	AnyOf                []EvaluationSchema
 }
 
 // LoadEvaluation loads an OpenAPI 3 document through the shared adapter and
@@ -167,6 +169,12 @@ func evaluationSchemaRef(input *contract.Schema, schemas map[string]*contract.Sc
 	}
 	for _, branch := range input.AllOf {
 		result.AllOf = append(result.AllOf, evaluationSchemaRef(branch, schemas))
+	}
+	for _, branch := range input.OneOf {
+		result.OneOf = append(result.OneOf, evaluationSchemaRef(branch, schemas))
+	}
+	for _, branch := range input.AnyOf {
+		result.AnyOf = append(result.AnyOf, evaluationSchemaRef(branch, schemas))
 	}
 	return result
 }

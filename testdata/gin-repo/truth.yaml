@@ -1,0 +1,269 @@
+# Ground Truth: testdata/gin-repo 的真实契约（人工标注，作为 specforge eval 的对照真值）。
+# 信封：Resp {code,msg,data}、RespV2 {code,data}、Stats 双形状 oneOf、Wrap/envelope {ok,payload}。
+# 约定与 specforge 渲染一致：int64 用 integer/format:int64；nullable 用 type 数组；无 json tag 的结构体字段名按 Go 导出名（Page/Sort）。
+openapi: 3.1.0
+info:
+  title: example.com/ginrepo API
+  version: 1.0.0
+paths:
+  /api/v1/users:
+    post:
+      tags:
+        - api
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserReq'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          description: Bad Request (error branch)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrBody'
+    get:
+      tags:
+        - api
+      operationId: listUsers
+      parameters:
+        - name: keyword
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: sort
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/User'
+  /api/v1/users/{id}:
+    get:
+      tags:
+        - api
+      operationId: getUser
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Trace-Id
+          in: header
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+  /api/v1/users/{id}/detail:
+    get:
+      tags:
+        - api
+      operationId: detail
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=500): fixed code in response wrapper'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - allOf:
+                      - $ref: '#/components/schemas/RespEnvelope'
+                      - type: object
+                        properties:
+                          data:
+                            $ref: '#/components/schemas/User'
+                  - $ref: '#/components/schemas/RespEnvelope'
+  /api/v1/users/{id}/settings:
+    get:
+      tags:
+        - api
+      operationId: settings
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success (code=0)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: integer
+                    format: int64
+                    enum:
+                      - 0
+                  data:
+                    $ref: '#/components/schemas/ListQuery'
+                required:
+                  - code
+                  - data
+  /api/v1/users/{id}/profile:
+    get:
+      tags:
+        - api
+      operationId: profile
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  payload:
+                    $ref: '#/components/schemas/User'
+                required:
+                  - ok
+                  - payload
+  /api/v1/stats:
+    get:
+      tags:
+        - api
+      operationId: stats
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            format: int64
+        - name: sort
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'OK; OK (error branch)'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/HForStats'
+                  - $ref: '#/components/schemas/HErrorForStats'
+components:
+  schemas:
+    CreateUserReq:
+      type: object
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+      required:
+        - name
+    User:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        email:
+          type: string
+      required:
+        - id
+        - name
+    ListQuery:
+      type: object
+      properties:
+        Page:
+          type: integer
+          format: int64
+        Sort:
+          type: string
+      required:
+        - Page
+        - Sort
+    ErrBody:
+      type: object
+      properties:
+        message:
+          type: string
+      required:
+        - message
+    RespEnvelope:
+      type: object
+      properties:
+        code:
+          type: integer
+          format: int64
+        msg:
+          type: string
+        data:
+          description: business payload (narrowed per operation)
+      required:
+        - code
+        - msg
+    RespV2Envelope:
+      type: object
+      properties:
+        code:
+          type: integer
+          format: int64
+        data:
+          description: business payload (narrowed per operation)
+      required:
+        - code
+        - data
+    HForStats:
+      type: object
+      properties:
+        total:
+          type: integer
+          format: int64
+        active:
+          type: boolean
+      required:
+        - total
+        - active
+    HErrorForStats:
+      type: object
+      properties:
+        error:
+          type: string
+      required:
+        - error

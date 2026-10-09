@@ -54,14 +54,21 @@ func TestShapeRejectsHallucinatedEnum(t *testing.T) {
 	}
 }
 
-// TestShapeRejectsHallucinatedPattern 正则字面量不在源码里：整棵拒绝。
-func TestShapeRejectsHallucinatedPattern(t *testing.T) {
+// TestShapeDropsUnverifiedPattern 正则字面量不在源码里（如 Pydantic 约束写在 handler 切片外的模型类）：
+// 丢弃该 pattern、保留字段与类型，而非整棵拒绝——避免因核对文本不含模型类而误拒正确形状。
+func TestShapeDropsUnverifiedPattern(t *testing.T) {
 	text := `class R: name: str`
 	node := &infer.ShapeNode{Type: "object", Properties: []infer.ShapeProp{
 		{Name: "name", Shape: &infer.ShapeNode{Type: "string", Pattern: "^[A-Z]+$"}},
 	}}
-	if _, _, err := Shape(node, text, Tokens(text)); err == nil {
-		t.Fatal("want rejection of hallucinated pattern")
+	sc, _, err := Shape(node, text, Tokens(text))
+	if err != nil {
+		t.Fatalf("unverified pattern should be dropped, not rejected: %v", err)
+	}
+	for _, p := range sc.Props {
+		if p.Name == "name" && p.Schema.Pattern != "" {
+			t.Fatalf("pattern should be cleared when not in source, got %q", p.Schema.Pattern)
+		}
 	}
 }
 

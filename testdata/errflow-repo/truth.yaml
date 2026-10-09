@@ -1,0 +1,119 @@
+# Ground Truth: errflow-repo 真实契约（人工标注）。
+# 错误值流定性仓库：信封为命名结构体 ErrResponse{error} / OkResponse{result}，
+# 业务码 100404(ErrNotFound)/100423(ErrLocked)/0 位于错误对象/描述中（无顶层 code 字段）。
+openapi: 3.1.0
+info:
+  title: errflow.local/repo API
+  version: 1.0.0
+paths:
+  /uncoded:
+    get:
+      tags:
+        - API
+      operationId: uncoded
+      parameters:
+        - name: id
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'Business error (code=100404); Error without business code'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrResponse'
+  /dynamic:
+    get:
+      tags:
+        - API
+      operationId: dynamic
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code passed through at runtime from res.Code)'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - allOf:
+                      - $ref: '#/components/schemas/OkResponse'
+                      - type: object
+                        properties:
+                          result:
+                            $ref: '#/components/schemas/upstream'
+                  - $ref: '#/components/schemas/ErrResponse'
+  /group:
+    get:
+      tags:
+        - API
+      operationId: group
+      responses:
+        '200':
+          description: 'Business error (code=100404); Error without business code'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrResponse'
+  /embedded:
+    get:
+      tags:
+        - API
+      operationId: embedded
+      parameters:
+        - name: k
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'Business error (code=100423)'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrResponse'
+  /static:
+    get:
+      tags:
+        - API
+      operationId: static
+      responses:
+        '200':
+          description: Success (code=0)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StaticResult'
+components:
+  schemas:
+    ErrResponse:
+      type: object
+      properties:
+        error: {}
+      required:
+        - error
+    OkResponse:
+      type: object
+      properties:
+        result: {}
+      required:
+        - result
+    StaticResult:
+      type: object
+      properties:
+        result:
+          type: array
+          items:
+            type: string
+      required:
+        - result
+    upstream:
+      type: object
+      properties:
+        Code:
+          type: integer
+          format: int64
+        Msg:
+          type: string
+      required:
+        - Code
+        - Msg

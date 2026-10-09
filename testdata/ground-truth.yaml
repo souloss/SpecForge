@@ -46,7 +46,7 @@ paths:
               $ref: '#/components/schemas/OrderCheckReqParams'
       responses:
         '200':
-          description: 'Success (code=0); Business error (code=40001); Business error (code=41001)'
+          description: 'Success (code=0); Business error (code=40001); Business error (code=41001); Business error (code=43001): unauthorized'
           content:
             application/json:
               schema:
@@ -58,6 +58,7 @@ paths:
                       - 0
                       - 40001
                       - 41001
+                      - 43001
                   msg:
                     type: string
                   data:
@@ -87,7 +88,7 @@ paths:
               $ref: '#/components/schemas/OrderCheckReqParams'
       responses:
         '200':
-          description: 'Success (code=0); Business error (code=40001); Business error (code=40002); Business error (code=41002)'
+          description: 'Success (code=0); Business error (code=40001); Business error (code=40002); Business error (code=41002); Business error (code=43001): unauthorized; Business error (code=43101): sub-account not permitted'
           content:
             application/json:
               schema:
@@ -100,6 +101,8 @@ paths:
                       - 40001
                       - 40002
                       - 41002
+                      - 43001
+                      - 43101
                   msg:
                     type: string
                   data:
@@ -126,7 +129,7 @@ paths:
               $ref: '#/components/schemas/OrderCreateReq'
       responses:
         '200':
-          description: 'Success (code=0); Business error (code=40001); Business error (code=41003)'
+          description: 'Success (code=0); Business error (code=40001); Business error (code=41003); Business error (code=43001): unauthorized'
           content:
             application/json:
               schema:
@@ -138,6 +141,7 @@ paths:
                       - 0
                       - 40001
                       - 41003
+                      - 43001
                   msg:
                     type: string
                   data:
@@ -163,7 +167,7 @@ paths:
               $ref: '#/components/schemas/OrderListReq'
       responses:
         '200':
-          description: 'Success (code=0); Business error (code=40001)'
+          description: 'Success (code=0); Business error (code=40001); Business error (code=43001): unauthorized'
           content:
             application/json:
               schema:
@@ -174,6 +178,7 @@ paths:
                     enum:
                       - 0
                       - 40001
+                      - 43001
                   msg:
                     type: string
                   data:
@@ -200,7 +205,7 @@ paths:
             type: string
       responses:
         '200':
-          description: 'Success (code=0); Business error (code=40002)'
+          description: 'Success (code=0); Business error (code=40002); Business error (code=43001): unauthorized'
           content:
             application/json:
               schema:
@@ -211,6 +216,7 @@ paths:
                     enum:
                       - 0
                       - 40002
+                      - 43001
                   msg:
                     type: string
                   data:
@@ -235,7 +241,7 @@ paths:
             type: string
       responses:
         '200':
-          description: 'Success (code=0); Business error (code=40002)'
+          description: 'Success (code=0); Business error (code=40002); Business error (code=43001): unauthorized'
           content:
             application/json:
               schema:
@@ -246,6 +252,7 @@ paths:
                     enum:
                       - 0
                       - 40002
+                      - 43001
                   msg:
                     type: string
                   data:
@@ -279,7 +286,7 @@ paths:
             type: string
       responses:
         '200':
-          description: 'Success (code=0); Business error (code=40002)'
+          description: 'Success (code=0); Business error (code=40002); Business error (code=43001): unauthorized; Business error (code=43101): sub-account not permitted'
           content:
             application/json:
               schema:
@@ -290,6 +297,8 @@ paths:
                     enum:
                       - 0
                       - 40002
+                      - 43001
+                      - 43101
                   msg:
                     type: string
                   data:

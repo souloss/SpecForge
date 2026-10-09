@@ -74,6 +74,12 @@ func (*Frontend) Analyze(ctx context.Context, req frontend.Request) (*frontend.A
 		extra = append(extra, sp.Framework())
 	}
 	fws := detectFrameworks(l, extra)
+	// 纯标准库仓库（未命中任何第三方 Web 框架，如只用 net/http ServeMux）：
+	// 兜底启用 ServeMux 适配器。ServeMux 不进 registry，因为 net/http 被 chi/gorilla/fiber 底层 import，
+	// 常驻会污染多框架仓库的 framework 归属；这里仅在「零第三方框架」时补上。
+	if len(fws) == 0 {
+		fws = append(fws, adapter.NewServeMux())
+	}
 	pkgs := l.ServiceFilter(req.Service)
 	prof, err := loadProfile(req.RepoDir, req.ProfilePath)
 	if err != nil {
@@ -732,6 +738,20 @@ func ensurePathParams(contract *facts.Fact, r adapter.Route) {
 		}
 		cp.Params = append(cp.Params, pf)
 	}
+	// 反向过滤：共享 handler 读的 path 参数（chi.URLParam / fiber.Params 等）会原样复制到每一条
+	// 复用该 handler 的路由；只保留出现在本路由模板段里的 in:path 参数，剔除模板之外的泄露项。
+	tmpl := map[string]bool{}
+	for _, name := range pathTemplateParams(r.Path) {
+		tmpl[name] = true
+	}
+	kept := cp.Params[:0]
+	for _, p := range cp.Params {
+		if p.In == "path" && !tmpl[p.Name] {
+			continue
+		}
+		kept = append(kept, p)
+	}
+	cp.Params = kept
 	contract.Value = cp
 }
 

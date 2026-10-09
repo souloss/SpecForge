@@ -122,7 +122,13 @@ func (b *ContractPayloadBuilder) Build() (*facts.Fact, []*facts.Fact, []*facts.F
 	}
 
 	// ---- 响应矩阵（调用图追踪，F5） ----
+	// handler 的正向可达闭包之外，鉴权等中间件可能在 handler 之前短路写出错误响应
+	// （如 code.Response(c, NewError(ErrUnauthorized), nil)）。中间件函数体不在 handler 的
+	// 可达闭包内，需单独 Trace 并合并进响应矩阵，让短路错误码进入信封 enum。
 	hits := b.slicer.Trace(b.route.Handler)
+	for _, mw := range b.route.Middleware {
+		hits = append(hits, b.slicer.Trace(mw)...)
+	}
 	rows, schemaFacts, respConf, respUnknowns := b.responseMatrix(hits)
 	cp.Responses = rows
 	unknowns = append(unknowns, respUnknowns...)
@@ -421,6 +427,14 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 					h.DataTypeID = strings.TrimPrefix(nf.ID, "schema:")
 					h.DataUnknown, h.DataMapValue, h.HasBody = false, "", true
 					narrowed[h.DataTypeID] = nf
+				} else if inner, df, envID := b.slicer.NarrowEnvelopeResult(h); inner != "" {
+					// 服务层组装信封（如 BuildBaseResponse 返回 *BaseResp，其 result 槽 any）：
+					// 沿 data 槽实参的调用链把 result 字段收窄为调用点传入的具体业务体。
+					// 成功体即信封 BaseResp，result 槽收窄为业务体 → 渲染 allOf[BaseResp, {result: 业务体}]。
+					h.DataTypeID = inner
+					h.EnvelopeType, h.DataField = envID, df
+					h.Raw = false
+					h.DataUnknown = false
 				}
 			}
 			// 成功行（原生写出位于 if err != nil 分支时为失败行）: 信封码 + data schema
@@ -472,7 +486,7 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 				// 不进 components，编译期直接展开。
 				row.MapValueType = h.DataMapValue
 			}
-			if h.DataUnknown {
+			if h.DataUnknown && !failure {
 				row.SchemaType = ""
 				unknowns = append(unknowns, facts.GapSuccessAny)
 				conf = minConf(conf, 0.6)
@@ -954,6 +968,10 @@ func unknownPaths(sc *typeschema.Schema, prefix string) []string {
 	if sc == nil {
 		return nil
 	}
+	// 已在某处被收窄为具体 schema 的路径不应再计入缺口（值级收窄的证据输出）。
+	if sc.Additional && prefix != "" {
+		return nil
+	}
 	if sc.Unknown {
 		if prefix == "" {
 			return []string{"<root>"}
@@ -986,6 +1004,10 @@ func schemaConfidence(sc *typeschema.Schema) float64 {
 		}
 		if s.Unknown {
 			return true
+		}
+		// 已在收窄层补出具体字段的开放对象（map[string]any 值级收窄后）视为已定型，不计 unknown。
+		if s.Additional && len(s.Props) > 0 {
+			return false
 		}
 		if s.Items != nil && hasUnknown(s.Items) {
 			return true

@@ -1,0 +1,157 @@
+# Ground Truth: express-repo（Express 4 样本服务，RESTful 无信封，真实状态码/真实 body 形状）
+# 覆盖 4 条路由：GET /api/users/:id、POST /api/users、GET /api/orders、GET /health。
+# 该仓库走 generic LLM 前端（非 Go）：路由与契约全部来自 LLM + 文本核对，置信度按 text 级封顶 0.6。
+openapi: 3.1.0
+info:
+  title: express-sample API
+  version: 1.0.0
+paths:
+  /api/users/{id}:
+    get:
+      tags:
+        - app
+      operationId: getUser
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: verbose
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: number
+                  name:
+                    type: string
+                  verbose:
+                    type: boolean
+                required:
+                  - id
+                  - name
+                  - verbose
+        '400':
+          description: missing id
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                required:
+                  - error
+  /api/users:
+    post:
+      tags:
+        - app
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                email:
+                  type: string
+              required:
+                - name
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  name:
+                    type: string
+                  email:
+                    type: string
+                required:
+                  - id
+                  - name
+        '422':
+          description: name required
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                required:
+                  - error
+  /api/orders:
+    get:
+      tags:
+        - orders
+      operationId: listOrders
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+        - name: page
+          in: query
+          schema:
+            type: number
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  page:
+                    type: number
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        orderId:
+                          type: string
+                        status:
+                          type: string
+                        amount:
+                          type: number
+                      required:
+                        - orderId
+                        - status
+                        - amount
+                required:
+                  - page
+                  - items
+  /health:
+    get:
+      tags:
+        - app
+      operationId: getHealth
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                required:
+                  - status

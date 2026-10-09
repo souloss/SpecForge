@@ -489,3 +489,52 @@ func TestGenericFrontendOffline(t *testing.T) {
 		t.Fatalf("want ErrConfig mentioning --llm, got %v", err)
 	}
 }
+
+// TestServeMuxAdapter net/http ServeMux（Go 1.22+ 方法+路径模式）兜底适配器：
+// 纯标准库仓库离线也能全量抽取路由与契约（此前 0 路由）。
+func TestServeMuxAdapter(t *testing.T) {
+	repo := filepath.Join("..", "..", "testdata", "stdlib-repo")
+	res, err := Run(context.Background(), Config{RepoDir: repo, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("stdlib sample failed to load: %v", err)
+	}
+	if res.Operations != 4 || res.RoutesResolved != 4 {
+		t.Fatalf("stdlib operations=%d routes=%d, want 4/4", res.Operations, res.RoutesResolved)
+	}
+	ops := map[string]compiler.Operation{}
+	for _, op := range res.Doc.Operations {
+		ops[op.Method+" "+op.Path] = op
+	}
+	if get, ok := ops["GET /items/{id}"]; !ok || len(get.Params) != 1 || get.Params[0].Origin != "nethttp:PathValue" {
+		t.Fatalf("ServeMux GET /items/{id} params = %+v", get.Params)
+	}
+	statuses := map[string]bool{}
+	for _, r := range ops["POST /items"].Responses {
+		statuses[r.Status] = true
+	}
+	if !statuses["201"] || !statuses["400"] {
+		t.Fatalf("ServeMux POST statuses = %v", statuses)
+	}
+}
+
+// TestGorillaAdapter gorilla/mux 链式 Methods 注册适配器：离线全量抽取。
+func TestGorillaAdapter(t *testing.T) {
+	repo := filepath.Join("..", "..", "testdata", "gorilla-repo")
+	res, err := Run(context.Background(), Config{RepoDir: repo, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("gorilla sample failed to load: %v", err)
+	}
+	if res.Operations != 4 || res.RoutesResolved != 4 {
+		t.Fatalf("gorilla operations=%d routes=%d, want 4/4", res.Operations, res.RoutesResolved)
+	}
+	ops := map[string]compiler.Operation{}
+	for _, op := range res.Doc.Operations {
+		ops[op.Method+" "+op.Path] = op
+	}
+	if _, ok := ops["DELETE /items/{id}"]; !ok {
+		t.Fatalf("gorilla DELETE /items/{id} missing; ops=%v", ops)
+	}
+	if create := ops["POST /items"]; create.Body == nil || create.Body.SchemaName != "CreateItemReq" {
+		t.Fatalf("gorilla POST body = %+v", create.Body)
+	}
+}

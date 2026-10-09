@@ -1,0 +1,218 @@
+# Ground Truth: fastapi-repo（weave 族，FastAPI/Pydantic 动态语言 RESTful）人工标注契约。
+# 无信封：成功响应直接返回 dict；失败 raise HTTPException（真实状态码）；SSE 用 text/event-stream 无 JSON body。
+# 约定与 specforge eval 一致：nullable 用 3.1 type 数组、date-time/int64/double 格式。
+openapi: 3.1.0
+info:
+  title: fastapi-repo API
+  version: 1.0.0
+paths:
+  /api/health:
+    get:
+      tags:
+        - system
+      operationId: health
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /api/auth/login:
+    post:
+      tags:
+        - auth
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorDetail'
+  /api/auth/me:
+    get:
+      tags:
+        - auth
+      operationId: me
+      parameters:
+        - name: weave_session
+          in: cookie
+          required: false
+          schema:
+            type: string
+        - name: X-CSRF-Token
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorDetail'
+  /api/runs/submit:
+    post:
+      tags:
+        - runs
+      operationId: submit_run
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitRunRequest'
+      responses:
+        '202':
+          description: Accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubmitRunResponse'
+  /api/runs/{run_id}:
+    get:
+      tags:
+        - runs
+      operationId: get_run
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetRunResponse'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorDetail'
+  /api/runs/{run_id}/events:
+    get:
+      tags:
+        - runs
+      operationId: run_events
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Server-Sent Events stream
+          content:
+            text/event-stream:
+              schema:
+                type: string
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    UserResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        role:
+          type: string
+      required:
+        - id
+        - username
+        - role
+    LoginRequest:
+      type: object
+      properties:
+        username:
+          type: string
+          minLength: 1
+          maxLength: 128
+        password:
+          type: string
+          minLength: 1
+          maxLength: 128
+      required:
+        - username
+        - password
+    SubmitRunRequest:
+      type: object
+      properties:
+        suite_id:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+        case_ids:
+          type: array
+          maxItems: 500
+          items:
+            type: string
+        run_id:
+          type: [string, 'null']
+          pattern: '^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
+      required:
+        - suite_id
+    SubmitRunResponse:
+      type: object
+      properties:
+        run_id:
+          type: string
+        status:
+          type: string
+        suite_id:
+          type: string
+        cases:
+          type: string
+      required:
+        - run_id
+        - status
+        - suite_id
+        - cases
+    GetRunResponse:
+      type: object
+      properties:
+        run_id:
+          type: string
+        status:
+          type: string
+      required:
+        - run_id
+        - status
+    ErrorDetail:
+      type: object
+      properties:
+        detail:
+          type: string
+      required:
+        - detail

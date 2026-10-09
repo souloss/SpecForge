@@ -1,0 +1,112 @@
+# Ground Truth: stdlib-repo 的真实契约（人工标注，作为 specforge eval 的对照真值）。
+# 该仓库走 net/http Go1.22+ ServeMux 方法+路径模式路由，RESTful（无信封），
+# 状态码为真实 HTTP 状态码（200/201/204/400/404），响应体为业务结构体本身。
+openapi: 3.1.0
+info:
+  title: stdlib-repo API
+  version: 1.0.0
+paths:
+  /items:
+    get:
+      tags:
+        - api
+      operationId: listItems
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Item'
+    post:
+      tags:
+        - api
+      operationId: createItem
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateItemReq'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+  /items/{id}:
+    get:
+      tags:
+        - api
+      operationId: getItem
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+    delete:
+      tags:
+        - api
+      operationId: deleteItem
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: No Content
+components:
+  schemas:
+    CreateItemReq:
+      type: object
+      properties:
+        name:
+          type: string
+        price:
+          type: number
+          format: double
+        qty:
+          type: integer
+    Item:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        price:
+          type: number
+          format: double
+        qty:
+          type: integer
+      required:
+        - id
+        - name
+        - price
+        - qty

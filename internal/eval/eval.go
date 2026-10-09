@@ -94,6 +94,8 @@ type oasSchema struct {
 	Nullable             bool                 `yaml:"nullable"`
 	AdditionalProperties interface{}          `yaml:"additionalProperties"`
 	AllOf                []oasSchema          `yaml:"allOf"` // 组合 schema（swag 信封收窄 `Envelope{result=T}` 的产出形态）
+	OneOf                []oasSchema          `yaml:"oneOf"` // 同状态码多变体（成功信封 + 失败信封渲染为 oneOf）
+	AnyOf                []oasSchema          `yaml:"anyOf"`
 }
 
 // maxFlattenDepth schema 展平的递归深度上限（防自引用类型无限展开）。
@@ -166,6 +168,12 @@ func evaluationSchema(input openapi.EvaluationSchema) oasSchema {
 	}
 	for _, branch := range input.AllOf {
 		result.AllOf = append(result.AllOf, evaluationSchema(branch))
+	}
+	for _, branch := range input.OneOf {
+		result.OneOf = append(result.OneOf, evaluationSchema(branch))
+	}
+	for _, branch := range input.AnyOf {
+		result.AnyOf = append(result.AnyOf, evaluationSchema(branch))
 	}
 	return result
 }
@@ -346,6 +354,13 @@ func openSchemaPaths(s *oasSchema, prefix string, comps map[string]oasSchema, de
 		merged := mergeAllOf(s, comps, depth)
 		s = &merged
 	}
+	if len(s.OneOf) > 0 || len(s.AnyOf) > 0 {
+		for _, v := range append(append([]oasSchema{}, s.OneOf...), s.AnyOf...) {
+			for p := range openSchemaPaths(&v, prefix, comps, depth+1) {
+				paths[p] = true
+			}
+		}
+	}
 	if additionalPropertiesOpen(s.AdditionalProperties) {
 		paths[prefix] = true
 	}
@@ -462,6 +477,20 @@ func flattenSchema(s *oasSchema, prefix string, withRequired bool, comps map[str
 		merged := mergeAllOf(s, comps, depth)
 		s = &merged
 	}
+	// oneOf/anyOf：响应是这些变体之一，契约声明了全部变体字段，取各变体展平字段的并集（去重）。
+	if len(s.OneOf) > 0 || len(s.AnyOf) > 0 {
+		seen := map[string]bool{}
+		var out []string
+		for _, v := range append(append([]oasSchema{}, s.OneOf...), s.AnyOf...) {
+			for _, f := range flattenResolve(&v, prefix, withRequired, comps, depth+1) {
+				if !seen[f] {
+					seen[f] = true
+					out = append(out, f)
+				}
+			}
+		}
+		return out
+	}
 	var out []string
 	// required 集合
 	reqSet := map[string]bool{}
@@ -482,12 +511,17 @@ func flattenSchema(s *oasSchema, prefix string, withRequired bool, comps map[str
 		}
 		t := resolvedTypeStr(p, comps)
 		out = append(out, fmt.Sprintf("%s|%s|%v", path, t, reqSet[k] || !withRequired))
-		if p.Props != nil || p.Ref != "" || len(p.AllOf) > 0 {
+		if p.Props != nil || p.Ref != "" || len(p.AllOf) > 0 || len(p.OneOf) > 0 || len(p.AnyOf) > 0 {
 			out = append(out, flattenResolve(p, path, withRequired, comps, depth+1)...)
 		}
 		if p.Items != nil {
 			out = append(out, flattenResolve(p.Items, path+"[]", withRequired, comps, depth+1)...)
 		}
+	}
+	// 顶层数组响应体（schema 直接是 type:array，无 properties 包裹）：展平元素字段，
+	// 使「裸写 []T」的响应字段参与比较（前缀 "[]"）。
+	if s.Items != nil {
+		out = append(out, flattenResolve(s.Items, prefix+"[]", withRequired, comps, depth+1)...)
 	}
 	return out
 }
@@ -502,7 +536,7 @@ func resolvedTypeStr(s *oasSchema, comps map[string]oasSchema) string {
 		}
 		s = &target
 	}
-	if s.Type == nil && (len(s.Props) > 0 || len(s.AllOf) > 0) {
+	if s.Type == nil && (len(s.Props) > 0 || len(s.AllOf) > 0 || len(s.OneOf) > 0 || len(s.AnyOf) > 0) {
 		return "object"
 	}
 	return typeStr(s)

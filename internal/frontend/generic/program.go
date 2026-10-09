@@ -312,6 +312,45 @@ func blockEnd(ls []string, start int) int {
 		}
 		return end
 	}
+	// Python 多行签名：定义行以 `(` 结尾（`async def me(...` 的参数跨多行），括号尚未闭合。
+	// 先沿括号配平扫到签名终止行（trim 后以 `:` 结尾），再按缩进扫函数体，避免把别名参数
+	// 与响应字段截出切片（FastAPI Annotated/Cookie/Header 别名与返回 dict 都在这些行）。
+	if strings.HasSuffix(strings.TrimSpace(stripStrings(ls[start-1])), "(") {
+		base := indentOf(ls[start-1])
+		paren := 0
+		sigEnd := start // 签名终止行（含起始行），下标的第 sigEnd 行
+		for i := start; i <= limit; i++ {
+			s := stripStrings(ls[i-1])
+			for _, c := range s {
+				switch c {
+				case '(':
+					paren++
+				case ')':
+					paren--
+				}
+			}
+			if paren <= 0 {
+				sigEnd = i
+				break
+			}
+		}
+		// 若签名终止行本身已以 `:` 结束，函数体从下一行开始；否则视为无函数体。
+		bodyStart := sigEnd + 1
+		if bodyStart > limit || !strings.HasSuffix(strings.TrimSpace(ls[sigEnd-1]), ":") {
+			return sigEnd
+		}
+		end := bodyStart - 1
+		for i := bodyStart; i <= limit; i++ {
+			if strings.TrimSpace(ls[i-1]) == "" {
+				continue
+			}
+			if indentOf(ls[i-1]) <= base {
+				break
+			}
+			end = i
+		}
+		return end
+	}
 	return start
 }
 

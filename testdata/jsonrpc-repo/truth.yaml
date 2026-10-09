@@ -1,0 +1,342 @@
+# Ground Truth: jsonrpc-repo 的真实契约（人工标注，作为 specforge eval 的对照真值）。
+# JSON-RPC 2.0 信封：成功 {jsonrpc,id,result}（Response）或裸写 data（WriteResponse），
+# 失败 {jsonrpc,error,id}；X-uin 头鉴权；X-retcode 头携带业务码（HTTP 恒 200）。
+# 约定与 specforge 渲染一致：interface{} 字段无 type（透传），nullable 用 3.1 type 数组。
+openapi: 3.1.0
+info:
+  title: trade.local/jsonrpc API
+  version: 1.0.0
+paths:
+  /Time:
+    get:
+      operationId: ts
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/tsResp'
+  /ipo/v1/Ping:
+    get:
+      operationId: ping
+      responses:
+        '200':
+          description: Success (code=0)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/BaseResp'
+                  - type: object
+                    properties:
+                      result:
+                        $ref: '#/components/schemas/rsp'
+  /ipo/v1/OrderCheck:
+    post:
+      operationId: orderCheck
+      parameters:
+        - name: X-uin
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCheckReq'
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=100012): invalid request body; Business error (code=100013): invalid params; Business error (code=100009): permission denied'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - allOf:
+                      - $ref: '#/components/schemas/BaseResp'
+                      - type: object
+                        properties:
+                          result:
+                            $ref: '#/components/schemas/OrderCheckResp'
+                  - $ref: '#/components/schemas/ErrResponse'
+      security:
+        - X-uin: []
+  /ipo/v1/OrderCancel:
+    post:
+      operationId: orderCancel
+      parameters:
+        - name: X-uin
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCancelReq'
+      responses:
+        '200':
+          description: 'Success (code=0); Business error (code=100012): invalid request body; Business error (code=100106): resource not found; Business error (code=100009): permission denied'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - allOf:
+                      - $ref: '#/components/schemas/BaseResp'
+                      - type: object
+                        properties:
+                          result:
+                            $ref: '#/components/schemas/OrderCancelResp'
+                  - $ref: '#/components/schemas/ErrResponse'
+      security:
+        - X-uin: []
+  /ipo/v1/OrderList:
+    get:
+      operationId: orderList
+      parameters:
+        - name: uin
+          in: query
+          required: true
+          schema:
+            type: integer
+        - name: page
+          in: query
+          required: true
+          schema:
+            type: integer
+        - name: count
+          in: query
+          required: true
+          schema:
+            type: integer
+        - name: X-uin
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'OK; Business error (code=100012): invalid request body; Business error (code=100009): permission denied'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: array
+                    items:
+                      $ref: '#/components/schemas/OrderListItem'
+                  - $ref: '#/components/schemas/ErrResponse'
+      security:
+        - X-uin: []
+  /ipo/v1/StockCreate:
+    post:
+      operationId: stockCreate
+      parameters:
+        - name: X-uin
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StockCreateReq'
+      responses:
+        '200':
+          description: 'OK; Business error (code=100012): invalid request body; Business error (code=100009): permission denied'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: '#/components/schemas/StockCreateResp'
+                  - $ref: '#/components/schemas/ErrResponse'
+      security:
+        - X-uin: []
+components:
+  schemas:
+    tsResp:
+      type: object
+      properties:
+        ts:
+          type: integer
+          format: int64
+      required:
+        - ts
+    rsp:
+      type: object
+      properties:
+        ok:
+          type: boolean
+      required:
+        - ok
+    BaseResp:
+      type: object
+      properties:
+        jsonrpc:
+          type: string
+        id:
+          type: string
+        result:
+          description: interface{} passthrough (narrowed by allOf on success)
+        error:
+          description: interface{} passthrough (omitted on success)
+      required:
+        - jsonrpc
+        - id
+        - result
+    ErrResponse:
+      type: object
+      properties:
+        jsonrpc:
+          type: string
+        id:
+          type: string
+        result:
+          description: interface{} passthrough (omitted on failure)
+        error:
+          type: [object, 'null']
+          properties:
+            code:
+              type: integer
+              format: int64
+            message:
+              type: string
+            data:
+              description: interface{} passthrough
+          required:
+            - code
+            - message
+            - data
+      required:
+        - error
+        - id
+        - jsonrpc
+    OrderCheckReq:
+      type: object
+      properties:
+        jsonrpc:
+          type: string
+        id:
+          type: string
+        params:
+          type: [object, 'null']
+          properties:
+            orderId:
+              type: string
+            accountId:
+              type: integer
+              format: int64
+            amount:
+              type: number
+              format: double
+          required:
+            - orderId
+            - accountId
+            - amount
+      required:
+        - jsonrpc
+        - id
+        - params
+    OrderCheckResp:
+      type: object
+      properties:
+        orderId:
+          type: string
+        status:
+          type: string
+        amount:
+          type: number
+          format: double
+        fee:
+          type: [number, 'null']
+      required:
+        - orderId
+        - status
+        - amount
+    OrderCancelReq:
+      type: object
+      properties:
+        jsonrpc:
+          type: string
+        id:
+          type: string
+        params:
+          type: [object, 'null']
+          properties:
+            orderId:
+              type: string
+          required:
+            - orderId
+      required:
+        - jsonrpc
+        - id
+        - params
+    OrderCancelResp:
+      type: object
+      properties:
+        orderId:
+          type: string
+        canceled:
+          type: boolean
+        timestamp:
+          type: integer
+          format: int64
+      required:
+        - orderId
+        - canceled
+        - timestamp
+    OrderListItem:
+      type: object
+      properties:
+        orderId:
+          type: string
+        status:
+          type: string
+        amount:
+          type: number
+          format: double
+      required:
+        - orderId
+        - status
+        - amount
+    StockCreateReq:
+      type: object
+      properties:
+        jsonrpc:
+          type: string
+        id:
+          type: string
+        params:
+          type: [object, 'null']
+          properties:
+            symbol:
+              type: string
+            quantity:
+              type: integer
+              format: int64
+          required:
+            - symbol
+            - quantity
+      required:
+        - jsonrpc
+        - id
+        - params
+    StockCreateResp:
+      type: object
+      properties:
+        orderId:
+          type: string
+        symbol:
+          type: string
+        qty:
+          type: integer
+          format: int64
+      required:
+        - orderId
+        - symbol
+        - qty

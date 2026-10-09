@@ -1,0 +1,12 @@
+# 约定画像：直接 map 响应 + 中间件响应写法。
+#
+# 不声明 response_sinks：让引擎自动发现 code.Response 包装器（函数体写入 Envelope 信封，
+# data 槽为 any，逐 operation 值级收窄），还原「直接 map 响应 vs 结构体转 map vs 信封包装」三形态。
+# authRequired 中间件读 X-Auth-Token 头并在缺失时短路返回错误体。
+framework: gofiber/v2
+auth_middleware:
+  authRequired:
+    header: X-Auth-Token
+    scheme: apiKey
+    required: true
+error_codes_source: code

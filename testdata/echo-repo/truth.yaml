@@ -1,0 +1,97 @@
+# Ground Truth: echo-repo 的真实契约（人工标注，作为 specforge eval 的对照真值）。
+# RESTful（无信封）仓库：直接按 handler 实际写出写 OpenAPI 3.1（真实状态码、真实 body 形状）。
+# 约定与 specforge 渲染一致: date-time/int64/double 格式、json 语义。
+openapi: 3.1.0
+info:
+  title: example.com/echorepo API
+  version: 1.0.0
+paths:
+  /api/v1/orders:
+    get:
+      tags:
+        - api
+      operationId: listOrders
+      parameters:
+        - name: status
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Order'
+    post:
+      tags:
+        - api
+      operationId: createOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderReq'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: string
+  /api/v1/orders/{id}:
+    get:
+      tags:
+        - api
+      operationId: getOrder
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+components:
+  schemas:
+    CreateOrderReq:
+      type: object
+      properties:
+        price:
+          type: number
+          format: double
+        qty:
+          type: integer
+          format: int64
+        symbol:
+          type: string
+    Order:
+      type: object
+      properties:
+        id:
+          type: integer
+          format: int64
+        status:
+          type: string
+        symbol:
+          type: string
+      required:
+        - id
+        - status
+        - symbol

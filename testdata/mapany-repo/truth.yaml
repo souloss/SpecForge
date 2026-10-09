@@ -1,0 +1,202 @@
+# Ground Truth: mapany-repo 的真实契约（人工标注，作为 specforge eval 的对照真值）。
+#
+# 本仓库覆盖「直接 map 响应 + 中间件响应」写法：
+#   - /meta、/users/{id}、/legacy/ping、/legacy/health：handler 用 map[string]any 字面量直接 c.JSON 返回，无信封；
+#   - /legacy/* 走 authRequired 中间件，缺 X-Auth-Token 头时短路返回固定错误体 {code:1002,msg,data:{}}；
+#   - /orders：请求体解析到 Order 结构体，经反射转 map 后再直接 c.JSON 返回（无信封成功体），
+#     解析失败走 code.Response 信封（code=1001）。
+# 约定与 specforge 渲染一致：无信封路由直接按 handler 实际写出真实 body 形状；
+# 有错误分支的路由把业务码写进响应 description（与生成文档的 description 编码口径一致）。
+openapi: 3.1.0
+info:
+  title: mapany.local/repo API
+  version: 1.0.0
+paths:
+  /meta:
+    get:
+      tags:
+        - api
+      operationId: meta
+      parameters:
+        - name: session
+          in: cookie
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetaResp'
+  /users/{id}:
+    get:
+      tags:
+        - api
+      operationId: getUser
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: X-Trace-Id
+          in: header
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserResp'
+  /orders:
+    post:
+      tags:
+        - api
+      operationId: createOrder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/Order'
+      responses:
+        '200':
+          description: 'OK; Business error (code=1001): invalid body'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderResp'
+  /legacy/ping:
+    get:
+      tags:
+        - api
+      operationId: legacyPing
+      parameters:
+        - name: X-Auth-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'OK; Business error (code=1002): missing auth token'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PingResp'
+      security:
+        - X-Auth-Token: []
+  /legacy/health:
+    get:
+      tags:
+        - api
+      operationId: legacyHealth
+      parameters:
+        - name: X-Auth-Token
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: 'OK; Business error (code=1002): missing auth token'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResp'
+      security:
+        - X-Auth-Token: []
+components:
+  schemas:
+    MetaResp:
+      type: object
+      properties:
+        name:
+          type: string
+        version:
+          type: integer
+          format: int64
+        healthy:
+          type: boolean
+        info:
+          type: object
+          properties:
+            region:
+              type: string
+          required:
+            - region
+      required:
+        - name
+        - version
+        - healthy
+        - info
+    UserResp:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        age:
+          type: integer
+          format: int64
+      required:
+        - id
+        - name
+        - age
+    Order:
+      type: object
+      properties:
+        orderId:
+          type: string
+        symbol:
+          type: string
+        qty:
+          type: integer
+          format: int64
+        price:
+          type: number
+          format: double
+    OrderResp:
+      type: object
+      properties:
+        orderId:
+          type: string
+        symbol:
+          type: string
+        qty:
+          type: integer
+          format: int64
+        price:
+          type: number
+          format: double
+      required:
+        - orderId
+        - symbol
+        - qty
+        - price
+    PingResp:
+      type: object
+      properties:
+        pong:
+          type: boolean
+        ts:
+          type: integer
+          format: int64
+      required:
+        - pong
+        - ts
+    HealthResp:
+      type: object
+      properties:
+        status:
+          type: string
+        version:
+          type: integer
+          format: int64
+      required:
+        - status
+        - version

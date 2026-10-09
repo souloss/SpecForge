@@ -1,0 +1,112 @@
+# Ground Truth: chi-repo 真实契约（人工标注，作为 specforge eval 的对照真值）。
+# RESTful 仓库（chi v5 + 标准库 encoding/json），无 code/msg/data 信封：
+# 响应体即 handler 实际序列化的结构，真实状态码、真实 body 形状。
+openapi: 3.1.0
+info:
+  title: chirepo API
+  version: 1.0.0
+paths:
+  /api/users/{id}:
+    get:
+      tags:
+        - api
+      operationId: getUser
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: expand
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+  /api/method:
+    get:
+      tags:
+        - api
+      operationId: getUser
+      parameters:
+        - name: expand
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+  /api/users:
+    post:
+      tags:
+        - api
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          description: Bad Request
+  /api/stats:
+    get:
+      tags:
+        - api
+      operationId: stats
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: integer
+  /base-url:
+    get:
+      tags:
+        - api
+      operationId: stats
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: integer
+components:
+  schemas:
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+      required:
+        - id
+        - name
+    CreateUserRequest:
+      type: object
+      properties:
+        name:
+          type: string

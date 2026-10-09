@@ -1,0 +1,177 @@
+# Ground Truth: typed-repo 的完美注解形态（人工标注，作为 specforge eval 的对照真值）。
+# RESTful 强类型响应对象（chi v5 手写 strict-handler 同构，对应 meridian）。
+# 契约点：
+#   - 成功响应体即业务结构体，状态码藏在响应里（200/201/204）；
+#   - 错误是稳定信封 {code,message,requestId}，code 为蛇形字符串枚举（非整数业务码）；
+#   - 请求解码走 json.NewDecoder(r.Body).Decode，无 binding tag，故请求字段不标 required；
+#   - HTTP 状态是真实 RESTful 状态码（非恒 200）。
+openapi: 3.1.0
+info:
+  title: example.com/typedrepo API
+  version: 1.0.0
+paths:
+  /api/v1/auth/login:
+    post:
+      tags:
+        - api
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResult'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/errorEnvelope'
+        '422':
+          description: Unprocessable Entity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/errorEnvelope'
+  /api/v1/users:
+    post:
+      tags:
+        - api
+      operationId: createUser
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateUserRequest'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '422':
+          description: Unprocessable Entity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/errorEnvelope'
+  /api/v1/assets/{assetId}:
+    get:
+      tags:
+        - api
+      operationId: getAsset
+      parameters:
+        - name: assetId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Asset'
+        '404':
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/errorEnvelope'
+    delete:
+      tags:
+        - api
+      operationId: deleteAsset
+      parameters:
+        - name: assetId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: No Content
+        '409':
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/errorEnvelope'
+components:
+  schemas:
+    LoginRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+    LoginResult:
+      type: object
+      properties:
+        accessToken:
+          type: string
+        expiresInSeconds:
+          type: integer
+          format: int64
+      required:
+        - accessToken
+        - expiresInSeconds
+    CreateUserRequest:
+      type: object
+      properties:
+        username:
+          type: string
+        role:
+          type: string
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        role:
+          type: string
+      required:
+        - id
+        - username
+        - role
+    Asset:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+      required:
+        - id
+        - name
+    errorEnvelope:
+      type: object
+      properties:
+        code:
+          type: string
+          enum:
+            - unauthenticated
+            - not_found
+            - validation_error
+            - duplicate
+        message:
+          type: string
+        requestId:
+          type: string
+      required:
+        - code
+        - message
+        - requestId

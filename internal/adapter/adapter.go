@@ -105,7 +105,7 @@ func (p Primitives) Merge(o Primitives) Primitives {
 }
 
 // registry 内置框架（按识别优先级）。新增框架：在同包新增声明文件并加入此表。
-var registry = []Framework{Fiber, Gin, ChiV4, ChiV5}
+var registry = []Framework{Fiber, Gin, ChiV4, ChiV5, Gorilla}
 
 // Detect 按仓库 import 的包路径识别使用的全部框架（按 registry 顺序，结果确定）。
 func Detect(imports []string) []Framework {

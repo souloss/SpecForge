@@ -99,6 +99,7 @@ func shape(n *infer.ShapeNode, text string, tokens map[string]bool, depth int) (
 		if len(n.Enum) > 0 {
 			sc.Enum = n.Enum
 		}
+		sc = dropUnverifiedConstraints(sc, n, text, tokens)
 		return sc, nil, nil
 	case n.Type == "array":
 		items, names, err := shape(n.Items, text, tokens, depth+1)
@@ -110,6 +111,7 @@ func shape(n *infer.ShapeNode, text string, tokens map[string]bool, depth int) (
 		if err := verifyConstraints(n, text, tokens); err != nil {
 			return nil, nil, err
 		}
+		sc = dropUnverifiedConstraints(sc, n, text, tokens)
 		return sc, names, nil
 	case n.Type == "object":
 		sc := &schema.Schema{Type: "object", Nullable: n.Nullable}
@@ -137,30 +139,60 @@ func shape(n *infer.ShapeNode, text string, tokens map[string]bool, depth int) (
 // verifyConstraints 核对形状节点的约束值是否都能在源码里找到字面量出处：
 // enum 每个取值、pattern 正则、format、以及数值/长度边界的字面量都须原样出现，否则整棵拒绝。
 // 防幻觉：模型不能编一个源码里没有的正则、格式名或边界值。
+//
+// 注意：Pydantic 等动态语言把约束写在模型类（min_length/max_length/pattern），而核对文本
+// 只含 handler 切片，找不到这些字面量——为不整棵拒绝掉正确的字段形状，此处仅对 enum/format
+// 保持硬核对，pattern 与数值/长度边界在找不到字面量时「丢弃该约束」而非拒绝（见
+// dropUnverifiedConstraints）。硬核对的是离散取值（防编造 enum）与格式名（防编造 format）。
 func verifyConstraints(n *infer.ShapeNode, text string, tokens map[string]bool) error {
 	for _, v := range n.Enum {
 		if !NameInSource(v, text, tokens) {
 			return fmt.Errorf("%w: enum value %q not in source", ErrRejected, v)
 		}
 	}
-	if n.Pattern != "" && !NameInSource(n.Pattern, text, tokens) {
-		return fmt.Errorf("%w: pattern %q not in source", ErrRejected, n.Pattern)
-	}
 	if n.Format != "" && !ValidFormat(n.Format) {
 		return fmt.Errorf("%w: format %q outside closed set", ErrRejected, n.Format)
 	}
+	return nil
+}
+
+// dropUnverifiedConstraints 清除「源码中找不到字面量出处」的约束（pattern 与数值/长度边界）：
+// 这类约束常写在 handler 切片之外的模型类里，丢弃不误拒；enum/format 已由 verifyConstraints 硬核对。
+func dropUnverifiedConstraints(sc *schema.Schema, n *infer.ShapeNode, text string, tokens map[string]bool) *schema.Schema {
+	if sc == nil {
+		return sc
+	}
 	nums := numberLiterals(text)
+	if n.Pattern != "" && !NameInSource(n.Pattern, text, tokens) {
+		sc.Pattern = ""
+	}
 	for _, v := range []*float64{n.Min, n.Max} {
 		if v != nil && !nums[strconv.FormatFloat(*v, 'f', -1, 64)] && !nums[strconv.FormatInt(int64(*v), 10)] {
-			return fmt.Errorf("%w: numeric bound %v not in source", ErrRejected, *v)
+			if sc.Min == v {
+				sc.Min = nil
+			}
+			if sc.Max == v {
+				sc.Max = nil
+			}
 		}
 	}
 	for _, v := range []*int{n.MinLen, n.MaxLen, n.MinItems, n.MaxItems} {
 		if v != nil && !nums[strconv.Itoa(*v)] {
-			return fmt.Errorf("%w: length bound %d not in source", ErrRejected, *v)
+			if sc.MinLen == v {
+				sc.MinLen = nil
+			}
+			if sc.MaxLen == v {
+				sc.MaxLen = nil
+			}
+			if sc.MinItems == v {
+				sc.MinItems = nil
+			}
+			if sc.MaxItems == v {
+				sc.MaxItems = nil
+			}
 		}
 	}
-	return nil
+	return sc
 }
 
 // numberLiteral 源码中的数值字面量（整数与小数）。

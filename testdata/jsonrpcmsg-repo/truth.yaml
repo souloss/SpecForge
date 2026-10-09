@@ -1,0 +1,213 @@
+# Ground Truth: jsonrpcmsg-repo（admin-permission 族：error.msg 字段名变体 + service 层 BuildBaseResponse 组装信封 + 中间件剥 params 外壳）。
+# 真实契约：成功信封 {jsonrpc,id,result}（result=业务体）；失败信封 {jsonrpc,id,error:{code,msg}}；
+# HTTP 恒 200，业务码在 error.code 与 X-retcode 头（eval 不建模响应头，故业务码经 description code=N 表达）。
+# 请求体是扁平 DTO（jsonRpcMiddleware 已剥掉 jsonrpc/id/params 外壳）。
+openapi: 3.1.0
+info:
+  title: jsonrpcmsg API
+  version: 1.0.0
+paths:
+  /permAdmin/v1/RoleList:
+    post:
+      tags:
+        - perm
+      operationId: roleList
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleListReq'
+      responses:
+        '200':
+          description: 'Business error (code=100012): invalid request body'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      jsonrpc:
+                        type: string
+                      id:
+                        type: string
+                      result:
+                        $ref: '#/components/schemas/RoleListResp'
+                    required:
+                      - jsonrpc
+                      - id
+                      - result
+                  - type: object
+                    properties:
+                      jsonrpc:
+                        type: string
+                      id:
+                        type: string
+                      error:
+                        $ref: '#/components/schemas/JsonRpcError'
+                    required:
+                      - jsonrpc
+                      - id
+                      - error
+  /permAdmin/v1/UserCreate:
+    post:
+      tags:
+        - perm
+      operationId: userCreate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreateReq'
+      responses:
+        '200':
+          description: 'Business error (code=100009): permission denied; Business error (code=100012): invalid request body'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      jsonrpc:
+                        type: string
+                      id:
+                        type: string
+                      result:
+                        $ref: '#/components/schemas/UserCreateResp'
+                    required:
+                      - jsonrpc
+                      - id
+                      - result
+                  - type: object
+                    properties:
+                      jsonrpc:
+                        type: string
+                      id:
+                        type: string
+                      error:
+                        $ref: '#/components/schemas/JsonRpcError'
+                    required:
+                      - jsonrpc
+                      - id
+                      - error
+  /permAdmin/v1/RoleAssign:
+    post:
+      tags:
+        - perm
+      operationId: roleAssign
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleAssignReq'
+      responses:
+        '200':
+          description: 'Business error (code=100012): invalid request body; Business error (code=100201): role not found'
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    properties:
+                      jsonrpc:
+                        type: string
+                      id:
+                        type: string
+                      result:
+                        $ref: '#/components/schemas/RoleAssignResp'
+                    required:
+                      - jsonrpc
+                      - id
+                      - result
+                  - type: object
+                    properties:
+                      jsonrpc:
+                        type: string
+                      id:
+                        type: string
+                      error:
+                        $ref: '#/components/schemas/JsonRpcError'
+                    required:
+                      - jsonrpc
+                      - id
+                      - error
+components:
+  schemas:
+    RoleListReq:
+      type: object
+      properties:
+        page:
+          type: integer
+          format: int64
+        count:
+          type: integer
+          format: int64
+    RoleItem:
+      type: object
+      properties:
+        roleId:
+          type: string
+        roleName:
+          type: string
+      required:
+        - roleId
+        - roleName
+    RoleListResp:
+      type: object
+      properties:
+        list:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoleItem'
+        total:
+          type: integer
+          format: int64
+      required:
+        - list
+        - total
+    UserCreateReq:
+      type: object
+      properties:
+        uin:
+          type: string
+        name:
+          type: string
+        roleCode:
+          type: string
+    UserCreateResp:
+      type: object
+      properties:
+        userId:
+          type: string
+        uin:
+          type: string
+      required:
+        - userId
+        - uin
+    RoleAssignReq:
+      type: object
+      properties:
+        uin:
+          type: string
+        roleCode:
+          type: string
+    RoleAssignResp:
+      type: object
+      properties:
+        assigned:
+          type: boolean
+      required:
+        - assigned
+    JsonRpcError:
+      type: object
+      properties:
+        code:
+          type: integer
+          format: int64
+        msg:
+          type: string
+      required:
+        - code
+        - msg

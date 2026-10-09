@@ -1,0 +1,105 @@
+# Ground Truth: gorilla-repo 的真实契约（人工标注）。
+# gorilla/mux 目前无内置适配器，静态前端预期 0 条路由；本 truth 记录真实契约。
+openapi: 3.1.0
+info:
+  title: gorilla API
+  version: 1.0.0
+paths:
+  /items:
+    post:
+      tags:
+        - api
+      operationId: createItem
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateItemReq'
+      responses:
+        '201':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+        '400':
+          description: Bad request
+          content:
+            text/plain:
+              schema:
+                type: string
+    get:
+      tags:
+        - api
+      operationId: listItems
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Item'
+  /items/{id}:
+    get:
+      tags:
+        - api
+      operationId: getItem
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Item'
+        '404':
+          description: Not found
+          content:
+            text/plain:
+              schema:
+                type: string
+    delete:
+      tags:
+        - api
+      operationId: deleteItem
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: No content
+components:
+  schemas:
+    CreateItemReq:
+      type: object
+      properties:
+        name:
+          type: string
+        price:
+          type: number
+          format: double
+    Item:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        price:
+          type: number
+          format: double
+      required:
+        - id
+        - name
+        - price
