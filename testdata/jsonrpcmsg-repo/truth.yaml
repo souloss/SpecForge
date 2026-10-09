@@ -25,18 +25,12 @@ paths:
             application/json:
               schema:
                 oneOf:
-                  - type: object
-                    properties:
-                      jsonrpc:
-                        type: string
-                      id:
-                        type: string
-                      result:
-                        $ref: '#/components/schemas/RoleListResp'
-                    required:
-                      - jsonrpc
-                      - id
-                      - result
+                  - allOf:
+                      - $ref: '#/components/schemas/BaseResp'
+                      - type: object
+                        properties:
+                          result:
+                            $ref: '#/components/schemas/RoleListResp'
                   - type: object
                     properties:
                       jsonrpc:
@@ -79,18 +73,12 @@ paths:
             application/json:
               schema:
                 oneOf:
-                  - type: object
-                    properties:
-                      jsonrpc:
-                        type: string
-                      id:
-                        type: string
-                      result:
-                        $ref: '#/components/schemas/UserCreateResp'
-                    required:
-                      - jsonrpc
-                      - id
-                      - result
+                  - allOf:
+                      - $ref: '#/components/schemas/BaseResp'
+                      - type: object
+                        properties:
+                          result:
+                            $ref: '#/components/schemas/UserCreateResp'
                   - type: object
                     properties:
                       jsonrpc:
@@ -133,18 +121,12 @@ paths:
             application/json:
               schema:
                 oneOf:
-                  - type: object
-                    properties:
-                      jsonrpc:
-                        type: string
-                      id:
-                        type: string
-                      result:
-                        $ref: '#/components/schemas/RoleAssignResp'
-                    required:
-                      - jsonrpc
-                      - id
-                      - result
+                  - allOf:
+                      - $ref: '#/components/schemas/BaseResp'
+                      - type: object
+                        properties:
+                          result:
+                            $ref: '#/components/schemas/RoleAssignResp'
                   - type: object
                     properties:
                       jsonrpc:
@@ -171,6 +153,48 @@ paths:
                       - error
 components:
   schemas:
+    BaseResp:
+      type: object
+      properties:
+        jsonrpc:
+          type: string
+        id:
+          type: string
+        result:
+          description: interface{} passthrough (narrowed by allOf on success)
+        error:
+          description: interface{} passthrough (omitted on success)
+      required:
+        - jsonrpc
+        - id
+        - result
+    ErrResponse:
+      type: object
+      properties:
+        jsonrpc:
+          type: string
+        id:
+          type: string
+        result:
+          description: interface{} passthrough (omitted on failure)
+        error:
+          type: [object, 'null']
+          properties:
+            code:
+              type: integer
+              format: int64
+            msg:
+              type: string
+            data:
+              description: interface{} passthrough
+          required:
+            - code
+            - msg
+            - data
+      required:
+        - error
+        - id
+        - jsonrpc
     RoleListReq:
       type: object
       properties:
