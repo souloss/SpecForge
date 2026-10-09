@@ -578,6 +578,11 @@ func buildFacts(prog *Program, r route, o opOutcome) ([]*facts.Fact, int) {
 		}
 		seen[key] = true
 		row := facts.ResponseFact{Status: resp.Status, Raw: true, Failure: resp.Error, Sink: Name + ":llm", Source: string(facts.SourceLLM)}
+		if resp.ContentType != "" {
+			// 非 JSON 流式响应（如 SSE text/event-stream）：body 是流式字符串而非 JSON object，
+			// 记媒体类型，body 形状只取标量（string），渲染层挂到对应 media type 下。
+			row.ContentType = resp.ContentType
+		}
 		if resp.Body != nil {
 			if sc, ev, err := shapeOf(prog, resp.Body, o); err == nil {
 				branch := ""

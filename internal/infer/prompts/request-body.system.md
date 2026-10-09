@@ -7,3 +7,7 @@ every enum/pattern literal must appear literally in the source. If the handler r
 respond with {"requestBody":null}. Respond with a single JSON object:
 
 {"requestBody":{"type":"object","properties":[...]}|null}
+
+For optional/unwrapped-optional fields, set "nullable": true (renders as type:[T, null]): Optional[T]
+(typing.Optional), `T | None`, `*T` (Go pointer), `?T` (TS optional), and `@Nullable` annotations all
+mean the field may be absent/null, so mark nullable even when the plain type is also stated.

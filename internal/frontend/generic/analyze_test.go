@@ -89,3 +89,40 @@ func TestScanMissedRoutes(t *testing.T) {
 		t.Fatalf("missed rawPath = %q, want /missed", missed[0].RawPath)
 	}
 }
+
+// TestBuildFactsStreamingContentType SSE 流式响应带 contentType 时，挂到对应 media type、
+// body 按标量 string 渲染，而非 JSON object。
+func TestBuildFactsStreamingContentType(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "events.py")
+	src := "async def run_events(run_id: str):\n    return StreamingResponse(stream(), media_type=\"text/event-stream\")\n"
+	if err := os.WriteFile(file, []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prog, err := NewProgram(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := opOutcome{
+		text:    src,
+		sources: []infer.SourceSnippet{{File: file, Line: 1, Code: src}},
+		contract: &infer.ExtractedContract{
+			Responses: []infer.ExtractedResponse{
+				{Status: 200, Error: false, ContentType: "text/event-stream", Body: &infer.ShapeNode{Type: "string"}},
+			},
+		},
+	}
+	factsOut, rejected := buildFacts(prog, route{method: "GET", path: "/events", handler: "run_events", file: file, line: 1}, o)
+	if rejected != 0 {
+		t.Fatalf("rejected = %d, want 0", rejected)
+	}
+	for _, f := range factsOut {
+		if cp, ok := f.Contract(); ok && len(cp.Responses) == 1 {
+			if cp.Responses[0].ContentType != "text/event-stream" {
+				t.Fatalf("contentType = %q, want text/event-stream", cp.Responses[0].ContentType)
+			}
+			return
+		}
+	}
+	t.Fatal("no contract fact produced")
+}

@@ -88,6 +88,10 @@ type ExtractedResponse struct {
 	Status int        `json:"status"` // HTTP 状态码
 	Error  bool       `json:"error"`  // 是否为错误分支
 	Body   *ShapeNode `json:"body"`   // 响应体形状（无则 null）
+	// ContentType 响应媒体类型；JSON 响应留空（由渲染层默认 application/json）。
+	// 非 JSON 流式响应（如 FastAPI StreamingResponse(media_type="text/event-stream")）填写，
+	// 渲染层据此挂到对应 media type 下，避免把 SSE 流误写成 JSON object。
+	ContentType string `json:"contentType,omitempty"`
 }
 
 // ExtractContract 对一个 operation 抽取契约（tools 非空时可按需读更多源码）。离线返回 ErrNoProvider。
