@@ -10,11 +10,6 @@ paths:
     get:
       operationId: getUser
       parameters:
-        - name: id
-          in: path
-          required: true
-          schema:
-            type: string
         - name: expand
           in: query
           schema:

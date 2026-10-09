@@ -44,7 +44,19 @@ paths:
                       id:
                         type: string
                       error:
-                        $ref: '#/components/schemas/JsonRpcError'
+                        type: [object, 'null']
+                        properties:
+                          code:
+                            type: integer
+                            format: int64
+                          msg:
+                            type: string
+                          data:
+                            description: interface{} passthrough
+                        required:
+                          - code
+                          - msg
+                          - data
                     required:
                       - jsonrpc
                       - id
@@ -86,7 +98,19 @@ paths:
                       id:
                         type: string
                       error:
-                        $ref: '#/components/schemas/JsonRpcError'
+                        type: [object, 'null']
+                        properties:
+                          code:
+                            type: integer
+                            format: int64
+                          msg:
+                            type: string
+                          data:
+                            description: interface{} passthrough
+                        required:
+                          - code
+                          - msg
+                          - data
                     required:
                       - jsonrpc
                       - id
@@ -128,7 +152,19 @@ paths:
                       id:
                         type: string
                       error:
-                        $ref: '#/components/schemas/JsonRpcError'
+                        type: [object, 'null']
+                        properties:
+                          code:
+                            type: integer
+                            format: int64
+                          msg:
+                            type: string
+                          data:
+                            description: interface{} passthrough
+                        required:
+                          - code
+                          - msg
+                          - data
                     required:
                       - jsonrpc
                       - id
@@ -200,14 +236,3 @@ components:
           type: boolean
       required:
         - assigned
-    JsonRpcError:
-      type: object
-      properties:
-        code:
-          type: integer
-          format: int64
-        msg:
-          type: string
-      required:
-        - code
-        - msg
