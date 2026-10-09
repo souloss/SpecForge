@@ -214,6 +214,14 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 	if st, ok := s.constStatus(site); ok {
 		hit.Status = st
 	}
+	// 状态码槽：包装器把 HTTP 状态码当形参（如 writeError(w,r,status,...)），取调用点常量实参。
+	if pat.StatusSlot >= 0 {
+		if info := s.g.TypeInfoOfFunc(site.Caller); info != nil {
+			if st, ok := s.constArgStatus(site, pat.StatusSlot, info); ok {
+				hit.Status = st
+			}
+		}
+	}
 	// 无显式状态码的裸写出（如 json.NewEncoder(w).Encode / w.Write）会随同函数内最近一次
 	// 常量 WriteHeader 归入该状态码行（wire 上首次 WriteHeader 生效，后写不覆盖）。
 	// http.Error 自身带常量 StatusArg，constStatus 已先取值，此处 w.StatusArg<0 才走兜底。
@@ -308,6 +316,17 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 	}
 
 	// ---- err 槽 ----
+	// 恒为错误写出的包装器（ErrOnly）：body 即错误信封（ErrEnvelopeType），无 err 槽分流，
+	// 直接按「错误分支的失败行」渲染（failure := Raw && ErrorBranch），状态码来自 StatusSlot/Status。
+	// 必须置于 data 槽与 inErrorBranch 之后：此处已不再改写 Success/ErrorBranch，避免被清回 false。
+	if pat.ErrOnly {
+		hit.Success = true
+		hit.Raw = true
+		hit.ErrorBranch = true
+		hit.DataTypeID = pat.ErrEnvelopeType
+		hit.HasBody = pat.ErrEnvelopeType != ""
+		hit.DataUnknown = false
+	}
 	if slotPresent(pat.ErrSlot, site.ArgSyms) {
 		sym := site.ArgSyms[pat.ErrSlot]
 		switch {
@@ -507,7 +526,15 @@ func (s *Slicer) constStatus(site codegraph.CallSite) (int, bool) {
 	if info == nil {
 		return 0, false
 	}
-	tv, ok := info.Types[site.ArgExprs[w.StatusArg]]
+	return s.constArgStatus(site, w.StatusArg, info)
+}
+
+// constArgStatus 调用点第 idx 个实参为整数常量时返回其值（状态码槽与状态码形参槽共用）。
+func (s *Slicer) constArgStatus(site codegraph.CallSite, idx int, info *types.Info) (int, bool) {
+	if idx < 0 || idx >= len(site.ArgExprs) {
+		return 0, false
+	}
+	tv, ok := info.Types[site.ArgExprs[idx]]
 	if !ok || tv.Value == nil || tv.Value.Kind() != constant.Int {
 		return 0, false
 	}

@@ -450,11 +450,12 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 				unknowns = append(unknowns, facts.GapWrapperPrefix+h.Site.Caller)
 				conf = minConf(conf, unsummarizedWrapperConfidence)
 			}
-			key := fmt.Sprintf("%s|%d|%v", h.DataTypeID, code, failure)
+			key := fmt.Sprintf("%s|%d|%v|%d", h.DataTypeID, code, failure, h.Status)
 			if seenSuccess[key] {
-				// 合并 sink 证据到既有行
+				// 合并 sink 证据到既有行（同状态码 + 同信封码 + 同失败性 + 同 body 类型才合并；
+				// 状态码纳入合并键——writeError 不同分支带不同真实状态码 401/422/409 必须各成一行）。
 				for i := range rows {
-					if rows[i].Envelope != nil && rows[i].Envelope.Code == code && rows[i].SchemaType == h.DataTypeID && rows[i].Failure == failure {
+					if rows[i].Envelope != nil && rows[i].Envelope.Code == code && rows[i].SchemaType == h.DataTypeID && rows[i].Failure == failure && rows[i].Status == h.Status {
 						rows[i].Sink = rows[i].Sink + "," + sinkLoc
 					}
 				}

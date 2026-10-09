@@ -44,6 +44,11 @@ type SinkPattern struct {
 	Learned bool `yaml:"-"`
 	// ErrEnvelopeType 失败分支写出的信封类型（与成功分支不同时，如 BaseResp / ErrResponse）；空 = 同 EnvelopeType。
 	ErrEnvelopeType string `yaml:"err_envelope_type,omitempty"`
+	// StatusSlot 状态码取自该形参下标（调用点常量实参，如 writeError(w,r,status,...) 的 status 形参）；
+	// NoSlot = 用 Status 常量。用于「错误写出口把 HTTP 状态码当作形参」的形态。
+	StatusSlot int `yaml:"status_slot,omitempty"`
+	// ErrOnly 恒为错误写出（无成功分支）：响应行按失败处理，body 即 ErrEnvelopeType/EnvelopeType。
+	ErrOnly bool `yaml:"err_only,omitempty"`
 }
 
 // NoSlot 槽位不存在（SinkPattern.DataSlot/ErrSlot 取值）。
