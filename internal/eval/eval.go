@@ -759,9 +759,13 @@ func countIntersect(a, b []string) int {
 func prf1(tp, fp, fn int) (p, r, f float64) {
 	if tp+fp > 0 {
 		p = float64(tp) / float64(tp+fp)
+	} else {
+		p = 1 // 无预测项：不罚精确率（真值也无项时为 1，真值有项时由 recall 表达缺口）
 	}
 	if tp+fn > 0 {
 		r = float64(tp) / float64(tp+fn)
+	} else {
+		r = 1 // 真值无项：不罚召回（空契约双方一致即满分）
 	}
 	if p+r > 0 {
 		f = 2 * p * r / (p + r)
