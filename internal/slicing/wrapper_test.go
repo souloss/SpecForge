@@ -1,6 +1,8 @@
 package slicing
 
 import (
+	"go/ast"
+	"go/types"
 	"strings"
 	"testing"
 
@@ -63,4 +65,57 @@ func writeError(w interface{}, r interface{}, status int, code ErrorCode) {
 	if p.DataSlot != profile.NoSlot {
 		t.Fatalf("DataSlot = %d, want NoSlot (no business data field)", p.DataSlot)
 	}
+}
+
+// TestReflectStructToMapArg mapany-repo 形态：handler 经反射助手 structToMap(req) 把结构体按
+// json 标签转 map[string]any 再裸写，值流追不到反射读出的字段名，但入参实参的静态类型即真实形状。
+// 断言 reflectMapArg 取到入参结构体类型；非 struct→map 的单入参调用（如 json.Marshal）返回 nil。
+func TestReflectStructToMapArg(t *testing.T) {
+	_, graph := buildTestSlicer(t, `package svc
+
+type Order struct {
+	Symbol string ` + "`json:\"symbol\"`" + `
+	Qty    int    ` + "`json:\"qty\"`" + `
+}
+
+func structToMap(v any) map[string]any { return nil }
+func asJSON(v any) []byte             { return nil }
+
+func create(o *Order) map[string]any {
+	return structToMap(o)
+}
+func marshal(o *Order) []byte {
+	return asJSON(o)
+}
+`)
+	info := graph.TypeInfoOfFunc("m/svc.create")
+	fd := graph.FuncDeclOf("m/svc.create")
+	call := findReturnCall(fd, info)
+	if call == nil {
+		t.Fatal("no return call in create")
+	}
+	if got := reflectMapArg(call, info); got == nil || got.String() != "m/svc.Order" {
+		t.Fatalf("reflectMapArg(structToMap(o)) = %v, want m/svc.Order", got)
+	}
+	// json.Marshal 类（返回 []byte）不该被识别为 struct→map 助手。
+	info2 := graph.TypeInfoOfFunc("m/svc.marshal")
+	fd2 := graph.FuncDeclOf("m/svc.marshal")
+	if got := reflectMapArg(findReturnCall(fd2, info2), info2); got != nil {
+		t.Fatalf("reflectMapArg(asJSON(o)) = %v, want nil", got)
+	}
+}
+
+// findReturnCall 取函数体内第一个 return 语句里的调用表达式。
+func findReturnCall(fd *ast.FuncDecl, info *types.Info) *ast.CallExpr {
+	var out *ast.CallExpr
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		if ret, ok := n.(*ast.ReturnStmt); ok && len(ret.Results) == 1 {
+			if call, ok := ast.Unparen(ret.Results[0]).(*ast.CallExpr); ok {
+				out = call
+				return false
+			}
+		}
+		return true
+	})
+	return out
 }

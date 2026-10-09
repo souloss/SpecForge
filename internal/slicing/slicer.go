@@ -240,7 +240,15 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 	if slotPresent(pat.DataSlot, site.ArgTypes) {
 		t := site.ArgTypes[pat.DataSlot]
 		var refined types.Type
-		if isAnyType(t) {
+		// 反射 struct→map 助手（如 structToMap(req) 经 reflect 循环 json tag 转 map[string]any）：
+		// 值流只能反推出 map[string]any 这一「开放 map」类型、追不到反射读出的字段名，
+		// 但入参实参的静态类型就是响应的真实形状——直接取唯一入参实参结构体当内联 data，
+		// 上层据此把该结构体按 json 标签展开为匿名 object（等价于结构体直接序列化）。
+		if reflArg := reflectMapArg(site.ArgExprs[pat.DataSlot], s.g.TypeInfoOfFunc(site.Caller)); reflArg != nil {
+			hit.DataInline = reflArg
+			hit.HasBody = true
+			hit.DataUnknown = false
+		} else if isAnyType(t) {
 			// any 槽：沿值流反推具体类型（反推失败保持 any → 不可定型）
 			rt, rtT, alts := s.refineAny(site, pat.DataSlot)
 			if rt != "" {
@@ -313,6 +321,12 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 	// 仅对成功行（非错误分支）生效：错误分支内 http.Error 的 data 是 error string，不应清位。
 	if pat.Raw && !hit.ErrorBranch && hit.DataTypeID != "" && hit.HasBody {
 		hit.DataUnknown = false
+	}
+	// 反射 struct→map 助手收窄出的内联 data（DataInline 非 nil）已静态定型，
+	// 即便实参静态类型是 any 也不该报 DataUnknown（避免污染成功体）。
+	if hit.DataInline != nil {
+		hit.DataUnknown = false
+		hit.HasBody = true
 	}
 
 	// ---- err 槽 ----
@@ -755,6 +769,41 @@ func isBasicSlice(t types.Type) bool {
 	}
 	_, ok = types.Unalias(sl.Elem()).(*types.Basic)
 	return ok
+}
+
+// reflectMapArg 反射 struct→map 助手（如 structToMap(v any) map[string]any，函数体内用
+// reflect.ValueOf(v).Type().NumField() 循环读 json tag 构键）的唯一入参实参类型。
+//
+// 这类助手把实参结构体的 json 标签名作为 map 键，字段名由实参静态类型决定（反射读不出来，
+// 值流也追不到），但写出形状等价于「该结构体按 json 标签序列化」——返回实参类型供上层
+// 当匿名 object 展开。仅当 data 实参是「单入参、入参静态类型为具体命名结构体」的调用点成立。
+func reflectMapArg(arg ast.Expr, info *types.Info) types.Type {
+	call, ok := ast.Unparen(arg).(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 || info == nil {
+		return nil
+	}
+	// 助手返回 map[string]any（反射循环把结构体 json 标签名铺成开放 map），
+	// 而非 json.Marshal（[]byte）之类其它单入参调用——用返回类型约束「struct→map」语义。
+	rt := info.TypeOf(call)
+	if m, ok := rt.Underlying().(*types.Map); !ok || !isStringKey(m.Key()) || !types.IsInterface(m.Elem()) {
+		return nil
+	}
+	t := info.TypeOf(call.Args[0])
+	if t == nil {
+		return nil
+	}
+	t = derefType(t)
+	// 命名结构体（type Order struct{…}）的 Underlying 才是 *types.Struct；匿名结构体 Unalias 即 *types.Struct。
+	if _, ok := t.Underlying().(*types.Struct); !ok {
+		return nil
+	}
+	return t
+}
+
+// isStringKey map 键类型底层是否为 string。
+func isStringKey(t types.Type) bool {
+	b, ok := t.Underlying().(*types.Basic)
+	return ok && b.Info()&types.IsString != 0
 }
 
 // statusConstInFunc 所在函数内、写出点紧邻前一行（cl == line-1）的常量状态码写出
