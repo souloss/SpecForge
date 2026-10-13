@@ -28,6 +28,14 @@ var sourceExts = map[string]bool{".js": true, ".mjs": true, ".cjs": true, ".ts":
 var skipDirs = map[string]bool{".git": true, "node_modules": true, "vendor": true, "dist": true, "build": true,
 	"target": true, ".venv": true, "venv": true, "__pycache__": true, ".specforge": true, ".idea": true, ".next": true}
 
+// testFileSuffix Go 单元测试文件后缀：测试桩里的路由不是真实 API，禁止进入候选文件。
+const testFileSuffix = "_test.go"
+
+// isTestFile 是否为单元测试文件（按后缀判定；LLM 前端不做测试桩，避免把 _test 里的路由当真实端点）。
+func isTestFile(path string) bool {
+	return strings.HasSuffix(path, testFileSuffix)
+}
+
 // defPatterns 多语言函数定义正则（捕获组 1 为函数名）。
 var defPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(`),                                                                                          // JS/PHP
@@ -95,7 +103,7 @@ func NewProgram(root string) (*Program, error) {
 			}
 			return nil
 		}
-		if sourceExts[filepath.Ext(path)] {
+		if sourceExts[filepath.Ext(path)] && !isTestFile(path) {
 			p.files = append(p.files, path)
 		}
 		return nil
@@ -181,7 +189,7 @@ func (p *Program) ValidLine(path string, line int) bool {
 func (p *Program) IsSourceFile(path string) bool {
 	abs := p.AbsPath(path)
 	rel := p.RelPath(abs)
-	if rel == abs || !sourceExts[filepath.Ext(abs)] {
+	if rel == abs || !sourceExts[filepath.Ext(abs)] || isTestFile(abs) {
 		return false
 	}
 	for _, seg := range strings.Split(rel, "/") {

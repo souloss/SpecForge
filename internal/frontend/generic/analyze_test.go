@@ -126,3 +126,38 @@ func TestBuildFactsStreamingContentType(t *testing.T) {
 	}
 	t.Fatal("no contract fact produced")
 }
+
+// TestProgramSkipsTestFiles 测试桩文件（_test.go）不进入程序视图：
+// 测试里的路由不是真实 API，此前会把 requestOnly_test.go 的 /command、
+// authPoint_test.go 的 /history 当真实端点报出。
+func TestProgramSkipsTestFiles(t *testing.T) {
+	root := t.TempDir()
+	for _, f := range []struct {
+		name, body string
+	}{
+		{"routes.go", "package routes\n\nfunc real() {}\n"},
+		{"routes_test.go", "package routes\n\nfunc fake() {}\n"},
+	} {
+		if err := os.WriteFile(filepath.Join(root, f.name), []byte(f.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prog, err := NewProgram(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range prog.Files() {
+		if isTestFile(f) {
+			t.Fatalf("test file %q leaked into program files", f)
+		}
+	}
+	if !prog.IsSourceFile(filepath.Join(root, "routes.go")) {
+		t.Fatal("routes.go should be a source file")
+	}
+	if prog.IsSourceFile(filepath.Join(root, "routes_test.go")) {
+		t.Fatal("routes_test.go must not be a source file")
+	}
+	if _, ok := prog.Resolve("fake", filepath.Join(root, "routes_test.go")); ok {
+		t.Fatal("test-file def must not be resolvable")
+	}
+}
