@@ -129,6 +129,7 @@ func (b *ContractPayloadBuilder) Build() (*facts.Fact, []*facts.Fact, []*facts.F
 	for _, mw := range b.route.Middleware {
 		hits = append(hits, b.slicer.Trace(mw)...)
 	}
+	b.scanReachableParamReads(&cp)
 	rows, schemaFacts, respConf, respUnknowns := b.responseMatrix(hits)
 	cp.Responses = rows
 	unknowns = append(unknowns, respUnknowns...)
@@ -228,7 +229,12 @@ func (b *ContractPayloadBuilder) scanHandlerBody(fd *ast.FuncDecl, symID string,
 			return true
 		}
 		if pr, ok := b.prims.params[callee]; ok && pr.NameArg < len(call.Args) {
-			if name, isLit := stringLit(call.Args[pr.NameArg]); isLit && name != "" && !paramExists(cp.Params, pr.In, name) {
+			name, ok := stringLit(call.Args[pr.NameArg])
+			if !ok {
+				// 参数名以常量引用给出（如 ctx.Get(constant.HeaderUin)）：经类型信息解析常量值。
+				name, ok = b.constStringArg(call.Args[pr.NameArg], info)
+			}
+			if ok && name != "" && !paramExists(cp.Params, pr.In, name) {
 				cp.Params = append(cp.Params, facts.ParamFact{
 					In: pr.In, Name: name, Type: pr.Type, Required: pr.In == "path", Origin: origin,
 				})
@@ -236,6 +242,84 @@ func (b *ContractPayloadBuilder) scanHandlerBody(fd *ast.FuncDecl, symID string,
 		}
 		return true
 	})
+}
+
+// constStringArg 解析指向字符串常量的实参（Ident/Selector）为常量字面值：
+// header 参数名常以 const 引用给出（ctx.Get(constant.HeaderUin) → "X-uin"），
+// 只认字面量会漏掉这类参数。
+func (b *ContractPayloadBuilder) constStringArg(e ast.Expr, info *types.Info) (string, bool) {
+	id, ok := codegraph.ConstOf(e, info)
+	if !ok {
+		return "", false
+	}
+	v, ok := b.g.ConstValueOf(id)
+	if !ok {
+		return "", false
+	}
+	return trimQuotesStr(v), true
+}
+
+// trimQuotesStr 去掉常量值的字符串引号（types.Const.ExactString 对字符串常量保留双引号）。
+func trimQuotesStr(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// scanReachableParamReads 扫描 handler 正向可达闭包内全部函数的单参数读取（ctx.Get/ctx.Query/…），
+// 补齐 handler 函数体与中间件之外、下沉到 service 层的参数读取（如 c.Get(constant.HeaderUin)）。
+// 与原语表（symbol + NameArg）匹配；每个函数体用其所在包的类型信息解析常量实参，保持确定性。
+func (b *ContractPayloadBuilder) scanReachableParamReads(cp *facts.ContractPayload) {
+	prims := b.prims
+	reach := b.g.ForwardReach(b.route.Handler, slicing.MaxDepth)
+	for _, mw := range b.route.Middleware {
+		for id, d := range b.g.ForwardReach(mw, slicing.MaxDepth) {
+			if old, ok := reach[id]; !ok || d < old {
+				reach[id] = d
+			}
+		}
+	}
+	fns := make([]string, 0, len(reach))
+	for fn := range reach {
+		fns = append(fns, fn)
+	}
+	sort.Strings(fns)
+	for _, fn := range fns {
+		fd := b.g.FuncDeclOf(fn)
+		if fd == nil {
+			continue
+		}
+		info := b.g.TypeInfoOfFunc(fn)
+		if info == nil {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			callee, _ := codegraph.ResolveCallee(call, info)
+			if callee == "" {
+				return true
+			}
+			pr, ok := prims.params[callee]
+			if !ok || pr.NameArg >= len(call.Args) {
+				return true
+			}
+			name, ok := stringLit(call.Args[pr.NameArg])
+			if !ok {
+				name, ok = b.constStringArg(call.Args[pr.NameArg], info)
+			}
+			if ok && name != "" && !paramExists(cp.Params, pr.In, name) {
+				cp.Params = append(cp.Params, facts.ParamFact{
+					In: pr.In, Name: name, Type: pr.Type, Required: pr.In == "path", Origin: prims.origin[callee],
+				})
+			}
+			return true
+		})
+	}
 }
 
 // primIndex 框架原语表按符号索引（多框架合并），并预计算证据来源标签（如 "fiber:Query"）。
