@@ -441,6 +441,10 @@ type opOutcome struct {
 func extract(ctx context.Context, req frontend.Request, prog *Program, routes []route, conc int) ([]*facts.Fact, frontend.StepStats) {
 	outs := make([]opOutcome, len(routes))
 	tools := frontend.Tools(prog)
+	// 进度计数（契约抽取是通用前端最慢的阶段，真实仓库可跑数十分钟）：
+	// 每个 operation 完成即打一条 debug 进度日志，卡死时能定位到「停在哪个 op / 哪路子任务」。
+	var done int64
+	var doneMu sync.Mutex
 	runPool(ctx, len(routes), conc, func(i int) {
 		r := routes[i]
 		src := sliceOf(prog, r.handler)
@@ -457,6 +461,11 @@ func extract(ctx context.Context, req frontend.Request, prog *Program, routes []
 			Method:        r.method, Path: r.path, Sources: src,
 		}, tools)
 		outs[i] = o
+		doneMu.Lock()
+		done++
+		n := done
+		doneMu.Unlock()
+		req.Log.Debug("契约抽取进度", "done", n, "total", len(routes), "op", r.method+" "+r.path)
 	})
 	var st frontend.StepStats
 	var fl []*facts.Fact
