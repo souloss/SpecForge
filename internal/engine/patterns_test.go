@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/specforge/specforge/internal/compiler"
+	"github.com/specforge/specforge/internal/contract"
 	"github.com/specforge/specforge/internal/frontend/generic"
 	"github.com/specforge/specforge/internal/infer"
 	"github.com/specforge/specforge/internal/schema"
@@ -18,7 +19,53 @@ import (
 // 断言关键契约字段（请求体 schema、响应信封形态、业务码、状态码、参数来源）。
 // 模式目录见 testdata/PATTERNS.md（模式 ↔ 真实 file:line 证据 ↔ fixture ↔ 测试）。
 
-// opsByKey 按 "METHOD /path" 索引编译后的 operation。
+// TestEnvelopeVariantsNotConflicts 单路由同时写出成功信封与错误信封（code.Response(c, err, data) 的分支），
+// 此前被 Contract Graph 误判为「同状态码候选分歧」（response_conflict / operation_conflict），
+// 91/97 的 operation 被污染。修复后：成功体(BaseResp)与错误体(ErrResponse)是不同的响应变体（oneOf 分支），
+// 不是 conflict；组内同码同形状的分歧（两个来源给不同 body）仍是 conflict。
+func TestEnvelopeVariantsNotConflicts(t *testing.T) {
+	repo := filepath.Join("..", "..", "testdata", "jsonrpc-repo")
+	res, err := Run(context.Background(), Config{
+		RepoDir:     repo,
+		ProfilePath: filepath.Join(repo, ".specforge", "profile.yaml"),
+		OutDir:      t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("gen failed: %v", err)
+	}
+	if res.Conflicts != 0 {
+		t.Fatalf("conflicts = %d, want 0 (success/error envelopes are variants, not conflicts)", res.Conflicts)
+	}
+	// OrderCheck 的成功信封 + 错误信封仍作为 oneOf 变体保留。
+	check := opsByKey(res)["POST /ipo/v1/OrderCheck"]
+	if !variantHas(check, "BaseResp") || !variantHas(check, "ErrResponse") {
+		t.Fatalf("OrderCheck should keep success+error envelope variants, got %+v", check.Responses)
+	}
+}
+
+// TestResponseShapeConflictStillDetected 真正的响应分歧仍要报 conflict：
+// 同一状态码 + 同一业务码下两个来源给出不同 body 形状，不能被变体语义吞掉。
+func TestResponseShapeConflictStillDetected(t *testing.T) {
+	g := contract.New()
+	g.Schemas["Pet"] = &contract.Schema{}
+	g.Schemas["Other"] = &contract.Schema{}
+	if err := g.AddOperation(&contract.Operation{
+		Key: "GET /pets", Method: "GET", Path: "/pets", Parameters: map[string][]contract.Candidate[contract.Parameter]{},
+		Responses: map[string][]contract.Candidate[contract.Response]{"200": {
+			{Value: contract.Response{Status: "200", Code: 0, CodeKnown: true, Schema: "Pet"}, Status: contract.StatusVerified},
+			{Value: contract.Response{Status: "200", Code: 0, CodeKnown: true, Schema: "Other"}, Status: contract.StatusDeclared},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	diags := contract.ValidateGraph(g)
+	for _, d := range diags {
+		if d.Code == "response_conflict" {
+			return
+		}
+	}
+	t.Fatalf("same-code divergent body should still be a response_conflict, got %+v", diags)
+}
 func opsByKey(res *Result) map[string]compiler.Operation {
 	out := map[string]compiler.Operation{}
 	for _, op := range res.Doc.Operations {
