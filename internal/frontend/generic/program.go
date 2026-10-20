@@ -249,6 +249,19 @@ func (p *Program) Resolve(name, near string) (Def, bool) {
 	return Def{}, false
 }
 
+// ResolveAll 名字 → 全部同名定义（按 ID 有序，结果确定）。
+// Go 惯用分层里 controller/service/interface 常同名（如 Controller.CaseDetail / Service.CaseDetail），
+// Resolve 因歧义拒绝时会落到空切片；调用方用 ResolveAll 取全部候选并把定义体并进切片。
+func (p *Program) ResolveAll(name string) []Def {
+	p.buildDefs()
+	if i := strings.LastIndexAny(name, ".:"); i >= 0 {
+		name = name[i+1:] // UserController.get / module:handler → 末段
+	}
+	cands := append([]Def(nil), p.byName[name]...)
+	sort.Slice(cands, func(i, j int) bool { return cands[i].ID < cands[j].ID })
+	return cands
+}
+
 // InlineID 内联 handler 的符号 ID（区域从注册行开始）。
 func (p *Program) InlineID(file string, line int) string {
 	return p.RelPath(file) + "#" + inlineMark + "@" + strconv.Itoa(line)

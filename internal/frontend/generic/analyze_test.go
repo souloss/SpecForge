@@ -9,6 +9,35 @@ import (
 	"github.com/specforge/specforge/internal/infer"
 )
 
+// TestResolveAllMultipleCandidates 同名方法歧义时 Resolve 拒绝、ResolveAll 返回全部候选（按 ID 有序）。
+func TestResolveAllMultipleCandidates(t *testing.T) {
+	root := t.TempDir()
+	// 两个同名方法分处不同文件（模拟 controller/service 分层），注册文件为第三个文件。
+	if err := os.WriteFile(filepath.Join(root, "controller.go"), []byte("package routes\ntype Controller struct{}\nfunc (c *Controller) CaseDetail() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "service.go"), []byte("package routes\ntype Service struct{}\nfunc (s *Service) CaseDetail() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "router.go"), []byte("package routes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prog, err := NewProgram(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := prog.Resolve("CaseDetail", filepath.Join(root, "router.go")); ok {
+		t.Fatal("Resolve should reject ambiguous name")
+	}
+	all := prog.ResolveAll("CaseDetail")
+	if len(all) != 2 {
+		t.Fatalf("ResolveAll = %d candidates, want 2", len(all))
+	}
+	if all[0].ID >= all[1].ID {
+		t.Fatalf("ResolveAll not sorted by ID: %v", all)
+	}
+}
+
 // TestNormalizePath 各框架路径参数写法归一为 OpenAPI {name}。
 func TestNormalizePath(t *testing.T) {
 	cases := map[string]struct {

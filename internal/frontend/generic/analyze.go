@@ -117,6 +117,7 @@ type route struct {
 	path    string   // OpenAPI 路径（参数已归一为 {name}）
 	params  []string // 路径参数名（有序）
 	handler string   // handler 符号 ID（文本视图口径）
+	alts    []string // 同名候选的其余符号 ID（handler 名歧义时并进切片）
 	name    string   // handler 名（operationId 来源；内联为空）
 	file    string   // 注册所在文件（绝对路径）
 	line    int      // 注册行号
@@ -365,6 +366,13 @@ func verifyRoute(prog *Program, file string, dr infer.DiscoveredRoute) (route, e
 	r.name = short
 	if d, ok := prog.Resolve(name, file); ok {
 		r.handler = d.ID
+	} else if cands := prog.ResolveAll(name); len(cands) > 0 {
+		// 同名方法歧义（Go 分层 controller/service/interface 同名）：取首个为主 handler，
+		// 其余并入 alts，契约抽取时把全部定义体并进切片——union 是诚实且更完整的做法。
+		r.handler = cands[0].ID
+		for _, c := range cands[1:] {
+			r.alts = append(r.alts, c.ID)
+		}
 	} else {
 		r.handler = prog.InlineID(file, dr.Line) // 定义不可定位（跨语言/动态注册）：以注册处为区域
 	}
@@ -436,6 +444,9 @@ func extract(ctx context.Context, req frontend.Request, prog *Program, routes []
 	runPool(ctx, len(routes), conc, func(i int) {
 		r := routes[i]
 		src := sliceOf(prog, r.handler)
+		for _, alt := range r.alts {
+			src = mergeSnippets(src, sliceOf(prog, alt))
+		}
 		o := opOutcome{sources: src}
 		for _, s := range src {
 			o.text += s.Code + "\n"
@@ -489,6 +500,22 @@ func sliceOf(prog *Program, handler string) []infer.SourceSnippet {
 	for _, id := range ids {
 		if file, start, _, text, ok := prog.FuncSource(id); ok {
 			out = append(out, infer.SourceSnippet{Symbol: id, File: prog.RelPath(file), Line: start, Code: text})
+		}
+	}
+	return out
+}
+
+// mergeSnippets 合并两份源码片段（按 Symbol 去重，保持先到先得顺序）。同名 handler 歧义时
+// 把全部候选定义体并进切片，contract 抽取据此拿到 controller 与 service 两层的完整源码。
+func mergeSnippets(a, b []infer.SourceSnippet) []infer.SourceSnippet {
+	seen := map[string]bool{}
+	out := append([]infer.SourceSnippet(nil), a...)
+	for _, s := range out {
+		seen[s.Symbol] = true
+	}
+	for _, s := range b {
+		if !seen[s.Symbol] {
+			out = append(out, s)
 		}
 	}
 	return out
