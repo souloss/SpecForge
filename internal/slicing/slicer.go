@@ -36,6 +36,7 @@ type SinkHit struct {
 	DataInline    types.Type         // data 槽经值流收窄到的匿名结构体类型（无类型 ID，由合成器直接出 schema）；nil = 无
 	DataAlts      []string           // data 槽的闭合并集（全部路径可反推、候选均为命名类型）；analyzeHits 展开为逐变体行
 	DataUnion     bool               // 本行是闭合并集中的一个变体（不再做值级收窄）
+	Binary        bool               // 文件/二进制响应：data 是 []byte（导出/下载写出，渲染挂 application/octet-stream）
 	HasBody       bool
 	ErrConstID    string   // 错误码常量符号（可解析时）
 	ErrConstIDs   []string // err 变量经值流反推到的全部错误码常量（analyzeHits 据此展开为逐码行）
@@ -240,11 +241,13 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 	if slotPresent(pat.DataSlot, site.ArgTypes) {
 		t := site.ArgTypes[pat.DataSlot]
 		var refined types.Type
-		// 反射 struct→map 助手（如 structToMap(req) 经 reflect 循环 json tag 转 map[string]any）：
-		// 值流只能反推出 map[string]any 这一「开放 map」类型、追不到反射读出的字段名，
-		// 但入参实参的静态类型就是响应的真实形状——直接取唯一入参实参结构体当内联 data，
-		// 上层据此把该结构体按 json 标签展开为匿名 object（等价于结构体直接序列化）。
-		if reflArg := reflectMapArg(site.ArgExprs[pat.DataSlot], s.g.TypeInfoOfFunc(site.Caller)); reflArg != nil {
+		// 文件/二进制响应：data 实参是 []byte 时（导出/下载写出），无命名类型可登记，
+		// 由响应矩阵直接合成 binary schema（string/byte），并挂 application/octet-stream。
+		if isByteSliceType(t) {
+			hit.Binary = true
+			hit.HasBody = true
+			hit.DataUnknown = false
+		} else if reflArg := reflectMapArg(site.ArgExprs[pat.DataSlot], s.g.TypeInfoOfFunc(site.Caller)); reflArg != nil {
 			hit.DataInline = reflArg
 			hit.HasBody = true
 			hit.DataUnknown = false
@@ -769,6 +772,13 @@ func isBasicSlice(t types.Type) bool {
 	}
 	_, ok = types.Unalias(sl.Elem()).(*types.Basic)
 	return ok
+}
+
+// isByteSliceType 类型串是否为 []byte/[]uint8（文件/二进制响应的 data 实参）。
+func isByteSliceType(t string) bool {
+	t = strings.TrimSpace(t)
+	t = strings.TrimPrefix(t, "*")
+	return t == "[]byte" || t == "[]uint8"
 }
 
 // reflectMapArg 反射 struct→map 助手（如 structToMap(v any) map[string]any，函数体内用

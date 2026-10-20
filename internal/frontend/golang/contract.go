@@ -553,7 +553,13 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 				EnvelopeType: h.EnvelopeType, DataField: h.DataField, Raw: h.Raw, Failure: failure,
 			}
 			schemaFacts = append(schemaFacts, b.envelopeFact(h.EnvelopeType)...)
-			if h.DataTypeID != "" {
+			if h.Binary {
+				// 文件/二进制响应：data 是 []byte，产出 string/byte schema 并挂 application/octet-stream。
+				bf := b.binarySchemaFact(h.Site)
+				row.SchemaType = strings.TrimPrefix(bf.ID, "schema:")
+				row.ContentType = binaryContentType
+				schemaFacts = append(schemaFacts, bf)
+			} else if h.DataTypeID != "" {
 				row.SchemaType = h.DataTypeID
 				if strings.HasPrefix(h.DataTypeID, "[]") {
 					// 切片响应: 元素进 components，数组包装在编译期展开（§7.1）
@@ -760,6 +766,22 @@ func (b *ContractPayloadBuilder) syntheticEnvelopeFact(env slicing.SyntheticEnve
 	return &facts.Fact{
 		ID: "schema:" + env.ID, Kind: facts.KindSchema, Value: facts.SchemaPayload{Schema: sc},
 		Source: facts.SourceStatic, Confidence: 1.0, Evidence: []facts.Evidence{ev}, Status: "verified",
+	}
+}
+
+// binaryContentType 文件/二进制响应的媒体类型（导出/下载写出）。
+const binaryContentType = "application/octet-stream"
+
+// binarySchemaFact 文件/二进制响应的 schema 事实：data 是 []byte，序列化为 string/byte。
+func (b *ContractPayloadBuilder) binarySchemaFact(site codegraph.CallSite) *facts.Fact {
+	sc := &schema.Schema{Type: "string", Format: "byte"}
+	id := "schema:" + narrowPrefix + shapeKey(sc) + "/" + operationIDOf(b.route) + ".Binary"
+	return &facts.Fact{
+		ID: id, Kind: facts.KindSchema, Value: facts.SchemaPayload{Schema: sc},
+		Source: facts.SourceStatic, Confidence: 1.0,
+		Evidence: []facts.Evidence{{File: site.File, StartLine: site.Line, EndLine: site.Line,
+			BlobSHA: b.g.FileHashOf(site.File), Quote: "binary file response"}},
+		Status: "verified",
 	}
 }
 

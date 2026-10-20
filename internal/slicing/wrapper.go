@@ -436,6 +436,14 @@ func flowOf(g *codegraph.Graph, arg ast.Expr, info *types.Info, params map[types
 	}
 	lit, ok := arg.(*ast.CompositeLit)
 	if !ok {
+		// 文件/二进制写出的中间层：`c.SendStream(bytes.NewReader(data), n)` 的 data 实参被
+		// bytes.NewReader 包了一层，看穿它取首实参（形参透传 / 局部变量），使外层包装器的
+		// data 形参映射到正确槽位（ResponseExcel(c, name, data) 的 data）。
+		if call, ok2 := arg.(*ast.CallExpr); ok2 && len(call.Args) == 1 {
+			if callee, _ := codegraph.ResolveCallee(call, info); isByteWrapCallee(callee) {
+				return flowOf(g, call.Args[0], info, params, body)
+			}
+		}
 		return f, false
 	}
 	t := info.TypeOf(lit)
@@ -466,6 +474,16 @@ func flowOf(g *codegraph.Graph, arg ast.Expr, info *types.Info, params map[types
 		}
 	}
 	return f, len(f.fieldOf)+len(f.derivedOf) > 0
+}
+
+// isByteWrapCallee 被调符号是否为「包一层字节切片」的辅助（bytes.NewReader/NewBuffer/Strings.NewReader 等）：
+// 文件/二进制写出的 data 实参常被它包一层再交给 SendStream/SendFile。
+func isByteWrapCallee(callee string) bool {
+	switch lastSeg(callee) {
+	case "NewReader", "NewBuffer", "NewBufferString", "NewStringReader":
+		return true
+	}
+	return false
 }
 
 // mapFlowOf map 字面量信封（`gin.H{"code": 0, "data": data}`）：常量字符串键为信封字段，
