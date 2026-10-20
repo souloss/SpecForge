@@ -148,6 +148,81 @@
 | 错误值流定性：untyped/dynamic/uncoded/unresolved + 命名错误信封 `{error}`/`{result}` | `errflow-repo` | 5 | `TestErrorFlowClassification` |
 | Express/JS 路由 + RESTful 状态码（LLM 通用前端，幻觉核对） | `express-repo` | 4 | `TestGenericFrontendExpress` |
 | echo 未登记框架（LLM 生成适配器声明） | `echo-repo` | 3 | `TestLLMAdapterEcho` |
+| 闭包中间件读 header（闭包返回内层函数，header 读取不可达） | `closureauth-repo` | 3 | `TestClosureAuthHeaderGap` |
+| 泛型分页 `Page[T].List []T`（类型实参收窄） | `genericpage-repo` | 3 | `TestGenericPageGap` |
+| header 参数名以常量引用（通用前端常量名幻觉） | `headerconst-repo` | 3 | `TestHeaderConstName` |
+
+---
+
+## 8. 闭包中间件读取 header（header 契约曾静默丢失）
+
+### 契约影响
+
+鉴权中间件以**闭包**形式注册：`checkPerm := func() fiber.Handler { return requireAuth() }`，路由登记
+`app.Get("/account", checkPerm(), handler)`。header 读取（`c.Get(constant.HeaderUser)`）发生在闭包返回的
+**内层 `requireAuth()`** 里，而路由登记的「中间件符号」是闭包本身——静态前端沿中间件符号做正向可达
+闭包时追不到内层函数，`X-user` 头被**静默漏掉**（既不产出 header 参数，也不报缺口）。
+
+修复：路由解析把闭包变量（`checkPerm`）映射到其返回的内层函数（`requireAuth`），正向可达闭包据此追到
+内层 header 读取，`X-user` 头恢复为 header 参数。
+
+对比：直接函数形式的中间件（如 mapany-repo 的 `authRequired`）能被 `scanReachableParamReads` 正常提取 header。
+
+### 真实出处
+
+- 闭包中间件：`internal/serviceAdminRisk/router.go:31-36`（`checkPerm := func(scene string) fiber.Handler`、
+  `checkPermV2 := func() fiber.Handler`），内层 `middleware/auth/auth_v2.go:78-94`（`NewAdminPermissionV2` 内
+  `c.Get(constant.HeaderUin)`）。
+- 影响面：闭包挂载的鉴权头 `X-uin` 在几乎全部 admin 操作上丢失。
+
+### 覆盖 fixture
+
+`testdata/closureauth-repo`（3 条路由 `/account`/`/settings`/`/profile` 都走同一闭包 `checkPerm()`）。
+回归测试：`internal/engine/patterns_test.go::TestClosureAuthHeaderGap`。
+
+---
+
+## 9. 泛型分页 `Page[T].List []T`（类型实参收窄）
+
+### 契约影响
+
+分页结构以泛型声明：`type Page[T any] struct { List []T }`，成功体是 `Page[Item]` 实例化。静态值流
+只登记命名类型 `Page`（去类型实参），`List []T` 的 `T` 追不到 → 曾落成 `list[] is interface{}/any` 缺口。
+
+修复：值流把实例化类型（`Page[Item]`）交给合成器，合成器沿实例化实参替换字段里的类型形参
+（`List []T` → `[]Item`），List 收窄为具体元素 schema（`PageOfItemForListItems`）。
+
+### 真实出处
+
+- 泛型分页：`pkg/utils/public.go:8-18`（`type Page[T any] struct { ... List []T }`、`NewPage[T]`）。
+- 影响面：`StockCollateralList`/`ExclusionMarginCallAeCodeList` 等列表接口（曾残留 any 缺口）。
+
+### 覆盖 fixture
+
+`testdata/genericpage-repo`（3 条路由 `/items`(Page[Item]) `/orders`(Page[Order]) `/accounts`(Page[string])）。
+回归测试：`internal/engine/patterns_test.go::TestGenericPageGap`。
+
+---
+
+## 10. header 参数名以常量引用（通用前端常量名幻觉）
+
+### 契约影响
+
+handler 读 header 时用常量：`c.Get(HeaderTrace)`，`HeaderTrace = "X-Trace"`。Go 静态前端能解析常量值
+（`constStringArg`），产出正确的 `X-Trace`；但通用 LLM 前端无类型信息，只看到标识符 `HeaderTrace`，
+可能把**常量名**当参数名输出（真实参数名应是常量的值 `"X-Trace"`）。
+
+修复：通用前端建立「常量名 → 字符串值」索引，header 参数名命中常量名时用值替换，产出 `X-Trace`。
+
+### 真实出处
+
+- 常量 header：`internal/risk_admin_config/infra/common/const.go:5`（`X_REQUEST_ID = "X-request-id"`），
+  读取点 `internal/risk_admin_config/interfaces/middleware/request_id.go:11`（`c.Get(common.X_REQUEST_ID)`）。
+
+### 覆盖 fixture
+
+`testdata/headerconst-repo`（3 条路由 `/trace`/`/region`/`/both`，读 `HeaderTrace`/`HeaderRegion` 常量）。
+回归测试：`internal/engine/patterns_test.go::TestHeaderConstName`。
 
 ---
 

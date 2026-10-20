@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/specforge/specforge/internal/compiler"
+	"github.com/specforge/specforge/internal/frontend/generic"
 	"github.com/specforge/specforge/internal/infer"
 	"github.com/specforge/specforge/internal/schema"
 )
@@ -391,9 +392,148 @@ func propHas(sc *schema.Schema, field string) bool {
 	return false
 }
 
+// containsInt hay 是否含 needle。
 func containsInt(hay []int, needle int) bool {
 	for _, v := range hay {
 		if v == needle {
+			return true
+		}
+	}
+	return false
+}
+
+// TestClosureAuthHeaderGap 闭包中间件读取 header（§8）：路由登记 `checkPerm()` 闭包，
+// header 读取发生在闭包返回的内层 requireAuth 里。引擎沿「闭包变量 → 返回的内层函数」
+// 解析中间件符号（exprResolver.closureReturns），正向可达闭包追到 requireAuth，
+// X-user 头应出现在全部 3 条路由的 header 参数（此前被静默漏掉）。
+func TestClosureAuthHeaderGap(t *testing.T) {
+	repo := filepath.Join("..", "..", "testdata", "closureauth-repo")
+	res, err := Run(context.Background(), Config{RepoDir: repo, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("gen failed: %v", err)
+	}
+	ops := opsByKey(res)
+	for _, path := range []string{"/account", "/settings", "/profile"} {
+		op, ok := ops["GET "+path]
+		if !ok {
+			t.Fatalf("missing operation GET %s", path)
+		}
+		if !hasParam(op, "header", "X-user", false) && !hasParam(op, "header", "X-user", true) {
+			t.Fatalf("GET %s missing X-user header param (closure middleware header not resolved), params=%+v", path, op.Params)
+		}
+	}
+}
+
+// TestGenericPageGap 泛型分页 `Page[T].List []T`（§9）：成功体是 Page[Item] 实例化，
+// 静态值流沿实例化类型替换形参元素（`List []T` → `[]Item`），List 不再落 any 缺口——
+// 每条路由应产出引用具体元素类型的收窄 schema，且无 interface{}/any 缺口。
+func TestGenericPageGap(t *testing.T) {
+	repo := filepath.Join("..", "..", "testdata", "genericpage-repo")
+	res, err := Run(context.Background(), Config{RepoDir: repo, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("gen failed: %v", err)
+	}
+	ops := opsByKey(res)
+	want := map[string]string{
+		"/items":    "PageOfItemForListItems",
+		"/orders":   "PageOfOrderForListOrders",
+		"/accounts": "PageOfstringForListAccounts",
+	}
+	for _, path := range []string{"/items", "/orders", "/accounts"} {
+		op, ok := ops["GET "+path]
+		if !ok {
+			t.Fatalf("missing operation GET %s", path)
+		}
+		if !responseHasSchema(op, want[path]) {
+			t.Fatalf("GET %s should reference generic-instantiated schema %s, responses=%+v", path, want[path], op.Responses)
+		}
+		if hasUnknownContaining(op, "any") {
+			t.Fatalf("GET %s should have no interface{}/any gap on Page.list, unknowns=%v", path, op.Unknowns)
+		}
+	}
+	// 元素类型被正确收窄：PageOfItemForListItems 的 list 元素是 object（含 id/name），PageOfstringForListAccounts 是 string。
+	if !assertSchemaProp(res, "PageOfItemForListItems", "list", func(p schema.Prop) bool {
+		return p.Schema.Type == "array" && p.Schema.Items != nil && p.Schema.Items.Type == "object" && propHas(p.Schema.Items, "id")
+	}) {
+		t.Fatal("PageOfItemForListItems.list should be array of object (id/name)")
+	}
+	if !assertSchemaProp(res, "PageOfstringForListAccounts", "list", func(p schema.Prop) bool {
+		return p.Schema.Type == "array" && p.Schema.Items != nil && p.Schema.Items.Type == "string"
+	}) {
+		t.Fatal("PageOfstringForListAccounts.list should be array of string")
+	}
+}
+
+// assertSchemaProp 断言命名 schema 的某字段满足给定判定。
+func assertSchemaProp(res *Result, schemaName, field string, check func(schema.Prop) bool) bool {
+	for _, ns := range res.Doc.Schemas {
+		if ns.Name != schemaName {
+			continue
+		}
+		for _, p := range ns.Schema.Props {
+			if p.Name == field && check(p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestHeaderConstName header 参数名以常量引用（§10）：静态前端把常量值解析为参数名（X-Trace/X-Region）；
+// 通用前端无类型信息只看到标识符——经常量名 → 字符串值索引把 header 参数名还原为常量值，不再把常量名当参数名。
+// 本测试同时断言静态正确、并锁定通用前端的常量名幻觉缺陷已修复。
+func TestHeaderConstName(t *testing.T) {
+	repo := filepath.Join("..", "..", "testdata", "headerconst-repo")
+	res, err := Run(context.Background(), Config{RepoDir: repo, OutDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("gen failed: %v", err)
+	}
+	ops := opsByKey(res)
+	// 静态前端：常量值解析为真实 header 名。
+	both := ops["GET /both"]
+	if !hasParam(both, "header", "X-Trace", false) || !hasParam(both, "header", "X-Region", false) {
+		t.Fatalf("static GET /both should resolve header constants to values, params=%+v", both.Params)
+	}
+	trace := ops["GET /trace"]
+	if !hasParam(trace, "header", "X-Trace", false) {
+		t.Fatalf("static GET /trace should carry X-Trace, params=%+v", trace.Params)
+	}
+
+	// 通用前端：契约抽取由脚本 provider 返回 header 名 HeaderTrace/HeaderRegion（模拟 LLM 只看到标识符），
+	// 引擎应经常量索引还原为 X-Trace/X-Region，而不是把常量名当参数名输出。
+	gres, err := Run(context.Background(), Config{
+		RepoDir: repo, OutDir: t.TempDir(),
+		Frontend: generic.New(), Provider: headerConstProvider(),
+	})
+	if err != nil {
+		t.Fatalf("generic gen failed: %v", err)
+	}
+	gops := opsByKey(gres)
+	if both := gops["GET /both"]; !hasParam(both, "header", "X-Trace", false) || !hasParam(both, "header", "X-Region", false) {
+		t.Fatalf("generic GET /both should resolve header constants to values, params=%+v", both.Params)
+	}
+}
+
+// headerConstProvider headerconst-repo 的 generic 脚本：契约里 header 参数名故意写成常量标识符
+// （HeaderTrace/HeaderRegion），模拟 LLM 无类型信息时的常量名幻觉，验证引擎能还原为常量值。
+func headerConstProvider() *genericProvider {
+	return &genericProvider{
+		routes: map[string]string{"internal/svc/svc.go": `{"routes":[
+		 {"method":"GET","path":"/trace","handler":"trace","line":18},
+		 {"method":"GET","path":"/region","handler":"region","line":19},
+		 {"method":"GET","path":"/both","handler":"both","line":20}]}`},
+		contracts: map[string]string{
+			"GET /trace":  `{"params":[{"in":"header","name":"HeaderTrace","type":"string"}],"responses":[{"status":200,"body":{"type":"object","properties":[{"name":"ok","shape":{"type":"boolean"}}]}}]}`,
+			"GET /region": `{"params":[{"in":"header","name":"HeaderRegion","type":"string"}],"responses":[{"status":200,"body":{"type":"object","properties":[{"name":"ok","shape":{"type":"boolean"}}]}}]}`,
+			"GET /both":   `{"params":[{"in":"header","name":"HeaderTrace","type":"string"},{"in":"header","name":"HeaderRegion","type":"string"}],"responses":[{"status":200,"body":{"type":"object","properties":[{"name":"ok","shape":{"type":"boolean"}}]}}]}`,
+		},
+	}
+}
+
+// hasUnknownContaining operation 的缺口里是否存在含子串 s 的条目。
+func hasUnknownContaining(op compiler.Operation, s string) bool {
+	for _, u := range op.Unknowns {
+		if strings.Contains(u, s) {
 			return true
 		}
 	}
