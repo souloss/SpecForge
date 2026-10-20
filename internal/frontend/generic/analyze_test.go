@@ -156,6 +156,50 @@ func TestBuildFactsStreamingContentType(t *testing.T) {
 	t.Fatal("no contract fact produced")
 }
 
+// TestSerializeAliases json tag 名映射：LLM 报 Go 字段名（PascalCase）时，形状核对据 tag 名还原。
+func TestSerializeAliases(t *testing.T) {
+	text := "type R struct {\n\tData string `json:\"data\"`\n\tId   int    `json:\"id,omitempty\"`\n\tName string `json:\"name\"`\n}\n"
+	alias := serializeAliases(text)
+	if alias["Data"] != "data" || alias["Id"] != "id" || alias["Name"] != "name" {
+		t.Fatalf("serializeAliases = %v", alias)
+	}
+}
+
+// TestReachDepthCoversLayeredHandler 分层 controller→service→access 是 3 跳：可达深度须覆盖到写出口
+// （第 3~4 跳的函数），否则契约切片里没有响应写出口，LLM 只能答 no response found。
+func TestReachDepthCoversLayeredHandler(t *testing.T) {
+	root := t.TempDir()
+	src := map[string]string{
+		"ctl.go":   "package routes\nfunc ListCtl() { ListSvc() }\n",
+		"svc.go":   "package routes\nfunc ListSvc() { ListAcc() }\n",
+		"acc.go":   "package routes\nfunc ListAcc() { Write() }\n",
+		"write.go": "package routes\nfunc Write() {}\n",
+	}
+	for name, body := range src {
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prog, err := NewProgram(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler := "ctl.go#ListCtl@2"
+	reach := prog.Reach(handler)
+	// Write() 在第 3 跳；深度 4 必须把它纳入切片。
+	if _, ok := reach["write.go#Write@2"]; !ok {
+		t.Fatalf("Write() (3 hops away) not reached; reach = %v", keys(reach))
+	}
+}
+
+func keys(m map[string]int) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // TestProgramSkipsTestFiles 测试桩文件（_test.go）不进入程序视图：
 // 测试里的路由不是真实 API，此前会把 requestOnly_test.go 的 /command、
 // authPoint_test.go 的 /history 当真实端点报出。

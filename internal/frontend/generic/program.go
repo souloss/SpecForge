@@ -429,7 +429,11 @@ func (p *Program) Reach(handler string) map[string]int {
 }
 
 // reachDepth 文本调用关系的可达深度。
-const reachDepth = 2
+//
+// Go 惯用分层 controller→service→access→写出口 是 3~4 跳：深度 2 会把写出口
+// （code.Response/ctx.JSON）挡在切片之外，LLM 只能答「no response found」。
+// 提到 4 覆盖典型分层；文本调用图没有类型信息，可达集偏宽，截断仍靠 maxSliceSources。
+const reachDepth = 4
 
 // Callees 实现 frontend.Program：区域内「标识符(」且能解析到定义的函数（有序）。
 func (p *Program) Callees(id string) []string {

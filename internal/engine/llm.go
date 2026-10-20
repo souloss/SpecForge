@@ -929,7 +929,7 @@ func (lp *llmPhase) applyShapes(out *gapOutcome, shapes []infer.ResolvedShape, i
 // required 对齐结构体声明（无 omitempty 才必填），与静态前端同口径。
 func (lp *llmPhase) shapeSchema(n *infer.ShapeNode, text string, tokens map[string]bool,
 	tagged map[string]taggedField, sl sliceEvidence) (*schema.Schema, []facts.Evidence, error) {
-	sc, _, err := verify.Shape(n, text, tokens)
+	sc, _, err := verify.Shape(n, text, tokens, nil)
 	if err != nil {
 		return nil, nil, err
 	}

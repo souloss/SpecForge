@@ -77,12 +77,15 @@ func ValidStatus(s int) bool { return s >= MinHTTPStatus && s <= MaxHTTPStatus }
 // Shape 形状树 → schema，逐节点核对：类型取封闭集合、深度受限、每个字段名在源码中出现；
 // 约束（enum/pattern/format/数值与长度边界/nullable）逐项核对「字面量须出现在源码中」。
 // 任一节点不合规整棵拒绝（返回 ErrRejected）。names 为树中全部字段名（供上层定位证据行）。
-func Shape(n *infer.ShapeNode, text string, tokens map[string]bool) (*schema.Schema, []string, error) {
-	return shape(n, text, tokens, 0)
+//
+// alias 是「模型报的字段名 → 源码里的真实序列化名」映射（如 Go 的 json tag：Data → data），
+// 用于在模型用语言内名字（PascalCase）而序列化名不同（camelCase）时仍能核对；无映射时行为与旧版一致。
+func Shape(n *infer.ShapeNode, text string, tokens map[string]bool, alias map[string]string) (*schema.Schema, []string, error) {
+	return shape(n, text, tokens, alias, 0)
 }
 
 // shape Shape 的递归实现。
-func shape(n *infer.ShapeNode, text string, tokens map[string]bool, depth int) (*schema.Schema, []string, error) {
+func shape(n *infer.ShapeNode, text string, tokens map[string]bool, alias map[string]string, depth int) (*schema.Schema, []string, error) {
 	if n == nil {
 		return nil, nil, fmt.Errorf("%w: missing shape node", ErrRejected)
 	}
@@ -102,7 +105,7 @@ func shape(n *infer.ShapeNode, text string, tokens map[string]bool, depth int) (
 		sc = dropUnverifiedConstraints(sc, n, text, tokens)
 		return sc, nil, nil
 	case n.Type == "array":
-		items, names, err := shape(n.Items, text, tokens, depth+1)
+		items, names, err := shape(n.Items, text, tokens, alias, depth+1)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -117,18 +120,24 @@ func shape(n *infer.ShapeNode, text string, tokens map[string]bool, depth int) (
 		sc := &schema.Schema{Type: "object", Nullable: n.Nullable}
 		var names []string
 		for _, p := range n.Properties {
-			if !NameInSource(p.Name, text, tokens) {
+			// 模型报 Go 字段名（PascalCase）而 json tag 是 camelCase 时，用 alias 映射回源码名核对，
+			// 产物字段名统一用源码里的序列化名（json tag），避免 PascalCase 幻觉。
+			srcName := p.Name
+			if v, ok := alias[p.Name]; ok {
+				srcName = v
+			}
+			if !NameInSource(srcName, text, tokens) {
 				return nil, nil, fmt.Errorf("%w: field %q not in source", ErrRejected, p.Name)
 			}
-			child, cn, err := shape(p.Shape, text, tokens, depth+1)
+			child, cn, err := shape(p.Shape, text, tokens, alias, depth+1)
 			if err != nil {
 				return nil, nil, err
 			}
-			sc.Props = append(sc.Props, schema.Prop{Name: p.Name, Schema: child, Required: p.Required})
+			sc.Props = append(sc.Props, schema.Prop{Name: srcName, Schema: child, Required: p.Required})
 			if p.Required {
-				sc.Required = append(sc.Required, p.Name)
+				sc.Required = append(sc.Required, srcName)
 			}
-			names = append(append(names, p.Name), cn...)
+			names = append(append(names, srcName), cn...)
 		}
 		sort.Strings(sc.Required)
 		return sc, names, nil

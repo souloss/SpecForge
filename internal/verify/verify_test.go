@@ -21,7 +21,7 @@ func TestShapePassesConstraints(t *testing.T) {
 			{Name: "created_at", Shape: &infer.ShapeNode{Type: "string", Format: "date-time", Nullable: true}},
 		},
 	}
-	sc, _, err := Shape(node, text, tokens)
+	sc, _, err := Shape(node, text, tokens, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,8 +49,30 @@ func TestShapeRejectsHallucinatedEnum(t *testing.T) {
 	node := &infer.ShapeNode{Type: "object", Properties: []infer.ShapeProp{
 		{Name: "status", Shape: &infer.ShapeNode{Type: "string", Enum: []string{"ghost"}}},
 	}}
-	if _, _, err := Shape(node, text, Tokens(text)); err == nil || !strings.Contains(err.Error(), "ghost") {
+	if _, _, err := Shape(node, text, Tokens(text), nil); err == nil || !strings.Contains(err.Error(), "ghost") {
 		t.Fatalf("want rejection of hallucinated enum, got %v", err)
+	}
+}
+
+// TestShapeResolvesSerializeAlias 模型报 Go 字段名（PascalCase）而源码 json tag 是 camelCase 时，
+// 经 alias 映射核对并把产物字段名还原为序列化名（json tag）。
+func TestShapeResolvesSerializeAlias(t *testing.T) {
+	text := "type R struct { Data string `json:\"data\"`; Id int `json:\"id\"` }"
+	node := &infer.ShapeNode{Type: "object", Properties: []infer.ShapeProp{
+		{Name: "Data", Shape: &infer.ShapeNode{Type: "string"}},
+		{Name: "Id", Shape: &infer.ShapeNode{Type: "integer", Format: "int64"}},
+	}}
+	alias := map[string]string{"Data": "data", "Id": "id"}
+	sc, _, err := Shape(node, text, Tokens(text), alias)
+	if err != nil {
+		t.Fatalf("alias should let PascalCase field pass: %v", err)
+	}
+	names := map[string]bool{}
+	for _, p := range sc.Props {
+		names[p.Name] = true
+	}
+	if !names["data"] || !names["id"] || names["Data"] || names["Id"] {
+		t.Fatalf("fields should be renamed to json tags, got %+v", names)
 	}
 }
 
@@ -61,7 +83,7 @@ func TestShapeDropsUnverifiedPattern(t *testing.T) {
 	node := &infer.ShapeNode{Type: "object", Properties: []infer.ShapeProp{
 		{Name: "name", Shape: &infer.ShapeNode{Type: "string", Pattern: "^[A-Z]+$"}},
 	}}
-	sc, _, err := Shape(node, text, Tokens(text))
+	sc, _, err := Shape(node, text, Tokens(text), nil)
 	if err != nil {
 		t.Fatalf("unverified pattern should be dropped, not rejected: %v", err)
 	}

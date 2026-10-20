@@ -651,7 +651,10 @@ const gapConfidence = 0.4
 
 // shapeOf 形状树核对（字段名须出现在切片源码中）→ schema，并为字段名定位证据行（首个出现处）。
 func shapeOf(prog *Program, n *infer.ShapeNode, o opOutcome) (*schema.Schema, []facts.Evidence, error) {
-	sc, names, err := verify.Shape(n, o.text, verify.Tokens(o.text))
+	// 切片内结构体/字典的「语言内名字 → 序列化名」映射（如 Go 的 json tag：Data → data）。
+	// LLM 读源码常报 PascalCase 的 Go 字段名，用 tag 名核对并落 schema，避免被 NameInSource 整棵拒绝。
+	alias := serializeAliases(o.text)
+	sc, names, err := verify.Shape(n, o.text, verify.Tokens(o.text), alias)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -666,6 +669,21 @@ func shapeOf(prog *Program, n *infer.ShapeNode, o opOutcome) (*schema.Schema, []
 		ev = append(ev, evidenceAt(prog, prog.AbsPath(s.File), s.Line, "shape"))
 	}
 	return sc, ev, nil
+}
+
+// serializeAliases 从切片源码里提取「语言内字段名 → 序列化名」映射：
+// Go 的 `Data string \`json:"data"\``、`Field int \`json:"field,omitempty"\`` 等。
+// 只提取 `json:"xxx"` 且 tag 名 ≠ Go 名的项（同名无需映射）。
+func serializeAliases(text string) map[string]string {
+	out := map[string]string{}
+	re := regexp.MustCompile(`(\w+)\s+\w+.*?json:"([^"]+)"`)
+	for _, m := range re.FindAllStringSubmatch(text, -1) {
+		goName, tagName := m[1], strings.SplitN(m[2], ",", 2)[0]
+		if tagName != "" && tagName != "-" && tagName != goName {
+			out[goName] = tagName
+		}
+	}
+	return out
 }
 
 // locate 名字在切片中首次出现的行 → 证据。
