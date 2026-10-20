@@ -288,20 +288,38 @@ func scanMissedRoutes(prog *Program, files []string, accepted []route) []fronten
 
 // discover 逐文件路由发现并核对；按 (method, path) 去重（先到先得，文件序确定）。
 // 统计口径：Attempted = LLM 报告的路由数，Accepted/Rejected = 核对结果，Failed = 调用失败的文件数。
+//
+// 超长/路由密集的文件（真实仓库常见把几十条路由集中注册在一个 router.go）单次 LLM 调用
+// 易超时或漏报，整文件失败又会让全部路由丢失。这里把文件按路由注册行切片分块，
+// 每块独立请求，单块失败只丢该块并续跑其余块，保证「同一文件里不同函数块的路由都能被解析出来」。
 func discover(ctx context.Context, req frontend.Request, prog *Program, files []string, conc int) ([]route, frontend.StepStats) {
-	lists := make([]*infer.RouteList, len(files))
-	errs := make([]error, len(files))
-	runPool(ctx, len(files), conc, func(i int) {
+	type chunk struct {
+		file string
+		idx  int // 在 files 中的下标
+		text string
+	}
+	var chunks []chunk
+	for i, f := range files {
+		for _, lines := range splitRouteBlocks(prog, f) {
+			chunks = append(chunks, chunk{file: f, idx: i, text: numbered(lines)})
+		}
+	}
+	lists := make([]*infer.RouteList, len(chunks))
+	errs := make([]error, len(chunks))
+	runPool(ctx, len(chunks), conc, func(i int) {
 		lists[i], errs[i] = infer.DiscoverRoutes(ctx, req.Provider,
-			infer.RouteTask{File: prog.RelPath(files[i]), Lines: numbered(prog.FileLines(files[i]))})
+			infer.RouteTask{File: prog.RelPath(chunks[i].file), Lines: chunks[i].text})
 	})
 	var st frontend.StepStats
 	var out []route
 	seen := map[string]bool{}
-	for i, f := range files {
+	chunksPerFile := map[int]int{}
+	chunksFailed := map[int]bool{}
+	for i, c := range chunks {
+		chunksPerFile[c.idx]++
 		if errs[i] != nil {
-			st.Failed++
-			req.Log.Warn("路由发现失败", "file", prog.RelPath(f), "err", errs[i])
+			chunksFailed[c.idx] = true
+			req.Log.Warn("路由发现分块失败", "file", prog.RelPath(c.file), "chunk", chunksPerFile[c.idx], "err", errs[i])
 			continue
 		}
 		if lists[i] == nil {
@@ -309,10 +327,10 @@ func discover(ctx context.Context, req frontend.Request, prog *Program, files []
 		}
 		for _, dr := range lists[i].Routes {
 			st.Attempted++
-			r, err := verifyRoute(prog, f, dr)
+			r, err := verifyRoute(prog, c.file, dr)
 			if err != nil {
 				st.Rejected++
-				req.Log.Debug("路由未通过核对", "file", prog.RelPath(f), "route", dr.Method+" "+dr.Path, "err", err)
+				req.Log.Debug("路由未通过核对", "file", prog.RelPath(c.file), "route", dr.Method+" "+dr.Path, "err", err)
 				continue
 			}
 			key := facts.OpKey(r.method, r.path)
@@ -324,11 +342,57 @@ func discover(ctx context.Context, req frontend.Request, prog *Program, files []
 			out = append(out, r)
 		}
 	}
+	for i := range files {
+		if chunksFailed[i] {
+			st.Failed++
+		}
+	}
 	if len(out) > maxOperations {
 		req.Log.Warn("operation 数超过上限，截断", "total", len(out), "limit", maxOperations)
 		out = out[:maxOperations]
 	}
 	return out, st
+}
+
+// routeBlockTarget 单块路由发现的目标行数：密集注册的文件按此切块，控制单次调用规模。
+const routeBlockTarget = 80
+
+// splitRouteBlocks 把一个文件按路由注册行切片：命中的注册行群聚成块，块间插入参考上下文
+// （文件头 import 与挂载前缀行），使每块都能独立判定挂载前缀。无命中行时整文件作为一块。
+//
+// 密集注册的 router 文件（几十条路由集中在一处）单次 LLM 调用易超时或漏报，
+// 切成小批独立请求，单块失败只丢该块、其余块照常解析。
+func splitRouteBlocks(prog *Program, file string) [][]string {
+	lines := prog.FileLines(file)
+	var hitIdx []int
+	for i, l := range lines {
+		if routeHint.MatchString(l) && verbHint.MatchString(l) {
+			hitIdx = append(hitIdx, i)
+		}
+	}
+	if len(hitIdx) == 0 || len(hitIdx) <= routeBlockTarget {
+		return [][]string{lines}
+	}
+	// 文件头（import / 包声明 / 挂载前缀，位于首个注册行之前）作为每块共享上下文。
+	header := lines
+	if hitIdx[0] > 0 {
+		header = lines[:hitIdx[0]]
+	}
+	// 只把命中的注册行并入块；非命中的注释/空行/无关语句不进块（避免把纯注释行当路由）。
+	var blocks [][]string
+	var cur []string
+	cur = append(cur, header...)
+	for _, i := range hitIdx {
+		if len(cur) >= routeBlockTarget {
+			blocks = append(blocks, cur)
+			cur = append([]string(nil), header...)
+		}
+		cur = append(cur, lines[i])
+	}
+	if len(cur) > len(header) {
+		blocks = append(blocks, cur)
+	}
+	return blocks
 }
 
 // verifyRoute 文本核对：方法合法；注册行有效；窗口内有字符串字面量是所报路径的后缀（前缀来自挂载/分组，

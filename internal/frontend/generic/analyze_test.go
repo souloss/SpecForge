@@ -1,9 +1,11 @@
 package generic
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/specforge/specforge/internal/infer"
@@ -198,6 +200,37 @@ func keys(m map[string]int) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TestSplitRouteBlocks 密集路由文件切成小批：>routeBlockTarget 条注册行时切成多块，
+// 每块都带文件头（import/挂载前缀），保证单块规模可控、挂载前缀可判定。
+func TestSplitRouteBlocks(t *testing.T) {
+	root := t.TempDir()
+	file := filepath.Join(root, "router.go")
+	header := "package routes\nimport \"x\"\nfunc Router() {\n\tapp := g.Group(\"/api\")\n"
+	var b strings.Builder
+	b.WriteString(header)
+	n := routeBlockTarget*2 + 10
+	for i := 0; i < n; i++ {
+		fmt.Fprintf(&b, "\tapp.Get(\"/r%d\", h%d)\n", i, i)
+	}
+	b.WriteString("}\n")
+	if err := os.WriteFile(file, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prog, err := NewProgram(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocks := splitRouteBlocks(prog, file)
+	if len(blocks) < 2 {
+		t.Fatalf("splitRouteBlocks = %d blocks, want >= 2", len(blocks))
+	}
+	for _, blk := range blocks {
+		if !strings.Contains(strings.Join(blk, "\n"), "func Router()") {
+			t.Fatalf("each block must carry the file header (mount prefix context), got %q", blk)
+		}
+	}
 }
 
 // TestProgramSkipsTestFiles 测试桩文件（_test.go）不进入程序视图：
