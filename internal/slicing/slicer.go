@@ -34,6 +34,7 @@ type SinkHit struct {
 	DataUnknown   bool               // any/interface{}: 无法定型
 	DataMapValue  string             // data 槽为 map[K]V 且 V 为基础类型时，V 的 JSON schema 类型（integer/string/...）；空 = 非 map 或值不可定型
 	DataInline    types.Type         // data 槽经值流收窄到的匿名结构体类型（无类型 ID，由合成器直接出 schema）；nil = 无
+	DataLiteral   types.Type         // data 槽字面量/变量的静态类型（含泛型实参），供合成器按实例化形态替换类型形参
 	DataAlts      []string           // data 槽的闭合并集（全部路径可反推、候选均为命名类型）；analyzeHits 展开为逐变体行
 	DataUnion     bool               // 本行是闭合并集中的一个变体（不再做值级收窄）
 	Binary        bool               // 文件/二进制响应：data 是 []byte（导出/下载写出，渲染挂 application/octet-stream）
@@ -272,6 +273,14 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 				hit.DataUnknown = true
 			}
 		default:
+			if al := s.genericArgType(site, pat.DataSlot); al != nil {
+				// 泛型实例化的数据体（Page[Item]）：normalizeTypeID 会把类型实参剥掉只剩命名类型 Page，
+				// 而 Page 的 `List []T` 形参元素须按实例化实参替换才能定型——先于命名类型分支处理。
+				hit.DataLiteral = al
+				hit.HasBody = true
+				hit.DataUnknown = false
+				break
+			}
 			id := normalizeTypeID(t)
 			if id != "" {
 				hit.DataTypeID = id
@@ -977,6 +986,33 @@ func (s *Slicer) sliceTypeOf(site codegraph.CallSite, slot int) types.Type {
 	c := &flowCtx{leaf: leaf, out: map[string]bool{}, visiting: map[string]bool{}}
 	s.flowValues(site.Caller, site.ArgExprs[slot], 0, c)
 	return got
+}
+
+// genericArgType data 槽实参的实例化静态类型（如 Page[Item]）：其底层是命名结构体
+// 且带类型实参时返回之，供合成器把 `List []T` 的形参元素替换为具体类型。非泛型/不可取返回 nil。
+func (s *Slicer) genericArgType(site codegraph.CallSite, slot int) types.Type {
+	if slot < 0 || slot >= len(site.ArgExprs) || site.ArgExprs[slot] == nil {
+		return nil
+	}
+	info := s.g.TypeInfoOfFunc(site.Caller)
+	if info == nil {
+		return nil
+	}
+	t := info.TypeOf(site.ArgExprs[slot])
+	if t == nil {
+		return nil
+	}
+	if p, ok := t.(*types.Pointer); ok {
+		t = p.Elem()
+	}
+	args := codegraph.TypeArgsOf(t)
+	if len(args) == 0 {
+		return nil
+	}
+	if _, ok := t.Underlying().(*types.Struct); !ok {
+		return nil
+	}
+	return t
 }
 
 // normalizeTypeID 类型串 → 可登记的命名类型 ID（去指针与泛型实参）；基础类型、切片、map、匿名类型返回空。

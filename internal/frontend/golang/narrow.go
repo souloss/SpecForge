@@ -77,6 +77,33 @@ func (b *ContractPayloadBuilder) inlineDataFact(h slicing.SinkHit) *facts.Fact {
 	return b.narrowFact(h, sc, anonShapeName, h.Site.File, h.Site.Line, "narrowed from inline struct type")
 }
 
+// instantiatedDataFact data 槽是泛型实例化结构体（Page[Item]）时，按实例化类型替换
+// `List []T` 的形参元素合成专属 schema 事实；组件名带实例化元素（PageOfItem 形态）以示区分。
+func (b *ContractPayloadBuilder) instantiatedDataFact(h slicing.SinkHit) *facts.Fact {
+	sc := b.synth.SchemaOfInstantiated(h.DataLiteral)
+	name := instantiatedTypeName(h.DataLiteral)
+	if name == "" {
+		name = anonShapeName
+	}
+	return b.narrowFact(h, sc, name, h.Site.File, h.Site.Line, "narrowed from generic instantiation")
+}
+
+// instantiatedTypeName 实例化类型的组件名主干：`svc.Page[svc.Item]` → `PageOfItem`。
+func instantiatedTypeName(t types.Type) string {
+	named, ok := t.(*types.Named)
+	if !ok {
+		base := lastSeg(t.String())
+		base = strings.NewReplacer("[", "", "]", "", " ", "", "{", "", "}", "").Replace(base)
+		return base
+	}
+	base := named.Obj().Name()
+	tl := named.TypeArgs()
+	if tl.Len() > 0 {
+		base += "Of" + lastSeg(tl.At(0).String())
+	}
+	return base
+}
+
 // narrowFact 收窄 schema 事实：ID 带形状指纹（同一 operation 内不同写出点的不同形状互不覆盖），
 // 组件名 <typeName>[Error]For<Op>。
 func (b *ContractPayloadBuilder) narrowFact(h slicing.SinkHit, sc *typeschema.Schema, typeName, file string, line int,

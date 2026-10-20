@@ -501,7 +501,13 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 		switch {
 		case h.Success:
 			// 值级收窄：data 由字面量构造且 any 部分可由字面量/字段赋值定型时，换成 operation 专属 schema。
-			if h.DataInline != nil {
+			if h.DataLiteral != nil {
+				// 泛型实例化数据体（Page[Item]）：按实例化类型替换 `List []T` 的形参元素合成 schema。
+				nf := b.instantiatedDataFact(h)
+				h.DataTypeID = strings.TrimPrefix(nf.ID, "schema:")
+				h.DataUnknown, h.HasBody = false, true
+				narrowed[h.DataTypeID] = nf
+			} else if h.DataInline != nil {
 				nf := b.inlineDataFact(h)
 				h.DataTypeID = strings.TrimPrefix(nf.ID, "schema:")
 				h.DataUnknown, h.HasBody = false, true

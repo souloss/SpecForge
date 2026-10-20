@@ -568,3 +568,115 @@ func (s *Synthesizer) FieldSchema(f codegraph.Field) *Schema {
 func (s *Synthesizer) SchemaOf(t types.Type) *Schema {
 	return s.synthGoType(t, 0)
 }
+
+// SchemaOfInstantiated 按实例化（泛型实参）类型合成 schema：字段里出现类型形参的
+// （`Page[T]` 的 `List []T`）用实例化实参替换（`Page[Item]` → `[]Item`）后再定型，
+// 把 any 形参元素收窄为具体元素 schema。
+func (s *Synthesizer) SchemaOfInstantiated(t types.Type) *Schema {
+	return s.synthNamedInstantiated(t, 0)
+}
+
+// synthNamedInstantiated 泛型实例化命名字段类型（含切片/指针包装）的合成。
+func (s *Synthesizer) synthNamedInstantiated(t types.Type, depth int) *Schema {
+	if depth > maxInlineDepth {
+		return &Schema{Unknown: true, UnknownWhy: "instantiated type nesting too deep"}
+	}
+	t = types.Unalias(t)
+	if p, ok := t.(*types.Pointer); ok {
+		return s.synthNamedInstantiated(p.Elem(), depth+1)
+	}
+	if sl, ok := t.Underlying().(*types.Slice); ok {
+		return &Schema{Type: "array", Items: s.synthNamedInstantiated(sl.Elem(), depth+1)}
+	}
+	named, ok := t.(*types.Named)
+	if !ok {
+		// 基础类型/具体切片元素（[]string）：回落常规合成。
+		return s.synthGoType(t, 0)
+	}
+	args := named.TypeArgs()
+	if args.Len() == 0 {
+		return s.Synthesize(codegraph.TypeIDOf(named))
+	}
+	ti := s.g.Type(codegraph.TypeIDOf(named))
+	if ti == nil || !ti.IsStruct {
+		return s.synthGoType(t, 0)
+	}
+	// 结构体字段：类型形参字段用实参替换类型后重新定型。
+	return s.synthTypeWithArgs(ti, named, args)
+}
+
+// synthTypeWithArgs 合成带类型实参的结构体 schema：字段类型里的类型形参按实参替换。
+func (s *Synthesizer) synthTypeWithArgs(ti *codegraph.TypeInfo, named *types.Named, args *types.TypeList) *Schema {
+	sc := &Schema{Type: "object"}
+	sub := map[*types.TypeParam]types.Type{}
+	tp := named.TypeParams()
+	for i := 0; i < tp.Len() && i < args.Len(); i++ {
+		sub[tp.At(i)] = args.At(i)
+	}
+	var required []string
+	seen := map[string]bool{}
+	var embedded []*Schema
+	for _, f := range ti.Fields {
+		if f.JSONName == "-" || (!f.Embedded && !token.IsExported(f.Name)) {
+			continue
+		}
+		if f.Embedded && !hasExplicitJSONName(f.Tag) {
+			if inner := s.embeddedSchema(f); inner != nil {
+				embedded = append(embedded, inner)
+				continue
+			}
+		}
+		fsc := s.synthFieldInst(f, sub)
+		if f.Doc != "" && fsc.Ref == "" {
+			fsc.Description = f.Doc
+		}
+		seen[f.JSONName] = true
+		req := f.Required
+		if s.request {
+			req, _ = codegraph.ConstraintRequired(f.Tag)
+		}
+		sc.Props = append(sc.Props, Prop{
+			Name: f.JSONName, Schema: fsc, Required: req, OmitEmpty: hasOmitempty(f.Tag),
+		})
+		if req {
+			required = append(required, f.JSONName)
+		}
+	}
+	for _, inner := range embedded {
+		for _, p := range inner.Props {
+			if seen[p.Name] {
+				continue
+			}
+			seen[p.Name] = true
+			sc.Props = append(sc.Props, Prop{Name: p.Name, Schema: cloneSchema(p.Schema), Required: p.Required, OmitEmpty: p.OmitEmpty})
+			if p.Required {
+				required = append(required, p.Name)
+			}
+		}
+	}
+	sort.Strings(required)
+	sc.Required = required
+	return sc
+}
+
+// synthFieldInst 带类型实参替换表的单字段合成（与 synthField 同构，类型形参字段先替换）。
+func (s *Synthesizer) synthFieldInst(f codegraph.Field, sub map[*types.TypeParam]types.Type) *Schema {
+	ft := f.Type
+	if ft != nil && len(sub) > 0 {
+		ft = codegraph.SubstituteType(ft, sub)
+	}
+	if ft != nil && codegraph.KindOf(ft) == "slice" {
+		if sl, ok := ft.Underlying().(*types.Slice); ok {
+			return &Schema{Type: "array", Items: s.synthGoType(sl.Elem(), 0)}
+		}
+	}
+	// 非形参字段：回落常规合成。
+	ff := f
+	ff.Type = ft
+	if ft != nil {
+		ff.TypeStr = ft.String()
+		ff.TypeID = codegraph.TypeIDOf(ft)
+		ff.Kind = codegraph.KindOf(ft)
+	}
+	return s.synthField(ff)
+}

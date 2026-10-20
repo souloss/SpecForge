@@ -959,6 +959,53 @@ func TypeIDOf(t types.Type) string { return typeID(t) }
 // KindOf 类型的归类（basic|slice|map|struct|any|iface|time|rawmsg|other），与 Field.Kind 同口径。
 func KindOf(t types.Type) string { return kindOf(t) }
 
+// TypeArgsOf 泛型实例化（或裸类型形参）的类型实参（`Page[Item]` → [Item]，`T` 本身 → [T]）；
+// 非泛型/无法取实参时返回 nil。用于把 `[]T` 的形参元素收窄为具体类型。
+func TypeArgsOf(t types.Type) []types.Type {
+	switch tt := t.(type) {
+	case *types.Named:
+		tl := tt.TypeArgs()
+		out := make([]types.Type, tl.Len())
+		for i := range out {
+			out[i] = tl.At(i)
+		}
+		return out
+	case *types.TypeParam:
+		return []types.Type{tt}
+	}
+	return nil
+}
+
+// SubstituteType 用替换表替换类型里的类型形参（递归切片/指针/数组元素，`[]T` → `[]Item`）。
+// 替换表由实例化类型（`Page[Item]`）的类型形参声明 → 类型实参构成。
+func SubstituteType(t types.Type, sub map[*types.TypeParam]types.Type) types.Type {
+	return substituteType(t, sub)
+}
+
+// substituteType 用替换表替换类型里的类型形参（递归切片/指针/数组元素）。
+func substituteType(t types.Type, sub map[*types.TypeParam]types.Type) types.Type {
+	if tp, ok := t.(*types.TypeParam); ok {
+		if r, ok := sub[tp]; ok {
+			return r
+		}
+		return t
+	}
+	if n, ok := t.(*types.Named); ok {
+		// 嵌套实例化 Page[Page[T]] 的深层替换少见且代价高：保守原样返回，
+		// 顶层字段类型是切片/指针（直接命中下方分支），Named 只会出现在嵌套场景。
+		return n
+	}
+	switch u := t.Underlying().(type) {
+	case *types.Slice:
+		return types.NewSlice(substituteType(u.Elem(), sub))
+	case *types.Array:
+		return types.NewArray(substituteType(u.Elem(), sub), u.Len())
+	case *types.Pointer:
+		return types.NewPointer(substituteType(u.Elem(), sub))
+	}
+	return t
+}
+
 // recvTypeIDOf 从方法符号 ID 提取接收者类型 ID。
 // "pkg.(*pkg.Recv).Method" → "pkg.Recv"；接口方法调用 ID "pkg.Iface.Method" → "pkg.Iface"。
 func recvTypeIDOf(methodID string) string {
