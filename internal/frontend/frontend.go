@@ -174,9 +174,11 @@ type StructIndex interface {
 
 // FieldSite 一个结构体序列化字段的声明位置。
 type FieldSite struct {
-	JSON string // 序列化字段名
-	File string // 声明所在文件（绝对路径）
-	Line int    // 声明行号
+	JSON     string // 序列化字段名（json tag 名，无 tag 等于源码字段名）
+	GoName   string // 源码字段名（LLM 读 Go 源码时输出的是它，需映射回 JSON 名）
+	Required bool   // 是否必填（无 omitempty 即必填）
+	File     string // 声明所在文件（绝对路径）
+	Line     int    // 声明行号
 }
 
 // Diagnoser 可选能力：前端自己的环境与仓库自检（doctor 命令）。未实现时 doctor 只做语言无关检查。

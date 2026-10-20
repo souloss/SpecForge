@@ -55,6 +55,14 @@ type Page struct {
 func Fetch() Page { return Page{} }
 
 func Paged() any { return Fetch().Result }
+
+// Row 上游响应：Go 字段名（DowJonesCaseID）与 json tag 名（dowJonesCaseId）不同，omitempty 字段可缺省。
+type Row struct {
+	CaseName   string ` + "`json:\"caseName\"`" + `
+	CaseID     string ` + "`json:\"dowJonesCaseId,omitempty\"`" + `
+}
+
+func Rows() any { return []Row{{}} }
 `
 
 // fixturePhase 在临时目录构造夹具模块并返回 LLM 阶段上下文。
@@ -218,6 +226,42 @@ func TestApplyShapesAcceptsTaggedFields(t *testing.T) {
 	ev := out.schemas[0].Evidence
 	if len(ev) != 1 || !strings.Contains(ev[0].Quote, "llm:shape-field itemCount ← ItemCount int") {
 		t.Fatalf("evidence = %+v", ev)
+	}
+}
+
+// TestApplyShapesMapsGoNameToJSONTag LLM 读 Go 源码输出 Go 字段名（CaseID）时，落 schema 应重写为
+// json tag 名（dowJonesCaseId），omitempty 字段不应标 required。
+func TestApplyShapesMapsGoNameToJSONTag(t *testing.T) {
+	lp := fixturePhase(t)
+	lp.schemas = map[string]*schema.Schema{}
+	it := shapeItem(lp, anyPayload(), "m/svc.Rows")
+	out := gapOutcome{cp: cloneContract(it.cp), minConf: 1}
+	lp.applyShapes(&out, []infer.ResolvedShape{{Gap: "s0", Shape: &infer.ShapeNode{Type: "array", Items: obj(
+		infer.ShapeProp{Name: "CaseName", Required: true, Shape: scalar("string")},
+		infer.ShapeProp{Name: "CaseID", Required: true, Shape: scalar("string")},
+	)}}}, it)
+	if out.accepted != 1 || len(out.schemas) != 1 {
+		t.Fatalf("outcome = %+v", out)
+	}
+	sc, _ := out.schemas[0].Schema()
+	item := sc.Items
+	var byName map[string]schema.Prop
+	byName = map[string]schema.Prop{}
+	for _, p := range item.Props {
+		byName[p.Name] = p
+	}
+	if _, ok := byName["CaseID"]; ok {
+		t.Fatalf("CaseID should be renamed to json tag, props=%v", item.Props)
+	}
+	p, ok := byName["dowJonesCaseId"]
+	if !ok {
+		t.Fatalf("dowJonesCaseId missing, props=%v", item.Props)
+	}
+	if p.Required {
+		t.Fatalf("omitempty field must not be required, props=%v", item.Props)
+	}
+	if !byName["caseName"].Required {
+		t.Fatalf("non-omitempty field should stay required, props=%v", item.Props)
 	}
 }
 

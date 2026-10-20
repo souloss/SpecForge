@@ -29,7 +29,7 @@ func (p *Program) JSONFieldsIn(funcIDs []string) []frontend.FieldSite {
 		for i, f := range p.g.StructFields(st) {
 			pos := p.g.Fset.Position(st.Field(i).Pos())
 			if _, dup := byName[f.JSONName]; !dup && f.JSONName != "" && f.JSONName != jsonSkipName && pos.IsValid() {
-				byName[f.JSONName] = frontend.FieldSite{JSON: f.JSONName, File: pos.Filename, Line: pos.Line}
+				byName[f.JSONName] = frontend.FieldSite{JSON: f.JSONName, GoName: f.Name, Required: f.Required, File: pos.Filename, Line: pos.Line}
 			}
 			if depth < maxStructRefDepth {
 				visit(f.Type, depth+1)

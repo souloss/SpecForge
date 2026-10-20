@@ -844,8 +844,9 @@ func (lp *llmPhase) applyShapes(out *gapOutcome, shapes []infer.ResolvedShape, i
 	}
 	text, tokens := lp.sliceText(it.sl)
 	tagged := lp.taggedFields(it.sl)
-	for name := range tagged {
-		tokens[name] = true
+	for name, tf := range tagged {
+		tokens[name] = true // Go 字段名（LLM 读源码输出）
+		tokens[tf.json] = true
 	}
 	type rowState struct {
 		sc       *schema.Schema
@@ -924,27 +925,71 @@ func (lp *llmPhase) applyShapes(out *gapOutcome, shapes []infer.ResolvedShape, i
 
 // shapeSchema 形状树 → schema（verify.Shape 做语言无关核对），并为每个字段名定位证据行：
 // 切片内字符串字面量优先，其次切片引用结构体的序列化字段声明，最后切片内标识符。
+// 字段名若命中结构体字段的 Go 名（LLM 读源码输出 Go 名），落 schema 时映射回 json tag 名，
+// required 对齐结构体声明（无 omitempty 才必填），与静态前端同口径。
 func (lp *llmPhase) shapeSchema(n *infer.ShapeNode, text string, tokens map[string]bool,
-	tagged map[string]facts.Evidence, sl sliceEvidence) (*schema.Schema, []facts.Evidence, error) {
-	sc, names, err := verify.Shape(n, text, tokens)
+	tagged map[string]taggedField, sl sliceEvidence) (*schema.Schema, []facts.Evidence, error) {
+	sc, _, err := verify.Shape(n, text, tokens)
 	if err != nil {
 		return nil, nil, err
 	}
+	jsonOf := map[string]taggedField{}
+	for goName, tf := range tagged {
+		jsonOf[goName] = tf
+		jsonOf[tf.json] = tf
+	}
 	var evs []facts.Evidence
-	for _, name := range names {
-		ev, ok := lp.findStringLit(sl, name)
-		if !ok {
-			ev, ok = tagged[name]
+	renameGoNames(sc, jsonOf)
+	collectShapeEv(lp, sl, sc, jsonOf, &evs)
+	return sc, evs, nil
+}
+
+// renameGoNames 递归把 schema 树里命中 Go 字段名的 prop 重写为 json tag 名，required 对齐结构体声明。
+func renameGoNames(sc *schema.Schema, jsonOf map[string]taggedField) {
+	if sc == nil {
+		return
+	}
+	for i := range sc.Props {
+		p := &sc.Props[i]
+		if tf, ok := jsonOf[p.Name]; ok && tf.json != p.Name {
+			p.Name = tf.json
+			p.Required = tf.required
 		}
-		if !ok {
-			ev, ok = lp.findIdent(sl, name)
-		}
-		if ok {
-			ev.Quote = "llm:shape-field " + name + " ← " + ev.Quote
-			evs = append(evs, ev)
+		renameGoNames(p.Schema, jsonOf)
+	}
+	renameGoNames(sc.Items, jsonOf)
+	required := make([]string, 0, len(sc.Props))
+	for _, p := range sc.Props {
+		if p.Required {
+			required = append(required, p.Name)
 		}
 	}
-	return sc, evs, nil
+	sort.Strings(required)
+	sc.Required = required
+}
+
+// collectShapeEv 递归收集 schema 树每个字段名的证据行（字符串字面量 / 结构体声明 / 标识符）。
+func collectShapeEv(lp *llmPhase, sl sliceEvidence, sc *schema.Schema, jsonOf map[string]taggedField, evs *[]facts.Evidence) {
+	if sc == nil {
+		return
+	}
+	for _, p := range sc.Props {
+		ev, ok := lp.findStringLit(sl, p.Name)
+		if !ok {
+			if tf, hit := jsonOf[p.Name]; hit {
+				ev, ok = tf.ev, true
+			}
+		}
+		if !ok {
+			ev, ok = lp.findIdent(sl, p.Name)
+		}
+		if ok {
+			ev.Quote = "llm:shape-field " + p.Name + " ← " + ev.Quote
+			*evs = append(*evs, ev)
+		}
+		collectShapeEv(lp, sl, p.Schema, jsonOf, evs)
+	}
+	collectShapeEv(lp, sl, sc.Items, jsonOf, evs)
 }
 
 // replaceAt 在 base 的 path 处替换为 node，返回新 schema（沿路径浅克隆，原 schema 不变）。
@@ -999,9 +1044,18 @@ func shapeHash(sc *schema.Schema) string {
 	return hex.EncodeToString(sum[:])[:shapeHashLen]
 }
 
-// taggedFields 切片函数体引用到的结构体的 JSON 字段名 → 字段声明行证据（前端无类型信息时为空）。
-func (lp *llmPhase) taggedFields(sl sliceEvidence) map[string]facts.Evidence {
-	out := map[string]facts.Evidence{}
+// taggedField 切片引用的结构体字段的元信息（键：Go 源码字段名）。
+type taggedField struct {
+	json     string         // 序列化字段名（json tag 名；LLM 读源码会输出 Go 名，需映射回它）
+	required bool           // 是否必填（无 omitempty 即必填）
+	ev       facts.Evidence // 字段声明行证据
+}
+
+// taggedFields 切片函数体引用到的结构体字段：Go 源码字段名 → 元信息。
+// LLM 读的是 Go 源码，输出的字段名是 Go 名（CaseName 而非 caseName）；text 核对允许 Go 名，
+// 落 schema 时再映射回 json tag 名、required 对齐结构体声明（见 shapeSchema）。
+func (lp *llmPhase) taggedFields(sl sliceEvidence) map[string]taggedField {
+	out := map[string]taggedField{}
 	idx, ok := lp.prog.(frontend.StructIndex)
 	if !ok {
 		return out
@@ -1009,7 +1063,13 @@ func (lp *llmPhase) taggedFields(sl sliceEvidence) map[string]facts.Evidence {
 	for _, fs := range idx.JSONFieldsIn(sl.reach) {
 		ev := lp.lineEvidence(fs.File, fs.Line, "")
 		ev.Quote = strings.TrimPrefix(ev.Quote, " ← ")
-		out[fs.JSON] = ev
+		goName := fs.GoName
+		if goName == "" {
+			goName = fs.JSON // 无 Go 名（外部前端）：退回 JSON 名
+		}
+		if _, dup := out[goName]; !dup {
+			out[goName] = taggedField{json: fs.JSON, required: fs.Required, ev: ev}
+		}
 	}
 	return out
 }
@@ -1179,6 +1239,10 @@ func (lp *llmPhase) applyCriticFindings(it criticItem, res *infer.CriticResult, 
 	cp := cloneContract(it.cp)
 	baseEv := []facts.Evidence{lp.lineEvidence(sl.snippets[0].File, sl.snippets[0].Line, "llm:critic")}
 	tagged := lp.taggedFields(sl)
+	for name, tf := range tagged {
+		tokens[name] = true
+		tokens[tf.json] = true
+	}
 	var out []*facts.Fact
 	for _, f := range res.Findings {
 		switch f.Kind {
