@@ -394,6 +394,7 @@ func extractAllRoutes(g *codegraph.Graph, fws []adapter.Framework) []adapter.Rou
 }
 
 func exprResolver(p *packages.Package) func(ast.Expr) string {
+	closures := closureReturns(p)
 	return func(e ast.Expr) string {
 		info := p.TypesInfo
 		switch x := ast.Unparen(e).(type) {
@@ -415,6 +416,14 @@ func exprResolver(p *packages.Package) func(ast.Expr) string {
 				if obj := info.Uses[fn]; obj != nil {
 					if f, ok := obj.(*types.Func); ok {
 						return f.FullName()
+					}
+					// 闭包中间件: checkPerm() 中 checkPerm 是闭包变量（types.Var），
+					// 返回内层 handler 函数（如 requireAuth）。解析到返回的函数符号，
+					// 正向可达闭包才能追到内层 header 读取。
+					if v, ok := obj.(*types.Var); ok {
+						if id := closures[v]; id != "" {
+							return id
+						}
 					}
 				}
 			}
@@ -439,6 +448,76 @@ func exprResolver(p *packages.Package) func(ast.Expr) string {
 		}
 		return ""
 	}
+}
+
+// closureReturns 收集「闭包变量 → 其返回的 handler 函数符号 ID」映射：
+// `checkPerm := func() fiber.Handler { return requireAuth() }` 里 checkPerm 是 *types.Var，
+// 路由登记 `checkPerm()` 时 exprResolver 无法按 *types.Func 解析，经此映射解析到内层 requireAuth，
+// 正向可达闭包才能追到内层 header 读取（否则 X-user 之类的鉴权头被静默漏掉）。
+func closureReturns(p *packages.Package) map[*types.Var]string {
+	out := map[*types.Var]string{}
+	info := p.TypesInfo
+	// 赋值形式：checkPerm := func() ...
+	inspect := func(lhs ast.Expr, rhs ast.Expr) {
+		id, ok := lhs.(*ast.Ident)
+		if !ok {
+			return
+		}
+		lit, ok := ast.Unparen(rhs).(*ast.FuncLit)
+		if !ok || lit.Body == nil {
+			return
+		}
+		v, ok := info.Defs[id].(*types.Var)
+		if !ok {
+			return
+		}
+		if sym := funcLitReturn(lit, info); sym != "" {
+			out[v] = sym
+		}
+	}
+	for _, f := range p.Syntax {
+		ast.Inspect(f, func(n ast.Node) bool {
+			switch d := n.(type) {
+			case *ast.AssignStmt:
+				if len(d.Lhs) == 1 && len(d.Rhs) == 1 {
+					inspect(d.Lhs[0], d.Rhs[0])
+				}
+			case *ast.GenDecl: // var checkPerm = func() ...
+				for _, spec := range d.Specs {
+					vs, ok := spec.(*ast.ValueSpec)
+					if !ok || len(vs.Names) != 1 || len(vs.Values) != 1 {
+						continue
+					}
+					inspect(vs.Names[0], vs.Values[0])
+				}
+			}
+			return true
+		})
+	}
+	return out
+}
+
+// funcLitReturn 解析闭包字面量 body 里的 return 语句，返回其表达式的被调函数符号 ID
+// （`return requireAuth()` → requireAuth；`return NewPerm(scene)` → NewPerm）。
+// 嵌套内层匿名函数（`return func(c *fiber.Ctx) error {...}`）本身不是可追踪符号，跳过。
+func funcLitReturn(lit *ast.FuncLit, info *types.Info) string {
+	var found string
+	ast.Inspect(lit.Body, func(n ast.Node) bool {
+		if found != "" {
+			return false
+		}
+		rs, ok := n.(*ast.ReturnStmt)
+		if !ok || len(rs.Results) != 1 {
+			return true
+		}
+		if call, ok := ast.Unparen(rs.Results[0]).(*ast.CallExpr); ok {
+			if callee, _ := codegraph.ResolveCallee(call, info); callee != "" {
+				found = callee
+			}
+		}
+		return true
+	})
+	return found
 }
 
 func argTypesOf(p *packages.Package) func(*ast.CallExpr) []string {
