@@ -54,6 +54,11 @@ var notFuncNames = map[string]bool{"if": true, "for": true, "while": true, "swit
 // callPattern 调用点：标识符后紧跟左括号。
 var callPattern = regexp.MustCompile(`([A-Za-z_$][\w$]*)\s*\(`)
 
+// constPattern 常量字符串声明（`const HeaderTrace = "X-Trace"` / `const X = '…'`）。
+// 通用前端无类型信息，LLM 常把常量名当 header 参数名；这里建立「常量名 → 字符串值」索引，
+// 供参数核对把常量引用（`c.Get(HeaderTrace)`）解析为真实参数名（`X-Trace`）。
+var constPattern = regexp.MustCompile(`^\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*["'` + "`" + `]([^"'` + "`" + `]*)["'` + "`" + `]`)
+
 // maxRegionLines 单个函数区域的最大行数（超长截断，防止括号失配吞掉整个文件）。
 const maxRegionLines = 300
 
@@ -80,6 +85,9 @@ type Program struct {
 	lines map[string][]string // 文件 → 行
 	hash  map[string]string   // 文件 → 内容指纹
 
+	consts   map[string]string // 常量名 → 字符串值（源码中 const/let/var 的字符串声明，header 参数名解析用）
+	constsMu sync.Mutex        // 保护 consts（惰性构建）
+
 	defsOnce sync.Once        // 定义表惰性构建
 	defs     []Def            // 全部定义（按 ID 有序）
 	byName   map[string][]Def // 名字 → 定义
@@ -92,7 +100,7 @@ func NewProgram(root string) (*Program, error) {
 	if err != nil {
 		return nil, err
 	}
-	p := &Program{root: abs, lines: map[string][]string{}, hash: map[string]string{}}
+	p := &Program{root: abs, lines: map[string][]string{}, hash: map[string]string{}, consts: map[string]string{}}
 	err = filepath.WalkDir(abs, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -478,3 +486,28 @@ func (p *Program) FindSymbols(query string) []string {
 
 // FieldTypes 实现 frontend.Program：文本视图不提供字段类型。
 func (p *Program) FieldTypes() map[string]string { return map[string]string{} }
+
+// ConstValue 返回常量名的字符串值（`HeaderTrace` → `X-Trace`）；非字符串常量或未声明返回空。
+func (p *Program) ConstValue(name string) string {
+	p.buildConsts()
+	return p.consts[name]
+}
+
+// buildConsts 扫描全部源码行建立「常量名 → 字符串值」索引（惰性，只建一次）。
+func (p *Program) buildConsts() {
+	p.constsMu.Lock()
+	defer p.constsMu.Unlock()
+	if p.consts != nil && len(p.consts) > 0 {
+		return
+	}
+	if p.consts == nil {
+		p.consts = map[string]string{}
+	}
+	for _, f := range p.files {
+		for _, line := range p.load(f) {
+			if m := constPattern.FindStringSubmatch(line); m != nil {
+				p.consts[m[1]] = m[2]
+			}
+		}
+	}
+}

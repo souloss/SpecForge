@@ -557,6 +557,13 @@ func buildFacts(prog *Program, r route, o opOutcome) ([]*facts.Fact, int) {
 			pathSeen[p.Name] = true
 		}
 		typ := verify.ScalarType(p.Type)
+		// header 参数名以常量引用给出（c.Get(HeaderTrace)）：LLM 只看到标识符会把它当参数名，
+		// 有常量字符串值（X-Trace）时用值替换，避免常量名幻觉。
+		if p.In == "header" && p.Name != "" {
+			if v := prog.ConstValue(p.Name); v != "" && v != p.Name {
+				p.Name = v
+			}
+		}
 		// 参数级约束核对：enum/pattern 字面量须出现在源码；format 取封闭集合。
 		for _, v := range p.Enum {
 			if !verify.NameInSource(v, o.text, tokens) {
