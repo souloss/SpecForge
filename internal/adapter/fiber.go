@@ -41,6 +41,7 @@ var Fiber Framework = routerFramework{
 		Writers: []Writer{
 			{Symbol: fiberCtx("JSON"), BodyArg: 0, StatusArg: NoArg, DefaultStatus: defaultOKStatus},
 			{Symbol: fiberCtx("XML"), BodyArg: 0, StatusArg: NoArg, DefaultStatus: defaultOKStatus},
+			{Symbol: fiberCtx("Send"), BodyArg: 0, StatusArg: NoArg, DefaultStatus: defaultOKStatus},
 			{Symbol: fiberCtx("SendStream"), BodyArg: 0, StatusArg: NoArg, DefaultStatus: defaultOKStatus},
 			{Symbol: fiberCtx("SendFile"), BodyArg: 0, StatusArg: NoArg, DefaultStatus: defaultOKStatus},
 		},

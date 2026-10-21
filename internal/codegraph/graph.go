@@ -320,8 +320,59 @@ func (g *Graph) buildPkg(p *packages.Package) {
 			g.funcDeclPkg[callerID] = p
 			g.Syms[callerID].Doc = g.docForFuncDecl(p, fd, info)
 			g.walkCalls(callerID, fd, info)
+			g.registerInlineFuncs(p, fd, info)
 		}
 	}
+}
+
+// inlineFuncIDPrefix 内联函数符号 ID 的前缀段（区别于包级函数，冲突概率低）。
+const inlineFuncIDPrefix = "inline#"
+
+// inlineFuncName 内联函数符号里嵌的「宿主函数名」，用于类型信息定位（不参与 ID 唯一性）。
+const inlineFuncName = "closure"
+
+// InlineFuncID 由宿主函数与闭包字面量位置构造内联函数符号 ID：
+// "<pkg>/<file>:<line>#closure" —— file:line 是闭包在源码里的唯一位置。
+func InlineFuncID(host string, lit *ast.FuncLit, fset *token.FileSet) string {
+	if lit == nil || fset == nil {
+		return ""
+	}
+	pos := fset.Position(lit.Pos())
+	if !pos.IsValid() {
+		return ""
+	}
+	return inlineFuncIDPrefix + host + ":" + strconv.Itoa(pos.Line) + "#" + inlineFuncName
+}
+
+// registerInlineFuncs 把函数体内直接声明的闭包（func(...){...}）注册为内联函数符号：
+// 路由登记 `app.Get("/", func(ctx){...})` 时末参是闭包字面量，之前解析不到符号 → no-handler。
+// 现在给每个闭包一个稳定 ID 并注册其调用边，正向可达闭包才能扫到闭包内的写出口。
+func (g *Graph) registerInlineFuncs(p *packages.Package, host *ast.FuncDecl, info *types.Info) {
+	hostID := g.funcDeclIDQuiet(p, host)
+	if hostID == "" {
+		return
+	}
+	ast.Inspect(host.Body, func(n ast.Node) bool {
+		lit, ok := n.(*ast.FuncLit)
+		if !ok || lit.Body == nil {
+			return true
+		}
+		id := InlineFuncID(hostID, lit, g.Fset)
+		if id == "" || g.funcDecls[id] != nil {
+			return true
+		}
+		// 用闭包字面量构造一个「函数体视图」：把闭包 body 包成 FuncDecl 供 FuncDeclOf / walkCalls 使用。
+		closureDecl := &ast.FuncDecl{
+			Type: &ast.FuncType{Params: lit.Type.Params, Results: lit.Type.Results},
+			Body: lit.Body,
+		}
+		g.funcDecls[id] = closureDecl
+		g.funcDeclPkg[id] = p
+		g.Syms[id] = &Symbol{ID: id, Kind: KindFunc, Pkg: p.PkgPath,
+			File: g.Fset.Position(lit.Pos()).Filename, Line: g.Fset.Position(lit.Pos()).Line}
+		g.walkCalls(id, closureDecl, info)
+		return true
+	})
 }
 
 // funcDeclID 由语法+类型信息确定函数符号 ID。

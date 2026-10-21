@@ -398,6 +398,11 @@ func exprResolver(p *packages.Package) func(ast.Expr) string {
 	return func(e ast.Expr) string {
 		info := p.TypesInfo
 		switch x := ast.Unparen(e).(type) {
+		case *ast.FuncLit:
+			// 内联闭包 handler：app.Get("/", func(ctx){...}) 的末参是闭包字面量。
+			// 按代码图里为它注册的内联符号 ID 返回（registerInlineFuncs），
+			// 正向可达闭包才能扫到闭包体内的写出口（ctx.Send/ctx.JSON）。
+			return inlineFuncIDOf(p, x)
 		case *ast.CallExpr:
 			// 中间件构造器调用: auth.GetUserRelation() → 被调符号
 			switch fn := x.Fun.(type) {
@@ -448,6 +453,36 @@ func exprResolver(p *packages.Package) func(ast.Expr) string {
 		}
 		return ""
 	}
+}
+
+// inlineFuncIDOf 求内联闭包字面量在代码图里的符号 ID（与 codegraph.registerInlineFuncs 同口径）。
+// hostID 取闭包所在顶层函数/方法的符号 ID（与 codegraph.funcDeclIDQuiet 一致）。
+func inlineFuncIDOf(p *packages.Package, lit *ast.FuncLit) string {
+	hostID := ""
+	pos := lit.Pos()
+	for _, f := range p.Syntax {
+		for _, d := range f.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil || !(fd.Pos() <= pos && pos < fd.End()) {
+				continue
+			}
+			if fd.Recv != nil && len(fd.Recv.List) > 0 && p.TypesInfo != nil {
+				if recvT := p.TypesInfo.TypeOf(fd.Recv.List[0].Type); recvT != nil {
+					hostID = fmt.Sprintf("%s.(*%s).%s", p.PkgPath, fullTypeID(recvT), fd.Name.Name)
+				}
+			} else {
+				hostID = p.PkgPath + "." + fd.Name.Name
+			}
+			break
+		}
+		if hostID != "" {
+			break
+		}
+	}
+	if hostID == "" {
+		return ""
+	}
+	return codegraph.InlineFuncID(hostID, lit, p.Fset)
 }
 
 // closureReturns 收集「闭包变量 → 其返回的 handler 函数符号 ID」映射：
