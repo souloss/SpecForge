@@ -484,9 +484,9 @@ func writeDiscoveredBody(w func(string, ...interface{}), p4 string, r ResponseOu
 	variants := r.Variants
 	if len(variants) == 0 {
 		variants = []BodyVariant{{SchemaName: r.SchemaName, ArrayElem: r.ArrayElem, MapValueType: r.MapValueType,
-			EnvelopeName: r.EnvelopeName, DataField: r.DataField, Raw: r.Raw}}
+			ScalarType: r.ScalarType, EnvelopeName: r.EnvelopeName, DataField: r.DataField, Raw: r.Raw}}
 		if !r.HasBody {
-			variants[0].SchemaName, variants[0].ArrayElem, variants[0].MapValueType = "", "", ""
+			variants[0].SchemaName, variants[0].ArrayElem, variants[0].MapValueType, variants[0].ScalarType = "", "", "", ""
 		}
 	}
 	if len(variants) == 1 && variants[0].Raw && !variants[0].hasData() {

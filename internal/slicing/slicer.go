@@ -286,6 +286,11 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 			if id != "" {
 				hit.DataTypeID = id
 				hit.HasBody = true
+			} else if st := scalarTypeStr(t); st != "" {
+				// 标量类型串（string/int/float/bool）：直接定型为标量业务体。
+				hit.ScalarType = st
+				hit.HasBody = true
+				hit.DataUnknown = false
 			} else {
 				// map[K]V 且 V 为基础类型时，静态可定型为 additionalProperties；
 				// 否则才标 DataUnknown（真 any）。
@@ -1442,4 +1447,23 @@ func mapValueType(typeStr string) (string, bool) {
 		return "object", true
 	}
 	return "", false
+}
+
+// scalarTypeStr 类型串是否为 JSON 基础标量（string/integer/number/boolean 的 Go 映射），
+// 返回 JSON schema 类型名；非标量返回空。
+func scalarTypeStr(typeStr string) string {
+	val := strings.TrimSpace(typeStr)
+	val = strings.TrimPrefix(val, "*")
+	switch val {
+	case "string":
+		return "string"
+	case "int", "int8", "int16", "int32", "int64",
+		"uint", "uint8", "uint16", "uint32", "uint64", "uintptr":
+		return "integer"
+	case "float32", "float64":
+		return "number"
+	case "bool":
+		return "boolean"
+	}
+	return ""
 }
