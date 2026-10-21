@@ -90,6 +90,7 @@ type ResponseOut struct {
 	ArrayElem     string   `json:"array_elem"`     // 切片响应: data 为 array，元素 $ref 名
 	HasBody       bool     `json:"has_body"`       // 是否有响应体
 	MapValueType  string   `json:"map_value_type"` // map[K]V 响应: data 为 additionalProperties map，值类型
+	ScalarType    string   `json:"scalar_type"`    // 标量响应体类型（string/integer/number/boolean）：data 直接渲染标量
 	Sinks         []string `json:"sinks"`          // 写出点 file:line
 	EnvelopeName  string   `json:"envelope"`       // 真实信封结构体的 $ref 名（空 = profile 信封 code/msg/data）
 	DataField     string   `json:"data_field"`     // 真实信封中承载业务体的字段 JSON 名（成功行 allOf 收窄）
@@ -103,6 +104,7 @@ type BodyVariant struct {
 	SchemaName   string `json:"schema"`         // 业务体 $ref 名
 	ArrayElem    string `json:"array_elem"`     // 数组业务体的元素 $ref 名
 	MapValueType string `json:"map_value_type"` // map 业务体的值类型
+	ScalarType   string `json:"scalar_type"`    // 标量业务体（string/integer/number/boolean）：data 直接渲染标量
 	EnvelopeName string `json:"envelope"`       // 信封 $ref 名
 	DataField    string `json:"data_field"`     // 信封中承载业务体的字段
 	Raw          bool   `json:"raw"`            // 原生写出（无信封）
@@ -128,7 +130,7 @@ func (g *ResponseOut) settlePrimary() {
 		return
 	}
 	v := g.Variants[0]
-	g.SchemaName, g.ArrayElem, g.MapValueType = v.SchemaName, v.ArrayElem, v.MapValueType
+	g.SchemaName, g.ArrayElem, g.MapValueType, g.ScalarType = v.SchemaName, v.ArrayElem, v.MapValueType, v.ScalarType
 	g.EnvelopeName, g.DataField, g.Raw = v.EnvelopeName, v.DataField, g.Raw || v.Raw
 	g.HasBody = g.HasBody || v.hasData()
 	if len(g.Variants) == 1 {
@@ -138,7 +140,7 @@ func (g *ResponseOut) settlePrimary() {
 
 // hasData 变体是否带业务体。
 func (v BodyVariant) hasData() bool {
-	return v.SchemaName != "" || v.ArrayElem != "" || v.MapValueType != ""
+	return v.SchemaName != "" || v.ArrayElem != "" || v.MapValueType != "" || v.ScalarType != ""
 }
 
 // NamedSchema 命名 schema。
@@ -315,6 +317,7 @@ func Compile(in Input) (*Document, error) {
 				}
 			}
 			v.MapValueType = r.MapValueType
+			v.ScalarType = r.ScalarType
 			if ref, ok := refOf[r.EnvelopeType]; ok && r.EnvelopeType != "" {
 				v.EnvelopeName = ref
 			}

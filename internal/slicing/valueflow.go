@@ -333,7 +333,10 @@ func (s *Slicer) flowValues(fnID string, e ast.Expr, depth int, c *flowCtx) {
 		}
 		c.visiting[key] = true
 		s.assignedValues(fnID, fd, info, v, depth, c)
-	case *ast.CompositeLit, *ast.UnaryExpr:
+	case *ast.UnaryExpr:
+		// 取地址/解引用包裹：`return &rsp{...}` / `*x` 剥掉一层继续反推。
+		s.flowValues(fnID, x.X, depth, c)
+	case *ast.CompositeLit:
 		// 由入参拼出的值（如 `&Error{Code: code}`）：不可反推的原因在调用方传参，归因到调用点。
 		c.markOpaqueBubble(s.g, e.Pos(), exprLabel(e))
 	case *ast.SelectorExpr:

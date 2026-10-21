@@ -56,7 +56,7 @@ func graphFromFacts(items []*facts.Fact) *contract.Graph {
 				op.RequestBody = append(op.RequestBody, contract.Candidate[contract.RequestBody]{Value: value, Evidence: evidence, Confidence: fact.Confidence, Status: status})
 			}
 			for _, response := range payload.Responses {
-				value := contract.Response{Status: itoa(response.Status), Description: response.Description, ContentType: response.ContentType, Schema: response.SchemaType, Envelope: response.EnvelopeType, DataField: response.DataField, MapValueType: response.MapValueType, HasBody: response.HasBody || response.SchemaType != "" || response.ContentType != "", Raw: response.Raw, Failure: response.Failure, Sink: response.Sink, ErrSource: response.ErrSource}
+				value := contract.Response{Status: itoa(response.Status), Description: response.Description, ContentType: response.ContentType, Schema: response.SchemaType, Envelope: response.EnvelopeType, DataField: response.DataField, MapValueType: response.MapValueType, ScalarType: response.ScalarType, HasBody: response.HasBody || response.SchemaType != "" || response.ContentType != "", Raw: response.Raw, Failure: response.Failure, Sink: response.Sink, ErrSource: response.ErrSource}
 				if response.Envelope != nil {
 					value.Code = response.Envelope.Code
 					value.CodeKnown = true

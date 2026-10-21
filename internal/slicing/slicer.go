@@ -35,6 +35,7 @@ type SinkHit struct {
 	DataMapValue  string             // data 槽为 map[K]V 且 V 为基础类型时，V 的 JSON schema 类型（integer/string/...）；空 = 非 map 或值不可定型
 	DataInline    types.Type         // data 槽经值流收窄到的匿名结构体类型（无类型 ID，由合成器直接出 schema）；nil = 无
 	DataLiteral   types.Type         // data 槽字面量/变量的静态类型（含泛型实参），供合成器按实例化形态替换类型形参
+	ScalarType    string             // data 槽经值流反推为标量时的 JSON 类型（string/integer/number/boolean）；空 = 非标量
 	DataAlts      []string           // data 槽的闭合并集（全部路径可反推、候选均为命名类型）；analyzeHits 展开为逐变体行
 	DataUnion     bool               // 本行是闭合并集中的一个变体（不再做值级收窄）
 	Binary        bool               // 文件/二进制响应：data 是 []byte（导出/下载写出，渲染挂 application/octet-stream）
@@ -298,6 +299,33 @@ func (s *Slicer) analyzeHit(site codegraph.CallSite, reach map[string]int, handl
 					// any 槽反推出基础元素切片（[]string/[]int...）：按内联数组类型合成 array schema。
 					hit.DataInline = refined
 					hit.HasBody = true
+				} else if refined != nil && isBasicScalar(refined) {
+					// any 槽反推出基础标量（string/int/float/bool）：直接定型为标量业务体。
+					hit.ScalarType = jsonScalarType(refined)
+					hit.HasBody = true
+					hit.DataUnknown = false
+				} else if refined != nil {
+					if isAnonStruct(refined) {
+						hit.DataInline = refined
+						hit.HasBody = true
+					} else if isBasicSlice(refined) {
+						// []基础类型（[]string/[]int...）：内联合成 array schema。
+						hit.DataInline = refined
+						hit.HasBody = true
+						hit.DataUnknown = false
+					} else if sl, ok := refined.Underlying().(*types.Slice); ok {
+						// 切片但元素是命名类型：登记为数组 schema。
+						elem := codegraph.TypeIDOf(sl.Elem())
+						if elem != "" && s.g.Type(elem) != nil {
+							hit.DataTypeID = "[]" + elem
+							hit.HasBody = true
+							hit.DataUnknown = false
+						} else {
+							hit.DataUnknown = true
+						}
+					} else {
+						hit.DataUnknown = true
+					}
 				} else {
 					hit.DataUnknown = true
 				}
@@ -781,6 +809,43 @@ func isBasicSlice(t types.Type) bool {
 	}
 	_, ok = types.Unalias(sl.Elem()).(*types.Basic)
 	return ok
+}
+
+// isBasicScalar 类型是否为 JSON 基础标量（string/integer/number/boolean 的 Go 映射）。
+// any 槽经值流反推出标量时（Ping 的 `return "ok"`）据此定型为标量业务体。
+func isBasicScalar(t types.Type) bool {
+	b, ok := types.Unalias(t).(*types.Basic)
+	if !ok {
+		return false
+	}
+	switch b.Kind() {
+	case types.String, types.Bool,
+		types.Int, types.Int8, types.Int16, types.Int32, types.Int64,
+		types.Uint, types.Uint8, types.Uint16, types.Uint32, types.Uint64,
+		types.Float32, types.Float64:
+		return true
+	}
+	return false
+}
+
+// jsonScalarType 基础标量类型 → JSON schema 类型名（与 typeschema.basicSchema 同口径）。
+func jsonScalarType(t types.Type) string {
+	b, ok := types.Unalias(t).(*types.Basic)
+	if !ok {
+		return ""
+	}
+	switch b.Kind() {
+	case types.String:
+		return "string"
+	case types.Bool:
+		return "boolean"
+	case types.Int, types.Int8, types.Int16, types.Int32, types.Int64,
+		types.Uint, types.Uint8, types.Uint16, types.Uint32, types.Uint64:
+		return "integer"
+	case types.Float32, types.Float64:
+		return "number"
+	}
+	return ""
 }
 
 // isByteSliceType 类型串是否为 []byte/[]uint8（文件/二进制响应的 data 实参）。

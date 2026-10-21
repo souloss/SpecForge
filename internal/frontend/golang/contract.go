@@ -582,6 +582,9 @@ func (b *ContractPayloadBuilder) responseMatrix(hits []slicing.SinkHit) (
 				// map[K]V 且 V 为基础类型：静态定型为 additionalProperties map（§7.2.3），
 				// 不进 components，编译期直接展开。
 				row.MapValueType = h.DataMapValue
+			} else if h.ScalarType != "" {
+				// 标量业务体（any 槽反推出 string/int/…）：编译期直接渲染标量 schema。
+				row.ScalarType = h.ScalarType
 			}
 			if h.DataUnknown && !failure {
 				row.SchemaType = ""

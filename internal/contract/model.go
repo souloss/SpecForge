@@ -140,6 +140,7 @@ type Response struct {
 	Envelope     string `json:"envelope,omitempty"`
 	DataField    string `json:"data_field,omitempty"`
 	MapValueType string `json:"map_value_type,omitempty"`
+	ScalarType   string `json:"scalar_type,omitempty"`
 	Code         int    `json:"code,omitempty"`
 	CodeKnown    bool   `json:"code_known,omitempty"`
 	HasBody      bool   `json:"has_body,omitempty"`

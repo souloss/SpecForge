@@ -56,7 +56,7 @@ func factsFromGraph(graph *contract.Graph) ([]*facts.Fact, map[string]*schema.Sc
 			candidates := operation.Responses[status]
 			for _, candidate := range candidates {
 				response := candidate.Value
-				row := facts.ResponseFact{Status: atoi(status), Description: response.Description, ContentType: response.ContentType, SchemaType: response.Schema, EnvelopeType: response.Envelope, DataField: response.DataField, MapValueType: response.MapValueType, HasBody: response.HasBody, Raw: response.Raw, Failure: response.Failure, Sink: response.Sink, ErrSource: response.ErrSource}
+				row := facts.ResponseFact{Status: atoi(status), Description: response.Description, ContentType: response.ContentType, SchemaType: response.Schema, EnvelopeType: response.Envelope, DataField: response.DataField, MapValueType: response.MapValueType, ScalarType: response.ScalarType, HasBody: response.HasBody, Raw: response.Raw, Failure: response.Failure, Sink: response.Sink, ErrSource: response.ErrSource}
 				if response.CodeKnown {
 					row.Envelope = &facts.Envelope{Code: response.Code, Msg: response.Description}
 				}

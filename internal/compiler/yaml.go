@@ -202,6 +202,9 @@ func writeOperation(w func(string, ...interface{}), b *strings.Builder, op Opera
 					w("%s          type: object\n", p4)
 					w("%s          additionalProperties:\n", p4)
 					w("%s            type: %s\n", p4, r.MapValueType)
+				} else if r.HasBody && r.ScalarType != "" {
+					w("%s        data:\n", p4)
+					w("%s          type: %s\n", p4, r.ScalarType)
 				}
 			}
 			if len(r.Sinks) > 0 {
@@ -537,7 +540,7 @@ func writeVariant(w func(string, ...interface{}), p5 string, v BodyVariant) {
 	}
 }
 
-// writeDataSchema 业务体 schema：切片 → array+items，map → additionalProperties，其余 → $ref。
+// writeDataSchema 业务体 schema：切片 → array+items，map → additionalProperties，标量 → type，其余 → $ref。
 func writeDataSchema(w func(string, ...interface{}), p string, r BodyVariant) {
 	switch {
 	case r.ArrayElem != "":
@@ -550,5 +553,7 @@ func writeDataSchema(w func(string, ...interface{}), p string, r BodyVariant) {
 		w("%stype: object\n", p)
 		w("%sadditionalProperties:\n", p)
 		w("%s  type: %s\n", p, r.MapValueType)
+	case r.ScalarType != "":
+		w("%stype: %s\n", p, r.ScalarType)
 	}
 }

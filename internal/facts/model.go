@@ -174,6 +174,8 @@ type ResponseFact struct {
 	// MapValueType data 槽为 map[K]V 且 V 为基础类型时，V 的 JSON schema 类型
 	// （integer/string/...）；空 = 非 map 或值不可定型。用于编译 additionalProperties map。
 	MapValueType string `yaml:"mapValueType,omitempty"`
+	// ScalarType data 槽为标量（string/int/float/bool）时的 JSON schema 类型；空 = 非标量。
+	ScalarType string `yaml:"scalarType,omitempty"`
 	// EnvelopeType 真实信封结构体类型 ID（包装器自动发现）；空 = profile 信封（code/msg/data）或无信封。
 	EnvelopeType string `yaml:"envelopeType,omitempty"`
 	// DataField 信封中承载 data 的字段 JSON 名（成功行用 allOf 将其收窄为具体 schema）。

@@ -266,15 +266,27 @@ func variantBodies(r compiler.ResponseOut) []string {
 		}
 		return ""
 	}
+	scalar := func(s string) string {
+		if s != "" {
+			return "scalar:" + s
+		}
+		return ""
+	}
 	var out []string
 	for _, v := range r.Variants {
 		if n := name(v.SchemaName, v.ArrayElem, v.MapValueType); n != "" && !slices.Contains(out, n) {
 			out = append(out, n)
 		}
+		if s := scalar(v.ScalarType); s != "" && !slices.Contains(out, s) {
+			out = append(out, s)
+		}
 	}
 	if len(out) == 0 {
 		if n := name(r.SchemaName, r.ArrayElem, r.MapValueType); n != "" {
 			out = append(out, n)
+		}
+		if s := scalar(r.ScalarType); s != "" {
+			out = append(out, s)
 		}
 	}
 	return out
