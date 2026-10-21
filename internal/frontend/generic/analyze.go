@@ -324,6 +324,7 @@ func discover(ctx context.Context, req frontend.Request, prog *Program, files []
 		lists[i], errs[i] = infer.DiscoverRoutes(ctx, req.Provider,
 			infer.RouteTask{File: prog.RelPath(chunks[i].file), Lines: chunks[i].text})
 		if errs[i] != nil {
+			req.Log.Debug("路由发现分块重试", "file", prog.RelPath(chunks[i].file), "err", errs[i])
 			lists[i], errs[i] = infer.DiscoverRoutes(ctx, req.Provider,
 				infer.RouteTask{File: prog.RelPath(chunks[i].file), Lines: chunks[i].text})
 		}
