@@ -226,9 +226,15 @@ func TestSplitRouteBlocks(t *testing.T) {
 	if len(blocks) < 2 {
 		t.Fatalf("splitRouteBlocks = %d blocks, want >= 2", len(blocks))
 	}
+	lines := prog.FileLines(file)
 	for _, blk := range blocks {
-		if !strings.Contains(strings.Join(blk, "\n"), "func Router()") {
-			t.Fatalf("each block must carry the file header (mount prefix context), got %q", blk)
+		var joined strings.Builder
+		for _, i := range blk {
+			joined.WriteString(lines[i])
+			joined.WriteString("\n")
+		}
+		if !strings.Contains(joined.String(), "func Router()") {
+			t.Fatalf("each block must carry the file header (mount prefix context), got %q", joined.String())
 		}
 	}
 }

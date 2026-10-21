@@ -232,6 +232,18 @@ func numbered(lines []string) string {
 	return b.String()
 }
 
+// numberedIdx 按原始行号输出指定行（分块后仍保留源码真实行号，verifyRoute 才能按行号核对注册行）。
+func numberedIdx(lines []string, idx []int) string {
+	var b strings.Builder
+	for _, i := range idx {
+		if i < 0 || i >= len(lines) {
+			continue
+		}
+		fmt.Fprintf(&b, "%d| %s\n", i+1, lines[i])
+	}
+	return b.String()
+}
+
 // runPool 以 conc 个 worker 执行 n 个任务（结果由调用方按下标写入，顺序与并发无关）。
 func runPool(ctx context.Context, n, conc int, work func(i int)) {
 	jobs := make(chan int)
@@ -300,15 +312,21 @@ func discover(ctx context.Context, req frontend.Request, prog *Program, files []
 	}
 	var chunks []chunk
 	for i, f := range files {
-		for _, lines := range splitRouteBlocks(prog, f) {
-			chunks = append(chunks, chunk{file: f, idx: i, text: numbered(lines)})
+		for _, blk := range splitRouteBlocks(prog, f) {
+			chunks = append(chunks, chunk{file: f, idx: i, text: numberedIdx(prog.FileLines(f), blk)})
 		}
 	}
 	lists := make([]*infer.RouteList, len(chunks))
 	errs := make([]error, len(chunks))
 	runPool(ctx, len(chunks), conc, func(i int) {
+		// 首次请求失败（通常是网关慢超时）重试一次：真实网关的瞬时超时不应整块丢路由。
+		// 重试仍失败才记 err，交由下游按「该块失败」处理。
 		lists[i], errs[i] = infer.DiscoverRoutes(ctx, req.Provider,
 			infer.RouteTask{File: prog.RelPath(chunks[i].file), Lines: chunks[i].text})
+		if errs[i] != nil {
+			lists[i], errs[i] = infer.DiscoverRoutes(ctx, req.Provider,
+				infer.RouteTask{File: prog.RelPath(chunks[i].file), Lines: chunks[i].text})
+		}
 	})
 	var st frontend.StepStats
 	var out []route
@@ -359,10 +377,11 @@ const routeBlockTarget = 80
 
 // splitRouteBlocks 把一个文件按路由注册行切片：命中的注册行群聚成块，块间插入参考上下文
 // （文件头 import 与挂载前缀行），使每块都能独立判定挂载前缀。无命中行时整文件作为一块。
+// 返回各块的「原始行下标」（0-based），分块仍保留真实行号（供 verifyRoute 核对）。
 //
 // 密集注册的 router 文件（几十条路由集中在一处）单次 LLM 调用易超时或漏报，
 // 切成小批独立请求，单块失败只丢该块、其余块照常解析。
-func splitRouteBlocks(prog *Program, file string) [][]string {
+func splitRouteBlocks(prog *Program, file string) [][]int {
 	lines := prog.FileLines(file)
 	var hitIdx []int
 	for i, l := range lines {
@@ -370,24 +389,28 @@ func splitRouteBlocks(prog *Program, file string) [][]string {
 			hitIdx = append(hitIdx, i)
 		}
 	}
-	if len(hitIdx) == 0 || len(hitIdx) <= routeBlockTarget {
-		return [][]string{lines}
+	if len(hitIdx) == 0 {
+		all := make([]int, len(lines))
+		for i := range all {
+			all[i] = i
+		}
+		return [][]int{all}
 	}
 	// 文件头（import / 包声明 / 挂载前缀，位于首个注册行之前）作为每块共享上下文。
-	header := lines
-	if hitIdx[0] > 0 {
-		header = lines[:hitIdx[0]]
+	var header []int
+	for i := 0; i < hitIdx[0]; i++ {
+		header = append(header, i)
 	}
-	// 只把命中的注册行并入块；非命中的注释/空行/无关语句不进块（避免把纯注释行当路由）。
-	var blocks [][]string
-	var cur []string
+	// 命中行超过单块上限时切块；只把命中的注册行并入块（注释/无关语句不进块）。
+	var blocks [][]int
+	var cur []int
 	cur = append(cur, header...)
 	for _, i := range hitIdx {
-		if len(cur) >= routeBlockTarget {
+		if len(cur)-len(header) >= routeBlockTarget {
 			blocks = append(blocks, cur)
-			cur = append([]string(nil), header...)
+			cur = append([]int(nil), header...)
 		}
-		cur = append(cur, lines[i])
+		cur = append(cur, i)
 	}
 	if len(cur) > len(header) {
 		blocks = append(blocks, cur)
@@ -524,6 +547,14 @@ func extract(ctx context.Context, req frontend.Request, prog *Program, routes []
 			AllowedFields: []string{"params", "requestBody", "responses"},
 			Method:        r.method, Path: r.path, Sources: src,
 		}, tools)
+		if o.err != nil {
+			// 契约抽取失败（网关慢超时等瞬时错误）重试一次；重试仍失败才降级为「仅保留路由」。
+			o.contract, o.err = infer.ExtractContract(ctx, req.Provider, infer.ContractTask{
+				Source: "generic", Operation: r.method + " " + r.path,
+				AllowedFields: []string{"params", "requestBody", "responses"},
+				Method:        r.method, Path: r.path, Sources: src,
+			}, tools)
+		}
 		outs[i] = o
 		doneMu.Lock()
 		done++
