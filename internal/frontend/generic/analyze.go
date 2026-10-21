@@ -72,6 +72,11 @@ var verbHint = regexp.MustCompile(`(?i)\b(get|post|put|delete|patch|route|mappin
 // stringLiteral 源码行中的字符串字面量（内容为捕获组 1/2/3）。
 var stringLiteral = regexp.MustCompile("\"([^\"]*)\"|'([^']*)'|`([^`]*)`")
 
+// groupDeclPattern 路由组/挂载声明行（app.Group("/x") / express.Router() / app.use("/x", r)）：
+// 分块时这些行必须作为每块共享上下文，否则 LLM 看不到 `pressMock := app.Group(...)` 声明，
+// 会把 pressMock 路由的前缀猜错（挂到别的组上）。
+var groupDeclPattern = regexp.MustCompile(`(?i)(\.Group\(|\.use\(|Router\(\))`)
+
 // pathParam 各框架的路径参数写法：:id、{id}、{id:int}、<id>、<int:id>。
 var pathParam = regexp.MustCompile(`:([A-Za-z_]\w*)|\{([A-Za-z_]\w*)(?::[^}]*)?\}|<(?:[A-Za-z_]\w*:)?([A-Za-z_]\w*)>`)
 
@@ -244,6 +249,21 @@ func numberedIdx(lines []string, idx []int) string {
 	return b.String()
 }
 
+// uniqInts 去重并升序排列（splitRouteBlocks 的共享头行号）。
+func uniqInts(in []int) []int {
+	if len(in) < 2 {
+		return in
+	}
+	sort.Ints(in)
+	out := in[:1]
+	for _, v := range in[1:] {
+		if v != out[len(out)-1] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // runPool 以 conc 个 worker 执行 n 个任务（结果由调用方按下标写入，顺序与并发无关）。
 func runPool(ctx context.Context, n, conc int, work func(i int)) {
 	jobs := make(chan int)
@@ -398,10 +418,18 @@ func splitRouteBlocks(prog *Program, file string) [][]int {
 		return [][]int{all}
 	}
 	// 文件头（import / 包声明 / 挂载前缀，位于首个注册行之前）作为每块共享上下文。
+	// 同时把组声明行（app.Group("/x")）纳入共享头：LLM 只看到注册行会猜错挂载前缀。
 	var header []int
 	for i := 0; i < hitIdx[0]; i++ {
 		header = append(header, i)
 	}
+	for i, l := range lines {
+		if groupDeclPattern.MatchString(l) {
+			header = append(header, i)
+		}
+	}
+	sort.Ints(header)
+	header = uniqInts(header)
 	// 命中行超过单块上限时切块；只把命中的注册行并入块（注释/无关语句不进块）。
 	var blocks [][]int
 	var cur []int
